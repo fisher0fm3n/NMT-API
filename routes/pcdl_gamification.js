@@ -133,7 +133,9 @@ module.exports = function pcdlGamificationRoutes() {
         metric: r.metric,
         target: Number(r.target),
         reward_xp: Number(r.reward_xp),
-        progress: Math.min(Number(r.progress), Number(r.target)),
+        progress:
+          Math.round(Math.min(Number(r.progress), Number(r.target)) * 100) /
+          100,
         completed: Boolean(r.completed_at),
         claimed: Boolean(r.claimed_at),
       });
