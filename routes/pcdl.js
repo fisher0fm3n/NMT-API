@@ -681,8 +681,27 @@ module.exports = function pcdlRoutes(deps) {
     "/pcdl/auth/admin_login",
     asyncHandler(async (req, res) => {
       try {
+        // const creds = req.body?.user || {};
+        // const { login, password } = creds || {};
+
         const creds = req.body?.user || {};
-        const { login, password } = creds || {};
+        const login = creds?.login || creds?.email || "";
+        const password = creds?.password || "";
+
+        if (!login || !password) {
+          return res.status(400).json({
+            status: false,
+            debug: {
+              body: req.body,
+              user: req.body?.user,
+              login,
+              password,
+              bodyType: typeof req.body,
+              contentType: req.headers["content-type"],
+            },
+            message: "user.login and user.password are required",
+          });
+        }
 
         if (!login || !password) {
           return res.status(400).json({
@@ -5851,19 +5870,19 @@ module.exports = function pcdlRoutes(deps) {
         position: null, // orderIds puts this first
         meta: { source: "inline_hero" },
         payload: [
-          {
-            image:
-              "https://d1zx0zj5kmre28.cloudfront.net/images/misc/focus_background.jpg",
-            logo: "https://d1zx0zj5kmre28.cloudfront.net/images/misc/focus_logo2.png",
-            title: "March 2026 – The Month of Focus",
-            blurb:
-              "Focus is a concentration of the attention or energy or convergence on something. It also means to give full attention to an object or interest. What are you focusing on this month? The scripture said in Isaiah 26:3 KJV; “Thou wilt keep him in perfect peace, whose mind is stayed on thee: because he trusteth in thee.”This month of March and onward, the Lord wants you to be focused on His word.",
-            cta: {
-              label: "Start Watching",
-              href: "/watch/HzhQxrFxiEk",
-              external: false,
-            },
-          },
+          // {
+          //   image:
+          //     "https://d1zx0zj5kmre28.cloudfront.net/images/misc/focus_background.jpg",
+          //   logo: "https://d1zx0zj5kmre28.cloudfront.net/images/misc/focus_logo2.png",
+          //   title: "March 2026 – The Month of Focus",
+          //   blurb:
+          //     "Focus is a concentration of the attention or energy or convergence on something. It also means to give full attention to an object or interest. What are you focusing on this month? The scripture said in Isaiah 26:3 KJV; “Thou wilt keep him in perfect peace, whose mind is stayed on thee: because he trusteth in thee.”This month of March and onward, the Lord wants you to be focused on His word.",
+          //   cta: {
+          //     label: "Start Watching",
+          //     href: "/watch/HzhQxrFxiEk",
+          //     external: false,
+          //   },
+          // },
           {
             image:
               "https://d1zx0zj5kmre28.cloudfront.net/images/misc/Year_of_Manifestation_Cover_new.webp",
@@ -8280,6 +8299,112 @@ module.exports = function pcdlRoutes(deps) {
         status: true,
         data,
       });
+    }),
+  );
+
+    // ---------------- EXPOSÉ (CORS passthrough for legacy PHP endpoint) ----------------
+  const EXPOSE_UPSTREAM_URL =
+    "https://pastorchrisdigitallibrary.org/pcdl_app_v6/get_current_expose_details.php";
+
+  // small in-memory cache so we don't hammer the PHP endpoint on every page load
+  let exposeCache = { at: 0, data: null };
+  const EXPOSE_TTL_MS = 60 * 1000;
+
+  function normalizeExposePayload(raw) {
+    const delimiter = raw?.videoDelimiter || "Day";
+    const days = Array.isArray(raw?.videos) ? raw.videos : [];
+
+    const videos = [];
+    for (const day of days) {
+      const payload = Array.isArray(day?.videoPayload) ? day.videoPayload : [];
+      payload.forEach((item, i) => {
+        videos.push({
+          id: item?.contentId || `${day?.id ?? videos.length}-${i}`,
+          day: day?.dayAlias ?? day?.id ?? null,
+          dateLabel: `${delimiter} ${day?.dayAlias ?? day?.id ?? ""}`.trim(),
+          title: item?.title || "",
+          description: item?.description || "",
+          type: item?.type || "message",
+          videoUrl: item?.url || "",
+          poster: item?.thumbnail || "",
+          completed: Boolean(item?.completed),
+        });
+      });
+    }
+
+    return {
+      campaignName: raw?.campaignName || "Exposé",
+      videoDelimiter: delimiter,
+      avatarURL: raw?.avatarURL || "",
+      testimonyURL: raw?.testimonyURL || "",
+      studyGuideURL: raw?.studyGuideURL || "",
+      quizURL: raw?.quizURL || "",
+      completionPercentage: raw?.completionPercentage || "",
+      completionPercentageInt: Number(raw?.completionPercentageInt || 0),
+      videos,
+    };
+  }
+
+  // GET /pcdl/expose/current            -> normalized, flat video list
+  // GET /pcdl/expose/current?raw=1      -> exact upstream JSON, untouched
+  router.get(
+    "/pcdl/expose/current",
+    asyncHandler(async (req, res) => {
+      const wantRaw = String(req.query.raw || "") === "1";
+
+      const fresh = Date.now() - exposeCache.at < EXPOSE_TTL_MS;
+      let raw = fresh ? exposeCache.data : null;
+
+      if (!raw) {
+        try {
+          const resp = await axios.get(EXPOSE_UPSTREAM_URL, {
+            timeout: 10000,
+            headers: { Accept: "application/json" },
+            // upstream sends Content-Type: text/html, so parse defensively
+            transformResponse: [
+              (d) => {
+                if (typeof d !== "string") return d;
+                try {
+                  return JSON.parse(d);
+                } catch {
+                  return null;
+                }
+              },
+            ],
+          });
+
+          raw = resp?.data || null;
+          if (!raw || typeof raw !== "object") {
+            return res.status(502).json({
+              status: false,
+              error: "bad_upstream_payload",
+              message: "Exposé endpoint did not return valid JSON",
+            });
+          }
+
+          exposeCache = { at: Date.now(), data: raw };
+        } catch (err) {
+          // serve stale data rather than breaking the page
+          if (exposeCache.data) {
+            raw = exposeCache.data;
+          } else {
+            return res.status(502).json({
+              status: false,
+              error: "expose_fetch_failed",
+              message:
+                err?.response?.data || err.message || "expose request failed",
+            });
+          }
+        }
+      }
+
+      res.set("Cache-Control", "public, max-age=60");
+
+      if (wantRaw) {
+        return res.json(raw);
+      }
+
+      return res.json({ status: true, data: normalizeExposePayload(raw) });
     }),
   );
 
