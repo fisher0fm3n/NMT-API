@@ -5,6 +5,10 @@ const axios = require("axios");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const {
+  ensureGamificationSchema,
+  updateQuestProgress,
+} = require("../lib/gamification");
 
 // === local upload dirs for routes file ===
 const UPLOAD_ROOT = path.join(process.cwd(), "uploads");
@@ -3354,6 +3358,11 @@ module.exports = function pcdlRoutes(deps) {
           "|",
         );
 
+      // Quest tables are created lazily; if bootstrap fails, XP still lands.
+      const questsEnabled = await ensureGamificationSchema(withClient)
+        .then(() => true)
+        .catch(() => false);
+
       const result = await withClient(async (db) => {
         await db.query("BEGIN");
 
@@ -3438,6 +3447,14 @@ module.exports = function pcdlRoutes(deps) {
           [newXp, streakCurrent, streakLongest, today, email],
         );
 
+        // Advance any active quests this action contributes to (same txn).
+        const questsCompleted = questsEnabled
+          ? await updateQuestProgress(db, email, action, {
+              durationSec,
+              points,
+            })
+          : [];
+
         const lvl = await db.query(`SELECT public.level_for_xp($1) AS level`, [
           newXp,
         ]);
@@ -3476,6 +3493,7 @@ module.exports = function pcdlRoutes(deps) {
           xp_this_level: Math.max(0, newXp - thisLevelXp),
           xp_to_next: Math.max(0, nextLevelXp - newXp),
           next_level: next.rows.length ? Number(next.rows[0].level) : newLevel,
+          quests_completed: questsCompleted,
         };
       });
 
