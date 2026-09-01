@@ -322,6 +322,9 @@ module.exports = function pcdlGamificationRoutes() {
         const entries = rows.map((r) => ({
           rank: Number(r.rank),
           display_name: displayNameFor(r),
+          // Present only for users who set a username; lets clients link to
+          // the public profile. Never exposes the email.
+          username: r.username || null,
           avatar_url: r.avatar_url || null,
           country: r.country || null,
           level: Number(r.level) || 1,
@@ -376,6 +379,7 @@ module.exports = function pcdlGamificationRoutes() {
               me = {
                 rank: Number(meRow.rank),
                 display_name: displayNameFor(meRow),
+                username: meRow.username || null,
                 avatar_url: meRow.avatar_url || null,
                 country: meRow.country || null,
                 level: Number(meRow.level) || 1,
