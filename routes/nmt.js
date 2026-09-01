@@ -1253,15 +1253,27 @@ module.exports = function nmtWebhookRoutes() {
         }
 
         const kcData = await response.json();
-        const profileId = kcData?.profile?.id;
+        const kcProfile = kcData?.profile || {};
+        const profileId = kcProfile?.id;
 
         if (!profileId) {
           throw new Error("No ID returned from KingsChat profile API.");
         }
 
-        const safeProfileId = String(profileId)
-          .replace(/\\/g, "\\\\")
-          .replace(/'/g, "\\'");
+        // Sanitize each field for safe embedding in the inline script.
+        const jsSafe = (v) =>
+          String(v == null ? "" : v)
+            .replace(/\\/g, "\\\\")
+            .replace(/'/g, "\\'")
+            .replace(/\n/g, "\\n")
+            .replace(/\r/g, "\\r");
+
+        const safeProfileId = jsSafe(profileId);
+        const safeName = jsSafe(kcProfile?.name || "");
+        const safeUsername = jsSafe(kcProfile?.username || "");
+        const safeAvatar = jsSafe(
+          kcProfile?.avatar_url || kcProfile?.avatar || "",
+        );
 
         const html = `
         <!DOCTYPE html>
@@ -1280,7 +1292,10 @@ module.exports = function nmtWebhookRoutes() {
                     window.ReactNativeWebView.postMessage(
                       JSON.stringify({
                         type: 'login',
-                        profileId: '${safeProfileId}'
+                        profileId: '${safeProfileId}',
+                        name: '${safeName}',
+                        username: '${safeUsername}',
+                        avatar: '${safeAvatar}'
                       })
                     );
                   }
