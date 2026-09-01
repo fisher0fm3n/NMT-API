@@ -4,6 +4,7 @@ const askPcoRoutes = require("./askPco");
 const espeesRoutes = require("./espees");
 const pcdlRoutes = require("./pcdl");
 const pcdlGamificationRoutes = require("./pcdl_gamification");
+const pcdlSocialRoutes = require("./pcdl_social");
 const kingsspaceRoutes = require("./kingsspace");
 const ceflixRoutes = require("./ceflix");
 const nmtRoutes = require("./nmt");
@@ -18,6 +19,7 @@ module.exports = function buildRoutes(deps) {
   router.use(espeesRoutes(deps));
   router.use(pcdlRoutes(deps));
   router.use(pcdlGamificationRoutes(deps));
+  router.use(pcdlSocialRoutes(deps));
   router.use(kingsspaceRoutes(deps));
   router.use(ceflixRoutes(deps));
   router.use(nmtRoutes(deps));

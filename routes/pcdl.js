@@ -9,6 +9,7 @@ const {
   ensureGamificationSchema,
   updateQuestProgress,
 } = require("../lib/gamification");
+const { ensureBlockTable } = require("../lib/blocks");
 
 // === local upload dirs for routes file ===
 const UPLOAD_ROOT = path.join(process.cwd(), "uploads");
@@ -3174,7 +3175,10 @@ module.exports = function pcdlRoutes(deps) {
         });
       }
 
-      // Fetch the public/profile payload (same as before, now including is_profile_public)
+      // Ensure the block table exists so is_blocked can be computed.
+      await ensureBlockTable(withClient).catch(() => {});
+
+      // Fetch the public/profile payload (now including public playlists + block state)
       const data = await withClient(async (db) => {
         const r = await db.query(
           `WITH base AS (
@@ -3190,24 +3194,43 @@ module.exports = function pcdlRoutes(deps) {
              JOIN base b ON b.email = f.user_email
          ),
          playlists_pub AS (
-           SELECT COUNT(*)::int AS cnt
+           SELECT COALESCE(json_agg(json_build_object(
+                    'id', p.id, 'title', p.title, 'description', p.description,
+                    'thumbnail_url', p.thumbnail_url, 'is_public', p.is_public
+                  ) ORDER BY p.updated_at DESC), '[]'::json) AS list,
+                  COUNT(*)::int AS cnt
              FROM public.playlists p
              JOIN base b ON b.email = p.owner_email
             WHERE p.is_public = TRUE
          )
          SELECT (SELECT row_to_json(base) FROM base) AS user,
                 (SELECT cnt FROM friends) AS friends_count,
-                (SELECT cnt FROM playlists_pub) AS playlists_public_count;`,
+                (SELECT cnt FROM playlists_pub) AS playlists_public_count,
+                (SELECT list FROM playlists_pub) AS public_playlists;`,
           [profile.email],
         );
         const row = r.rows[0];
         if (!row || !row.user) return null;
 
-        // If profile is private and requester is not owner, you could also redact fields here.
+        // Does the requester block this user (or vice-versa)?
+        let isBlocked = false;
+        if (requesterIsOwner === false && emailQ) {
+          const b = await db.query(
+            `SELECT 1 FROM public.user_blocks
+              WHERE (blocker_email=$1 AND blocked_email=$2)
+                 OR (blocker_email=$2 AND blocked_email=$1)
+              LIMIT 1`,
+            [emailQ, profile.email],
+          );
+          isBlocked = b.rowCount > 0;
+        }
+
         return {
           ...row.user,
           friends_count: row.friends_count || 0,
           playlists_public_count: row.playlists_public_count || 0,
+          public_playlists: row.public_playlists || [],
+          is_blocked: isBlocked,
         };
       });
 
