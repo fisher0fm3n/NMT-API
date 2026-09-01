@@ -109,7 +109,7 @@ app.use((req, res, next) => {
   // include x-admin-token used by your routes
 res.setHeader(
   "Access-Control-Allow-Headers",
-  "Content-Type, x-api-key, x-admin-token, x-user-token"
+  "Content-Type, Authorization, x-api-key, x-admin-token, x-user-token"
 );
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();

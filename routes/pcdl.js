@@ -3850,9 +3850,30 @@ module.exports = function pcdlRoutes(deps) {
       const rows = await withClient(async (db) => {
         const { rows } = await db.query(
           `
-        SELECT * FROM public.playlists
-        WHERE owner_email = $1
-        ORDER BY created_at DESC
+        SELECT p.*,
+               COALESCE(pi.cnt, 0)::int AS item_count,
+               COALESCE(pt.thumbs, ARRAY[]::text[]) AS item_thumbnails
+          FROM public.playlists p
+          LEFT JOIN LATERAL (
+            SELECT COUNT(*)::int AS cnt
+              FROM public.playlist_items i
+             WHERE i.playlist_id = p.id
+          ) pi ON TRUE
+          -- First four cover images, used to build the playlist's mosaic art.
+          LEFT JOIN LATERAL (
+            SELECT array_agg(t.thumbnail_url ORDER BY t.position NULLS LAST) AS thumbs
+              FROM (
+                SELECT m.thumbnail_url, i.position
+                  FROM public.playlist_items i
+                  JOIN public.messages m ON m.id = i.message_id
+                 WHERE i.playlist_id = p.id
+                   AND m.thumbnail_url IS NOT NULL
+                 ORDER BY i.position NULLS LAST
+                 LIMIT 4
+              ) t
+          ) pt ON TRUE
+        WHERE p.owner_email = $1
+        ORDER BY p.created_at DESC
         LIMIT $2 OFFSET $3
         `,
           [email, limit, offset],
@@ -3970,7 +3991,11 @@ module.exports = function pcdlRoutes(deps) {
                  'title', m.title,
                  'thumbnail_url', m.thumbnail_url,
                  'status', m.status,
-                 'series_id', m.series_id
+                 'series_id', m.series_id,
+                 -- Which media this message actually has, so clients can route
+                 -- an audio-only message to the listen screen.
+                 'has_video', (m.video_id IS NOT NULL),
+                 'has_audio', (m.audio_id IS NOT NULL)
                ) AS message
              FROM public.playlist_items i
              LEFT JOIN public.messages m ON m.id = i.message_id

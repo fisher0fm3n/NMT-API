@@ -9,6 +9,7 @@ const pcdlQuizRoutes = require("./pcdl_quizzes");
 const kingsspaceRoutes = require("./kingsspace");
 const ceflixRoutes = require("./ceflix");
 const nmtRoutes = require("./nmt");
+const nmmRoutes = require("./nmm");
 const pcdlAffiliateRoutes = require("./pcdl_affiliate");
 
 module.exports = function buildRoutes(deps) {
@@ -25,6 +26,7 @@ module.exports = function buildRoutes(deps) {
   router.use(kingsspaceRoutes(deps));
   router.use(ceflixRoutes(deps));
   router.use(nmtRoutes(deps));
+  router.use(nmmRoutes(deps));
   router.use(pcdlAffiliateRoutes(deps));
 
   return router;
