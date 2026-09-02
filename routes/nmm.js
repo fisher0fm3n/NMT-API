@@ -473,6 +473,12 @@ function attachmentPath(storedName) {
 
 module.exports = function nmmRoutes() {
   const router = Router();
+  // Never cache an API response, and always require the app key.
+  router.use("/nmm", (_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    next();
+  });
   router.use("/nmm", requireAppKey);
   const approved = [requireUser, requireApproved];
   const head = [requireUser, requireApproved, requireHead];
@@ -523,7 +529,7 @@ module.exports = function nmmRoutes() {
   }));
 
   // Active directorates and flagship institutions for the onboarding pickers.
-  router.get("/nmm/units", asyncHandler(async (req, res) => {
+  router.get("/nmm/units", requireUser, asyncHandler(async (req, res) => {
     const kind = isKind(req.query.kind) ? req.query.kind : null;
     const units = await q(
       `SELECT id, kind, name FROM units WHERE is_active ${kind ? "AND kind = $1" : ""} ORDER BY kind, position, name`,

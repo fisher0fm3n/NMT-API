@@ -196,6 +196,24 @@ DELETE /nmm/attachments/:id
 
 Both writes follow the report's edit window.
 
+## Staff
+
+Staff join through a unit's invite link. The app captures the token from a
+`/join/<token>` URL and posts it after sign-in.
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/nmm/invites/accept` | `{ token }` — attaches a brand-new account to that unit as staff. Existing heads are untouched. |
+| `POST` | `/nmm/onboarding/staff` | `{ fullName, birthday, rank, staffRole, city, country, phone?, kpis: [{ kpi, target }] }`. At least one KPI. |
+| `GET` / `PUT` | `/nmm/kpis` | The signed-in staff member's own KPIs. |
+| `GET` | `/nmm/staff/invites` | Heads: the ready-made link per unit they head. |
+| `GET` | `/nmm/staff` | Heads: their staff, with status and KPI counts. |
+| `PATCH` | `/nmm/staff/:id` | `{ status: "approved" \| "rejected" }` — **the head of the unit approves their own staff**; super admins may too. |
+
+Staff accounts have `role: "staff"` and a `staffUnitId`. They do not file
+reports: `/nmm/home`, `/nmm/goals`, `/nmm/reports` and `/nmm/periods` return
+403 `forbidden` for them.
+
 ## Admin (super admin only)
 
 | Method | Path | Notes |
@@ -225,6 +243,14 @@ Both writes follow the report's edit window.
 
 The schema is owned by the web app: run `npm run db:migrate` there. This API
 never creates or alters tables.
+
+## Security
+
+Every `/nmm` route needs the app key; everything except `/nmm/ping` and the
+sign-in call also needs a user bearer token. Identity always comes from that
+token — no endpoint accepts a user id as identity. Responses are sent
+`no-store`. Authorisation is per resource: owners for reports and goals, the
+head of the unit for staff, super admin for `/nmm/admin/*`.
 
 ```
 GET /nmm/ping   →  { "status": true, "message": "nmm reporting api alive", "units": 12, "period": "2026-09", "week": 1 }
