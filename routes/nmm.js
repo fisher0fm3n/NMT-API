@@ -161,7 +161,7 @@ const USER_SELECT = `
          u.directorate_id, d.name AS directorate_name, u.institution_id, i.name AS institution_name,
          u.staff_unit_id, su.name AS staff_unit_name, su.kind AS staff_unit_kind,
          to_char(u.birthday, 'YYYY-MM-DD') AS birthday, u.rank, u.staff_role, u.city, u.country,
-         u.role, u.status
+         u.role, u.status, u.disabled_at::text AS disabled_at
   FROM users u
   LEFT JOIN units d ON d.id = u.directorate_id
   LEFT JOIN units i ON i.id = u.institution_id
@@ -176,10 +176,11 @@ function shapeUser(r) {
     institutionId: r.institution_id, institutionName: r.institution_name,
     staffUnitId: r.staff_unit_id, staffUnitName: r.staff_unit_name, staffUnitKind: r.staff_unit_kind,
     birthday: r.birthday, rank: r.rank, staffRole: r.staff_role, city: r.city, country: r.country,
-    role: r.role, status: r.status,
+    role: r.role, status: r.status, disabledAt: r.disabled_at,
   };
 }
 const isStaff = (u) => u.role === "staff";
+const isDisabled = (u) => u.disabledAt !== null;
 const hasUnit = (u) => (isStaff(u) ? u.staffUnitId !== null : u.directorateId !== null || u.institutionId !== null);
 function unitsOf(u) {
   const out = [];
@@ -208,6 +209,7 @@ const requireUser = asyncHandler(async (req, res, next) => {
 
 function requireApproved(req, res, next) {
   const u = req.nmmUser;
+  if (isDisabled(u)) return fail(res, 403, "account_disabled", "This account is switched off. Switch it back on to continue.");
   if (u.status === "new" || (u.status === "approved" && !hasUnit(u))) {
     return fail(res, 403, "onboarding_required",
       isStaff(u) ? "Complete your staff profile first." : "Choose your directorate and/or flagship institution first.");
@@ -231,6 +233,7 @@ const isClosedStatus = (s) => s === "rejected" || s === "removed";
 
 function nextStepFor(user) {
   if (!user) return "signin";
+  if (isDisabled(user)) return "disabled";
   const onboarding = isStaff(user) ? "onboarding_staff" : "onboarding";
   if (user.status === "new") return onboarding;
   if (isClosedStatus(user.status)) return user.status; // "rejected" or "removed"
@@ -511,17 +514,47 @@ module.exports = function nmmRoutes() {
     ok(res, { token, expiresAt: expiresAt.toISOString(), next: nextStepFor(user), user });
   }));
 
-  // Someone declined or removed acknowledges it: the account goes, so the next
-  // KingsChat sign-in starts a brand-new registration.
-  router.post("/nmm/account/withdraw", requireUser, asyncHandler(async (req, res) => {
+  // Account controls, always for the signed-in user and nobody else:
+  // switch off (reversible), switch back on, or delete for good.
+  const lastActiveSuperAdmin = async (id) => {
+    const row = await q1(
+      `SELECT count(*)::int AS n FROM users
+       WHERE role = 'super_admin' AND status = 'approved' AND disabled_at IS NULL AND id <> $1`, [id]);
+    return (row?.n ?? 0) === 0;
+  };
+
+  router.post("/nmm/account", requireUser, asyncHandler(async (req, res) => {
     const u = req.nmmUser;
-    if (!isClosedStatus(u.status)) return fail(res, 409, "not_closed", "Only a declined or removed account can be cleared.");
+    const action = clean(req.body?.action, 20);
+    if (action === "reactivate") {
+      if (!isDisabled(u)) return fail(res, 409, "already_active", "This account is already active.");
+      await q(`UPDATE users SET disabled_at = NULL, updated_at = now() WHERE id = $1`, [u.id]);
+      const user = await getUserById(u.id);
+      return ok(res, { user, next: nextStepFor(user) });
+    }
+    if (action === "disable") {
+      if (isDisabled(u)) return fail(res, 409, "already_disabled", "This account is already switched off.");
+      if (u.role === "super_admin" && (await lastActiveSuperAdmin(u.id))) {
+        return fail(res, 409, "last_super_admin", "You are the only active super admin. Make someone else a super admin first.");
+      }
+      await q(`UPDATE users SET disabled_at = now(), updated_at = now() WHERE id = $1`, [u.id]);
+      await q(`DELETE FROM sessions WHERE user_id = $1`, [u.id]); // signs out everywhere
+      return ok(res, { disabled: true });
+    }
+    return fail(res, 400, "invalid_action", "action must be disable or reactivate.");
+  }));
+
+  router.delete("/nmm/account", requireUser, asyncHandler(async (req, res) => {
+    const u = req.nmmUser;
+    if (u.role === "super_admin" && (await lastActiveSuperAdmin(u.id))) {
+      return fail(res, 409, "last_super_admin", "You are the only active super admin. Make someone else a super admin first.");
+    }
     const reports = await q(`SELECT id FROM reports WHERE user_id = $1`, [u.id]);
     await q(`UPDATE users SET reviewed_by = NULL WHERE reviewed_by = $1`, [u.id]);
-    const gone = await q(`DELETE FROM users WHERE id = $1 AND status IN ('rejected', 'removed') RETURNING id`, [u.id]);
-    if (!gone.length) return fail(res, 500, "withdraw_failed", "Could not remove the account.");
+    const gone = await q(`DELETE FROM users WHERE id = $1 RETURNING id`, [u.id]);
+    if (!gone.length) return fail(res, 500, "delete_failed", "Could not delete the account.");
     for (const r of reports) await fsp.rm(path.join(UPLOAD_DIR, String(r.id)), { recursive: true, force: true }).catch(() => {});
-    ok(res, { removed: true });
+    ok(res, { deleted: true });
   }));
 
   router.post("/nmm/auth/logout", requireUser, asyncHandler(async (req, res) => {
@@ -1036,9 +1069,9 @@ module.exports = function nmmRoutes() {
     const weeksElapsed = isCurrentPeriod(period) ? Math.min(3, weekOfMonth()) : periodHasEnded(period) ? 3 : 0;
     const units = await q(
       `SELECT un.id, un.kind, un.name,
-         (SELECT count(*)::int FROM users u WHERE (u.directorate_id = un.id OR u.institution_id = un.id) AND u.status = 'approved') AS members,
+         (SELECT count(*)::int FROM users u WHERE (u.directorate_id = un.id OR u.institution_id = un.id) AND u.status = 'approved' AND u.disabled_at IS NULL) AS members,
          (SELECT count(*)::int FROM reports r WHERE r.unit_id = un.id AND r.period = $1 AND r.week < 4 AND r.status = 'submitted') AS weekly_submitted,
-         (SELECT count(*)::int FROM users u WHERE (u.directorate_id = un.id OR u.institution_id = un.id) AND u.status = 'approved') * $2::int AS weekly_expected,
+         (SELECT count(*)::int FROM users u WHERE (u.directorate_id = un.id OR u.institution_id = un.id) AND u.status = 'approved' AND u.disabled_at IS NULL) * $2::int AS weekly_expected,
          (SELECT count(*)::int FROM reports r WHERE r.unit_id = un.id AND r.period = $1 AND r.week = 4 AND r.status = 'submitted') AS monthly_submitted,
          (SELECT count(*)::int FROM monthly_goals g WHERE g.unit_id = un.id AND g.period = $1) AS goals_total,
          (SELECT count(*)::int FROM monthly_goals g WHERE g.unit_id = un.id AND g.period = $1 AND g.completed) AS goals_done

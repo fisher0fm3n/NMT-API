@@ -40,6 +40,7 @@ and `next`, which tells the app what to show:
 | `onboarding_staff` | Staff who joined via an invite: collect the profile → `POST /nmm/onboarding/staff`. |
 | `pending` | Waiting for an administrator to approve. Poll `/nmm/me`. |
 | `rejected` | The request was declined. |
+| `disabled` | The user switched their own account off. Offer to switch it back on via `POST /nmm/account`. |
 | `home` | Approved. Full access. |
 
 Tokens last 30 days (`NMM_SESSION_DAYS`). `POST /nmm/auth/logout` revokes one.
@@ -72,6 +73,8 @@ Success is `{ "status": true, … }`. Failure is
 
 | Method | Path | Notes |
 | --- | --- | --- |
+| `POST` | `/nmm/account` | `{ action: "disable" }` switches the caller's own account off (ends every session) and `{ action: "reactivate" }` switches it back on. Returns `last_super_admin` (409) if that would leave nobody able to administer. |
+| `DELETE` | `/nmm/account` | Deletes the caller's own account, KPIs, goals, reports and attachments for good. |
 | `GET` | `/nmm/me` | User, `next`, and `units` — the list of `{ id, kind, name }` the user reports for. |
 | `PATCH` | `/nmm/me` | `{ fullName, phone }`. The only self-service fields. |
 | `GET` | `/nmm/units` | Active `directorates`, `institutions` and the selectable `roles`. No token needed. |
