@@ -75,9 +75,9 @@ Success is `{ "status": true, … }`. Failure is
 | --- | --- | --- |
 | `POST` | `/nmm/account` | `{ action: "disable" }` switches the caller's own account off (ends every session) and `{ action: "reactivate" }` switches it back on. Returns `last_super_admin` (409) if that would leave nobody able to administer. |
 | `DELETE` | `/nmm/account` | Deletes the caller's own account, KPIs, goals, reports and attachments for good. |
-| `GET` | `/nmm/me` | User, `next`, and `units` — the list of `{ id, kind, name }` the user reports for. |
+| `GET` | `/nmm/me` | User, `next`, `units` — the `{ id, kind, name }` list the caller heads — and `scopes`, what they may actually file: `{ ownerId, unitId, kind, unitName, onBehalfOf }`. For a delegate `units` is empty and `scopes` holds their head's unit. |
 | `PATCH` | `/nmm/me` | `{ fullName, phone }`. The only self-service fields. |
-| `GET` | `/nmm/units` | Active `directorates`, `institutions` and the selectable `roles`. No token needed. |
+| `GET` | `/nmm/units` | Active `directorates`, `institutions` and the selectable `roles`. Needs a signed-in token. |
 | `POST` | `/nmm/onboarding` | `{ fullName, role, directorateId?, institutionId? }` — at least one of the two ids. |
 
 `role` is one of `director`, `assistant_director`, `assistant`. These are titles;
@@ -102,7 +102,7 @@ the unit as **staff**; existing heads are left untouched (`applied: false`).
 | `GET` | `/nmm/staff/invites` | Heads only. The link per unit. |
 | `GET` | `/nmm/staff` | Heads only. Their staff with rank, role, location, birthday and KPI count. |
 | `GET` | `/nmm/staff/:id` | One staff member in full: profile fields plus KPIs. Head of that unit, or a super admin. |
-| `PATCH` | `/nmm/staff/:id` | Heads only. `{ status: "approved" \| "rejected" \| "removed" }`. |
+| `PATCH` | `/nmm/staff/:id` | Heads only. `{ status?: "approved" \| "rejected" \| "removed", canReport?: boolean }`. |
 
 Staff accounts do not file reports or set goals: `/nmm/home`, `/nmm/goals`,
 `/nmm/reports*` and `/nmm/periods` return `forbidden` for them.
@@ -219,11 +219,27 @@ Staff join through a unit's invite link. The app captures the token from a
 | `GET` | `/nmm/staff/invites` | Heads: the ready-made link per unit they head. |
 | `GET` | `/nmm/staff` | Heads: their staff, with status and KPI counts. |
 | `GET` | `/nmm/staff/:id` | One staff member in full: profile fields plus KPIs. |
-| `PATCH` | `/nmm/staff/:id` | `{ status: "approved" \| "rejected" \| "removed" }` — **the head of the unit approves, declines or removes their own staff**; super admins may too. |
+| `PATCH` | `/nmm/staff/:id` | `{ status?, canReport? }`, either or both. `status` is `approved` / `rejected` / `removed` — **the head of the unit approves, declines or removes their own staff**; super admins may too. `canReport` delegates reporting (below). |
 
-Staff accounts have `role: "staff"` and a `staffUnitId`. They do not file
-reports: `/nmm/home`, `/nmm/goals`, `/nmm/reports` and `/nmm/periods` return
-403 `forbidden` for them.
+Staff accounts have `role: "staff"` and a `staffUnitId`. By default they do not
+file reports: `/nmm/home`, `/nmm/goals`, `/nmm/reports` and `/nmm/periods`
+return 403 `forbidden` for them.
+
+### Delegated reporting
+
+A head can let chosen staff help complete their unit's monthly goals and
+reports. `PATCH /nmm/staff/:id` with `{ "canReport": true }` sets that staff
+member's `reportsForId` to the head; `false` clears it. Only the head of the
+staff member's own unit can grant it, and only for an approved staff member — a
+super admin who does not head that unit gets 403. Declining or removing a staff
+member clears the delegation automatically.
+
+A delegate then gets `/nmm/home`, `/nmm/goals` and `/nmm/reports` for that one
+unit, and everything they file belongs to the **head**: `report.user_id` is the
+head's id and `head_of_unit` is the head's name. Responses carry
+`onBehalfOf: "<head's name>"` so the app can say whose report is being filled
+in. Delegation does not open anything else — `/nmm/staff*` and the invite links
+stay 403 for staff accounts.
 
 ## Admin (super admin only)
 
@@ -260,8 +276,9 @@ never creates or alters tables.
 Every `/nmm` route needs the app key; everything except `/nmm/ping` and the
 sign-in call also needs a user bearer token. Identity always comes from that
 token — no endpoint accepts a user id as identity. Responses are sent
-`no-store`. Authorisation is per resource: owners for reports and goals, the
-head of the unit for staff, super admin for `/nmm/admin/*`.
+`no-store`. Authorisation is per resource: for reports and goals, the owner or a
+staff member the owner has delegated to (`canReport`); the head of the unit for
+staff; super admin for `/nmm/admin/*`.
 
 ```
 GET /nmm/ping   →  { "status": true, "message": "nmm reporting api alive", "units": 12, "period": "2026-09", "week": 1 }

@@ -161,11 +161,13 @@ const USER_SELECT = `
          u.directorate_id, d.name AS directorate_name, u.institution_id, i.name AS institution_name,
          u.staff_unit_id, su.name AS staff_unit_name, su.kind AS staff_unit_kind,
          to_char(u.birthday, 'YYYY-MM-DD') AS birthday, u.rank, u.staff_role, u.city, u.country,
-         u.role, u.status, u.disabled_at::text AS disabled_at
+         u.role, u.status, u.disabled_at::text AS disabled_at,
+         u.reports_for_id, COALESCE(rf.full_name, rf.kc_name) AS reports_for_name
   FROM users u
   LEFT JOIN units d ON d.id = u.directorate_id
   LEFT JOIN units i ON i.id = u.institution_id
-  LEFT JOIN units su ON su.id = u.staff_unit_id`;
+  LEFT JOIN units su ON su.id = u.staff_unit_id
+  LEFT JOIN users rf ON rf.id = u.reports_for_id`;
 
 function shapeUser(r) {
   if (!r) return null;
@@ -177,6 +179,7 @@ function shapeUser(r) {
     staffUnitId: r.staff_unit_id, staffUnitName: r.staff_unit_name, staffUnitKind: r.staff_unit_kind,
     birthday: r.birthday, rank: r.rank, staffRole: r.staff_role, city: r.city, country: r.country,
     role: r.role, status: r.status, disabledAt: r.disabled_at,
+    reportsForId: r.reports_for_id, reportsForName: r.reports_for_name,
   };
 }
 const isStaff = (u) => u.role === "staff";
@@ -189,6 +192,20 @@ function unitsOf(u) {
   return out;
 }
 const unitOfKind = (u, kind) => unitsOf(u).find((x) => x.kind === kind) || null;
+
+// A head files for their own units. A staff member files only where their head
+// has delegated it, and then always in the head's name.
+function reportingScopes(u) {
+  if (isStaff(u)) {
+    if (!u.reportsForId || !u.staffUnitId || !u.staffUnitKind) return [];
+    return [{ ownerId: u.reportsForId, unitId: u.staffUnitId, kind: u.staffUnitKind,
+              unitName: u.staffUnitName || "", onBehalfOf: u.reportsForName || null }];
+  }
+  return unitsOf(u).map((x) => ({ ownerId: u.id, unitId: x.id, kind: x.kind, unitName: x.name, onBehalfOf: null }));
+}
+const scopeOfKind = (u, kind) => reportingScopes(u).find((s) => s.kind === kind) || null;
+const mayActFor = (u, ownerId, unitId) =>
+  reportingScopes(u).some((s) => s.ownerId === ownerId && s.unitId === unitId);
 
 function bearerToken(req) {
   const m = (req.header("authorization") || "").match(/^Bearer\s+(.+)$/i);
@@ -222,6 +239,13 @@ function requireApproved(req, res, next) {
 // Heads only — staff members do not file reports or set goals.
 function requireHead(req, res, next) {
   if (isStaff(req.nmmUser)) return fail(res, 403, "forbidden", "Staff accounts do not file reports.");
+  next();
+}
+// Heads, plus staff a head has given reporting access to.
+function requireReporter(req, res, next) {
+  if (reportingScopes(req.nmmUser).length === 0) {
+    return fail(res, 403, "forbidden", "You have not been given access to file reports.");
+  }
   next();
 }
 function requireSuperAdmin(req, res, next) {
@@ -357,16 +381,18 @@ const getReportFor = async (userId, unitId, period, week) =>
   loadReport(await q1(`${REPORT_SELECT} WHERE r.user_id = $1 AND r.unit_id = $2 AND r.period = $3 AND r.week = $4`,
     [userId, unitId, periodToDate(period), week]));
 
-async function getOrCreateReport(user, unit, period, week) {
-  const existing = await getReportFor(user.id, unit.id, period, week);
+async function getOrCreateReport(scope, period, week) {
+  const existing = await getReportFor(scope.ownerId, scope.unitId, period, week);
   if (existing) return existing;
   if (!canOpenReport(period, week)) return null;
+  // The head of unit is always the owner's name, whoever is typing.
   await q(
-    `INSERT INTO reports (user_id, unit_id, period, week, head_of_unit) VALUES ($1, $2, $3, $4, $5)
+    `INSERT INTO reports (user_id, unit_id, period, week, head_of_unit)
+     VALUES ($1, $2, $3, $4, COALESCE((SELECT NULLIF(TRIM(COALESCE(full_name, kc_name, '')), '') FROM users WHERE id = $1), ''))
      ON CONFLICT (user_id, unit_id, period, week) DO NOTHING`,
-    [user.id, unit.id, periodToDate(period), week, user.fullName || user.kcName || ""],
+    [scope.ownerId, scope.unitId, periodToDate(period), week],
   );
-  return getReportFor(user.id, unit.id, period, week);
+  return getReportFor(scope.ownerId, scope.unitId, period, week);
 }
 
 const nonEmpty = (rows, keys) => (Array.isArray(rows) ? rows : []).filter((r) => keys.some((k) => clean(r?.[k])));
@@ -487,6 +513,7 @@ module.exports = function nmmRoutes() {
   router.use("/nmm", requireAppKey);
   const approved = [requireUser, requireApproved];
   const head = [requireUser, requireApproved, requireHead];
+  const reporter = [requireUser, requireApproved, requireReporter];
   const admin = [requireUser, requireApproved, requireSuperAdmin];
 
   router.get("/nmm/ping", asyncHandler(async (_req, res) => {
@@ -565,7 +592,14 @@ module.exports = function nmmRoutes() {
   /* ---- account --------------------------------------------------------- */
 
   router.get("/nmm/me", requireUser, asyncHandler(async (req, res) => {
-    ok(res, { user: req.nmmUser, next: nextStepFor(req.nmmUser), units: unitsOf(req.nmmUser) });
+    // `units` is what the caller heads; `scopes` is what they may actually file
+    // for, which for a delegate is their head's unit.
+    ok(res, {
+      user: req.nmmUser,
+      next: nextStepFor(req.nmmUser),
+      units: unitsOf(req.nmmUser),
+      scopes: reportingScopes(req.nmmUser),
+    });
   }));
 
   router.patch("/nmm/me", requireUser, asyncHandler(async (req, res) => {
@@ -626,30 +660,33 @@ module.exports = function nmmRoutes() {
 
   // The caller's standing for a month across their units: goals, week statuses,
   // and anything missed. Defaults to the current month.
-  router.get("/nmm/home", ...head, asyncHandler(async (req, res) => {
+  router.get("/nmm/home", ...reporter, asyncHandler(async (req, res) => {
     const period = clean(req.query.period, 7) || currentPeriod();
     if (!isPeriod(period)) return fail(res, 400, "invalid_period", "Use a period like 2026-09.");
-    const months = await Promise.all(unitsOf(req.nmmUser).map((u) => unitMonth(req.nmmUser.id, u, period)));
-    ok(res, { period, currentWeek: weekOfMonth(), units: months });
+    const scopes = reportingScopes(req.nmmUser);
+    const months = await Promise.all(
+      scopes.map((sc) => unitMonth(sc.ownerId, { id: sc.unitId, kind: sc.kind, name: sc.unitName }, period)),
+    );
+    ok(res, { period, currentWeek: weekOfMonth(), onBehalfOf: scopes[0]?.onBehalfOf ?? null, units: months });
   }));
 
   /* ---- goals ----------------------------------------------------------- */
 
-  router.get("/nmm/goals", ...head, asyncHandler(async (req, res) => {
+  router.get("/nmm/goals", ...reporter, asyncHandler(async (req, res) => {
     const kind = req.query.kind;
     const period = clean(req.query.period, 7) || currentPeriod();
     if (!isKind(kind) || !isPeriod(period)) return fail(res, 400, "bad_request", "Provide kind and a period like 2026-09.");
-    const unit = unitOfKind(req.nmmUser, kind);
-    if (!unit) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
-    ok(res, { goals: await listGoals(req.nmmUser.id, unit.id, period), editable: goalsEditable(period) });
+    const scope = scopeOfKind(req.nmmUser, kind);
+    if (!scope) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
+    ok(res, { goals: await listGoals(scope.ownerId, scope.unitId, period), editable: goalsEditable(period) });
   }));
 
   // Replace the list. Existing ids keep their completion state.
-  router.put("/nmm/goals", ...head, asyncHandler(async (req, res) => {
+  router.put("/nmm/goals", ...reporter, asyncHandler(async (req, res) => {
     const { kind, period } = req.body || {};
     if (!isKind(kind) || !isPeriod(period)) return fail(res, 400, "bad_request", "Provide kind and a period like 2026-09.");
-    const unit = unitOfKind(req.nmmUser, kind);
-    if (!unit) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
+    const scope = scopeOfKind(req.nmmUser, kind);
+    if (!scope) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
     if (!goalsEditable(period)) return fail(res, 409, "period_closed", "Goals for that month can no longer be changed.");
     const rows = nonEmpty(req.body.goals, ["goal", "intended_outcome", "target_date"]);
     await withTx(async (client) => {
@@ -675,7 +712,7 @@ module.exports = function nmmRoutes() {
     ok(res, { goals: await listGoals(req.nmmUser.id, unit.id, period) });
   }));
 
-  router.patch("/nmm/goals/:id", ...head, asyncHandler(async (req, res) => {
+  router.patch("/nmm/goals/:id", ...reporter, asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const g = await q1(`SELECT user_id, to_char(period, 'YYYY-MM') AS period FROM monthly_goals WHERE id = $1`, [id]);
     if (!g) return fail(res, 404, "not_found", "Goal not found.");
@@ -690,54 +727,57 @@ module.exports = function nmmRoutes() {
   /* ---- reports --------------------------------------------------------- */
 
   // History for one of the caller's units.
-  router.get("/nmm/reports", ...head, asyncHandler(async (req, res) => {
+  router.get("/nmm/reports", ...reporter, asyncHandler(async (req, res) => {
     const kind = req.query.kind;
     if (!isKind(kind)) return fail(res, 400, "bad_request", "Provide kind=directorate or kind=institution.");
-    const unit = unitOfKind(req.nmmUser, kind);
-    if (!unit) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
+    const scope = scopeOfKind(req.nmmUser, kind);
+    if (!scope) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
     const rows = await q(`${SUMMARY_SELECT} WHERE r.user_id = $1 AND r.unit_id = $2 ORDER BY r.period DESC, r.week DESC`,
-      [req.nmmUser.id, unit.id]);
-    ok(res, { unit, reports: rows.map(summarize) });
+      [scope.ownerId, scope.unitId]);
+    ok(res, { unit: { id: scope.unitId, kind: scope.kind, name: scope.unitName }, onBehalfOf: scope.onBehalfOf,
+              reports: rows.map(summarize) });
   }));
 
   // Open (create if needed) a report for a kind, month and week.
-  router.post("/nmm/reports", ...head, asyncHandler(async (req, res) => {
+  router.post("/nmm/reports", ...reporter, asyncHandler(async (req, res) => {
     const { kind, period } = req.body || {};
     const week = Number(req.body?.week);
     if (!isKind(kind) || !isPeriod(period) || !isWeek(week)) {
       return fail(res, 400, "bad_request", "Provide kind, a period like 2026-09 and a week from 1 to 4.");
     }
-    const unit = unitOfKind(req.nmmUser, kind);
-    if (!unit) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
-    const report = await getOrCreateReport(req.nmmUser, unit, period, week);
+    const scope = scopeOfKind(req.nmmUser, kind);
+    if (!scope) return fail(res, 403, "forbidden", "You do not report for that kind of unit.");
+    const report = await getOrCreateReport(scope, period, week);
     if (!report) return fail(res, 409, "not_open", `The ${weekLabel(week)} for ${period} is not open.`);
-    ok(res, { report, goals: await listGoals(req.nmmUser.id, unit.id, period) });
+    ok(res, { report, onBehalfOf: scope.onBehalfOf, goals: await listGoals(scope.ownerId, scope.unitId, period) });
   }));
 
-  router.get("/nmm/reports/:id", ...head, asyncHandler(async (req, res) => {
+  router.get("/nmm/reports/:id", ...reporter, asyncHandler(async (req, res) => {
     const report = await getReport(Number(req.params.id));
     if (!report) return fail(res, 404, "not_found", "Report not found.");
-    if (report.user_id !== req.nmmUser.id && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "Not your report.");
+    if (!mayActFor(req.nmmUser, report.user_id, report.unit_id) && req.nmmUser.role !== "super_admin") {
+      return fail(res, 403, "forbidden", "Not your report.");
+    }
     ok(res, { report, goals: await listGoals(report.user_id, report.unit_id, report.period) });
   }));
 
   // Save sections while the edit window is open (submitted or not).
-  router.put("/nmm/reports/:id", ...head, asyncHandler(async (req, res) => {
+  router.put("/nmm/reports/:id", ...reporter, asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const report = await getReport(id);
     if (!report) return fail(res, 404, "not_found", "Report not found.");
-    if (report.user_id !== req.nmmUser.id) return fail(res, 403, "forbidden", "Only the owner can edit it.");
+    if (!mayActFor(req.nmmUser, report.user_id, report.unit_id)) return fail(res, 403, "forbidden", "You cannot edit this report.");
     if (!report.window.canEdit) return fail(res, 409, "report_locked", "This report can no longer be changed.");
     await saveReport(report, req.body || {});
     ok(res, { report: await getReport(id) });
   }));
 
   // Submit. Needs goals for the month and at least one highlight.
-  router.post("/nmm/reports/:id/submit", ...head, asyncHandler(async (req, res) => {
+  router.post("/nmm/reports/:id/submit", ...reporter, asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const report = await getReport(id);
     if (!report) return fail(res, 404, "not_found", "Report not found.");
-    if (report.user_id !== req.nmmUser.id) return fail(res, 403, "forbidden", "Only the owner can submit it.");
+    if (!mayActFor(req.nmmUser, report.user_id, report.unit_id)) return fail(res, 403, "forbidden", "You cannot submit this report.");
     if (!report.window.canEdit) return fail(res, 409, "report_locked", "This report can no longer be changed.");
     const errors = [];
     if (!clean(report.head_of_unit)) errors.push("Your account has no full name. Set it on your profile first.");
@@ -759,11 +799,13 @@ module.exports = function nmmRoutes() {
   }));
 
   // Drafts only, while the window is open.
-  router.delete("/nmm/reports/:id", ...head, asyncHandler(async (req, res) => {
+  router.delete("/nmm/reports/:id", ...reporter, asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const report = await getReport(id);
     if (!report) return fail(res, 404, "not_found", "Report not found.");
-    if (report.user_id !== req.nmmUser.id && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "Only the owner can delete it.");
+    if (!mayActFor(req.nmmUser, report.user_id, report.unit_id) && req.nmmUser.role !== "super_admin") {
+      return fail(res, 403, "forbidden", "You cannot delete this report.");
+    }
     if (report.status === "submitted") return fail(res, 409, "report_locked", "Submitted reports cannot be deleted.");
     if (!report.window.canEdit) return fail(res, 409, "report_locked", "This report can no longer be changed.");
     const gone = await q(`DELETE FROM reports WHERE id = $1 AND status = 'draft' RETURNING id`, [id]);
@@ -774,11 +816,11 @@ module.exports = function nmmRoutes() {
 
   /* ---- attachments ----------------------------------------------------- */
 
-  router.post("/nmm/reports/:id/attachments", ...head, uploadsFor("files"), asyncHandler(async (req, res) => {
+  router.post("/nmm/reports/:id/attachments", ...reporter, uploadsFor("files"), asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const report = await getReport(id);
     if (!report) return fail(res, 404, "not_found", "Report not found.");
-    if (report.user_id !== req.nmmUser.id) return fail(res, 403, "forbidden", "Only the owner can add attachments.");
+    if (!mayActFor(req.nmmUser, report.user_id, report.unit_id)) return fail(res, 403, "forbidden", "You cannot add attachments to this report.");
     if (!report.window.canEdit) return fail(res, 409, "report_locked", "This report can no longer be changed.");
     const files = req.files || [];
     if (!files.length) return fail(res, 400, "no_files", "No files received.");
@@ -796,11 +838,13 @@ module.exports = function nmmRoutes() {
     ok(res, { attachments: saved });
   }));
 
-  router.get("/nmm/attachments/:id", ...head, asyncHandler(async (req, res) => {
-    const att = await q1(`SELECT a.*, r.user_id AS owner_id FROM report_attachments a JOIN reports r ON r.id = a.report_id WHERE a.id = $1`,
+  router.get("/nmm/attachments/:id", ...reporter, asyncHandler(async (req, res) => {
+    const att = await q1(`SELECT a.*, r.user_id AS owner_id, r.unit_id AS owner_unit_id FROM report_attachments a JOIN reports r ON r.id = a.report_id WHERE a.id = $1`,
       [Number(req.params.id)]);
     if (!att) return fail(res, 404, "not_found", "Attachment not found.");
-    if (att.owner_id !== req.nmmUser.id && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "Not your attachment.");
+    if (!mayActFor(req.nmmUser, att.owner_id, att.owner_unit_id) && req.nmmUser.role !== "super_admin") {
+      return fail(res, 403, "forbidden", "Not your attachment.");
+    }
     const abs = attachmentPath(att.stored_name);
     if (!abs || !fs.existsSync(abs)) return fail(res, 404, "file_missing", "The stored file is not on this server.");
     const inline = att.mime_type.startsWith("image/") || att.mime_type === "application/pdf";
@@ -811,14 +855,16 @@ module.exports = function nmmRoutes() {
     fs.createReadStream(abs).pipe(res);
   }));
 
-  router.delete("/nmm/attachments/:id", ...head, asyncHandler(async (req, res) => {
+  router.delete("/nmm/attachments/:id", ...reporter, asyncHandler(async (req, res) => {
     const att = await q1(
-      `SELECT a.id, a.stored_name, r.user_id AS owner_id, to_char(r.period, 'YYYY-MM') AS period, r.week, r.status,
+      `SELECT a.id, a.stored_name, r.user_id AS owner_id, r.unit_id AS owner_unit_id, to_char(r.period, 'YYYY-MM') AS period, r.week, r.status,
               r.first_submitted_at::text AS first_submitted_at, r.unlocked_until::text AS unlocked_until
        FROM report_attachments a JOIN reports r ON r.id = a.report_id WHERE a.id = $1`,
       [Number(req.params.id)]);
     if (!att) return fail(res, 404, "not_found", "Attachment not found.");
-    if (att.owner_id !== req.nmmUser.id && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "Not your attachment.");
+    if (!mayActFor(req.nmmUser, att.owner_id, att.owner_unit_id) && req.nmmUser.role !== "super_admin") {
+      return fail(res, 403, "forbidden", "Not your attachment.");
+    }
     if (!editWindow(att).canEdit) return fail(res, 409, "report_locked", "This report can no longer be changed.");
     await q(`DELETE FROM report_attachments WHERE id = $1`, [att.id]);
     const abs = attachmentPath(att.stored_name);
@@ -919,7 +965,7 @@ module.exports = function nmmRoutes() {
     const ids = unitsOf(req.nmmUser).map((u) => u.id);
     const staff = await q(
       `SELECT u.id, u.kc_username, u.kc_name, u.kc_avatar, u.full_name, u.rank, u.staff_role, u.city, u.country,
-              to_char(u.birthday, 'YYYY-MM-DD') AS birthday, u.status, u.staff_unit_id, un.name AS unit_name, un.kind AS unit_kind,
+              to_char(u.birthday, 'YYYY-MM-DD') AS birthday, u.status, u.reports_for_id, u.staff_unit_id, un.name AS unit_name, un.kind AS unit_kind,
               (SELECT count(*)::int FROM staff_kpis k WHERE k.user_id = u.id) AS kpi_count
        FROM users u JOIN units un ON un.id = u.staff_unit_id
        WHERE u.role = 'staff' AND u.staff_unit_id = ANY($1::int[])
@@ -934,7 +980,7 @@ module.exports = function nmmRoutes() {
     const row = await q1(
       `SELECT u.id, u.kc_username, u.kc_name, u.kc_avatar, u.email, u.phone, u.full_name,
               to_char(u.birthday, 'YYYY-MM-DD') AS birthday, u.rank, u.staff_role, u.city, u.country,
-              u.status, u.staff_unit_id AS unit_id, un.name AS unit_name, un.kind AS unit_kind,
+              u.status, u.reports_for_id, u.staff_unit_id AS unit_id, un.name AS unit_name, un.kind AS unit_kind,
               u.profile_submitted_at::text AS profile_submitted_at, u.reviewed_at::text AS reviewed_at,
               u.last_login_at::text AS last_login_at, u.created_at::text AS created_at
        FROM users u JOIN units un ON un.id = u.staff_unit_id
@@ -953,10 +999,26 @@ module.exports = function nmmRoutes() {
     const mine = unitsOf(req.nmmUser).some((u) => u.id === target.staff_unit_id);
     if (!mine && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "You can only manage staff of units you head.");
     const status = req.body?.status;
-    if (!["approved", "rejected", "removed"].includes(status)) {
-      return fail(res, 400, "invalid_status", "status must be approved, rejected or removed.");
+    const canReport = req.body?.canReport;
+    if (status === undefined && typeof canReport !== "boolean") {
+      return fail(res, 400, "bad_request", "Provide status or canReport.");
     }
-    await q(`UPDATE users SET status = $2, reviewed_at = now(), reviewed_by = $3, updated_at = now() WHERE id = $1`, [id, status, req.nmmUser.id]);
+    if (status !== undefined) {
+      if (!["approved", "rejected", "removed"].includes(status)) {
+        return fail(res, 400, "invalid_status", "status must be approved, rejected or removed.");
+      }
+      await q(`UPDATE users SET status = $2, reviewed_at = now(), reviewed_by = $3, updated_at = now() WHERE id = $1`, [id, status, req.nmmUser.id]);
+      // Losing access to the unit also ends any delegation.
+      if (status !== "approved") await q(`UPDATE users SET reports_for_id = NULL WHERE id = $1`, [id]);
+    }
+    // Delegating: the staff member files for the head of the unit they belong to.
+    if (typeof canReport === "boolean") {
+      if (canReport && req.nmmUser.role === "super_admin" && !mine) {
+        return fail(res, 403, "forbidden", "Only a head of the unit can delegate their reports.");
+      }
+      await q(`UPDATE users SET reports_for_id = $2, updated_at = now() WHERE id = $1 AND role = 'staff'`,
+        [id, canReport ? req.nmmUser.id : null]);
+    }
     ok(res, { user: await getUserById(id) });
   }));
 
@@ -1095,7 +1157,7 @@ module.exports = function nmmRoutes() {
     ok(res, { report: await getReport(id) });
   }));
 
-  router.get("/nmm/periods", ...head, asyncHandler(async (_req, res) => {
+  router.get("/nmm/periods", ...reporter, asyncHandler(async (_req, res) => {
     const rows = await q(`SELECT DISTINCT to_char(period, 'YYYY-MM') AS period FROM reports ORDER BY period DESC`);
     ok(res, { periods: rows.map((r) => r.period), current: currentPeriod(), currentWeek: weekOfMonth() });
   }));
