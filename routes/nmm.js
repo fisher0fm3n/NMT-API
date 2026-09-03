@@ -116,7 +116,7 @@ const periodHasEnded = (p, d = zonedNow()) => d >= periodEnd(p);
 
 const ROLES = ["director", "assistant_director", "assistant", "staff", "super_admin"];
 const SELF_ROLES = ["director", "assistant_director", "assistant"];
-const STATUSES = ["pending", "approved", "rejected"];
+const STATUSES = ["pending", "approved", "rejected", "removed"];
 
 /* ---------------------------------------------------------------------------
  * Edit windows — the same rules as the web app
@@ -227,11 +227,13 @@ function requireSuperAdmin(req, res, next) {
   next();
 }
 
+const isClosedStatus = (s) => s === "rejected" || s === "removed";
+
 function nextStepFor(user) {
   if (!user) return "signin";
   const onboarding = isStaff(user) ? "onboarding_staff" : "onboarding";
   if (user.status === "new") return onboarding;
-  if (user.status === "rejected") return "rejected";
+  if (isClosedStatus(user.status)) return user.status; // "rejected" or "removed"
   if (user.status !== "approved") return "pending";
   return hasUnit(user) ? "home" : onboarding;
 }
@@ -507,6 +509,19 @@ module.exports = function nmmRoutes() {
     const user = await getUserById(userId);
     const { token, expiresAt } = await createSession(userId, req.get("user-agent"));
     ok(res, { token, expiresAt: expiresAt.toISOString(), next: nextStepFor(user), user });
+  }));
+
+  // Someone declined or removed acknowledges it: the account goes, so the next
+  // KingsChat sign-in starts a brand-new registration.
+  router.post("/nmm/account/withdraw", requireUser, asyncHandler(async (req, res) => {
+    const u = req.nmmUser;
+    if (!isClosedStatus(u.status)) return fail(res, 409, "not_closed", "Only a declined or removed account can be cleared.");
+    const reports = await q(`SELECT id FROM reports WHERE user_id = $1`, [u.id]);
+    await q(`UPDATE users SET reviewed_by = NULL WHERE reviewed_by = $1`, [u.id]);
+    const gone = await q(`DELETE FROM users WHERE id = $1 AND status IN ('rejected', 'removed') RETURNING id`, [u.id]);
+    if (!gone.length) return fail(res, 500, "withdraw_failed", "Could not remove the account.");
+    for (const r of reports) await fsp.rm(path.join(UPLOAD_DIR, String(r.id)), { recursive: true, force: true }).catch(() => {});
+    ok(res, { removed: true });
   }));
 
   router.post("/nmm/auth/logout", requireUser, asyncHandler(async (req, res) => {
@@ -880,6 +895,24 @@ module.exports = function nmmRoutes() {
     ok(res, { staff });
   }));
 
+  // One staff member in full, for their head's profile view.
+  router.get("/nmm/staff/:id", ...head, asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    const row = await q1(
+      `SELECT u.id, u.kc_username, u.kc_name, u.kc_avatar, u.email, u.phone, u.full_name,
+              to_char(u.birthday, 'YYYY-MM-DD') AS birthday, u.rank, u.staff_role, u.city, u.country,
+              u.status, u.staff_unit_id AS unit_id, un.name AS unit_name, un.kind AS unit_kind,
+              u.profile_submitted_at::text AS profile_submitted_at, u.reviewed_at::text AS reviewed_at,
+              u.last_login_at::text AS last_login_at, u.created_at::text AS created_at
+       FROM users u JOIN units un ON un.id = u.staff_unit_id
+       WHERE u.id = $1 AND u.role = 'staff'`,
+      [id]);
+    if (!row) return fail(res, 404, "not_found", "Staff member not found.");
+    const mine = unitsOf(req.nmmUser).some((u) => u.id === row.unit_id);
+    if (!mine && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "You can only view staff of units you head.");
+    ok(res, { staff: { ...row, kpis: await listKpis(id) } });
+  }));
+
   router.patch("/nmm/staff/:id", ...head, asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
     const target = await q1(`SELECT staff_unit_id FROM users WHERE id = $1 AND role = 'staff'`, [id]);
@@ -887,7 +920,9 @@ module.exports = function nmmRoutes() {
     const mine = unitsOf(req.nmmUser).some((u) => u.id === target.staff_unit_id);
     if (!mine && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "You can only manage staff of units you head.");
     const status = req.body?.status;
-    if (status !== "approved" && status !== "rejected") return fail(res, 400, "invalid_status", "status must be approved or rejected.");
+    if (!["approved", "rejected", "removed"].includes(status)) {
+      return fail(res, 400, "invalid_status", "status must be approved, rejected or removed.");
+    }
     await q(`UPDATE users SET status = $2, reviewed_at = now(), reviewed_by = $3, updated_at = now() WHERE id = $1`, [id, status, req.nmmUser.id]);
     ok(res, { user: await getUserById(id) });
   }));

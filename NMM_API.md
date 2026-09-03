@@ -44,6 +44,12 @@ and `next`, which tells the app what to show:
 
 Tokens last 30 days (`NMM_SESSION_DAYS`). `POST /nmm/auth/logout` revokes one.
 
+When `next` is `rejected` (application declined) or `removed` (access taken away
+after approval), show wording that matches and offer to acknowledge it:
+`POST /nmm/account/withdraw` deletes the account, its KPIs and its sessions, so
+the person can sign in again and register afresh. It returns `not_closed` (409)
+for any other status.
+
 ## Response shape and error codes
 
 Success is `{ "status": true, … }`. Failure is
@@ -92,7 +98,8 @@ the unit as **staff**; existing heads are left untouched (`applied: false`).
 | `GET` / `PUT` | `/nmm/kpis` | A staff member reads / replaces their own KPI list. |
 | `GET` | `/nmm/staff/invites` | Heads only. The link per unit. |
 | `GET` | `/nmm/staff` | Heads only. Their staff with rank, role, location, birthday and KPI count. |
-| `PATCH` | `/nmm/staff/:id` | Heads only. `{ status: "approved" \| "rejected" }`. |
+| `GET` | `/nmm/staff/:id` | One staff member in full: profile fields plus KPIs. Head of that unit, or a super admin. |
+| `PATCH` | `/nmm/staff/:id` | Heads only. `{ status: "approved" \| "rejected" \| "removed" }`. |
 
 Staff accounts do not file reports or set goals: `/nmm/home`, `/nmm/goals`,
 `/nmm/reports*` and `/nmm/periods` return `forbidden` for them.
@@ -208,7 +215,8 @@ Staff join through a unit's invite link. The app captures the token from a
 | `GET` / `PUT` | `/nmm/kpis` | The signed-in staff member's own KPIs. |
 | `GET` | `/nmm/staff/invites` | Heads: the ready-made link per unit they head. |
 | `GET` | `/nmm/staff` | Heads: their staff, with status and KPI counts. |
-| `PATCH` | `/nmm/staff/:id` | `{ status: "approved" \| "rejected" }` — **the head of the unit approves their own staff**; super admins may too. |
+| `GET` | `/nmm/staff/:id` | One staff member in full: profile fields plus KPIs. |
+| `PATCH` | `/nmm/staff/:id` | `{ status: "approved" \| "rejected" \| "removed" }` — **the head of the unit approves, declines or removes their own staff**; super admins may too. |
 
 Staff accounts have `role: "staff"` and a `staffUnitId`. They do not file
 reports: `/nmm/home`, `/nmm/goals`, `/nmm/reports` and `/nmm/periods` return
