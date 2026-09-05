@@ -114,6 +114,23 @@ function periodEnd(p) {
 const isCurrentPeriod = (p, d = zonedNow()) => currentPeriod(d) === p;
 const periodHasEnded = (p, d = zonedNow()) => d >= periodEnd(p);
 
+// The system opens on this month. Every month from it up to the current one
+// stays open so missed reports can still be filed; nothing before it exists.
+const START_PERIOD = process.env.REPORTING_START_PERIOD || "2026-08";
+const MAX_OPEN_MONTHS = 12;
+// "YYYY-MM" sorts as a string, so plain comparison is the whole rule.
+const isOpenPeriod = (p, d = zonedNow()) => isPeriod(p) && p >= START_PERIOD && p <= currentPeriod(d);
+function shiftPeriod(p, months) {
+  const [y, m] = p.split("-").map(Number);
+  const idx = y * 12 + (m - 1) + months;
+  return `${Math.floor(idx / 12)}-${pad((idx % 12) + 1)}`;
+}
+function openPeriods(d = zonedNow(), max = MAX_OPEN_MONTHS) {
+  const out = [];
+  for (let p = currentPeriod(d); p >= START_PERIOD && out.length < max; p = shiftPeriod(p, -1)) out.push(p);
+  return out;
+}
+
 const ROLES = ["director", "assistant_director", "assistant", "staff", "super_admin"];
 const SELF_ROLES = ["director", "assistant_director", "assistant"];
 const STATUSES = ["pending", "approved", "rejected", "removed"];
@@ -121,6 +138,8 @@ const STATUSES = ["pending", "approved", "rejected", "removed"];
 /* ---------------------------------------------------------------------------
  * Edit windows — the same rules as the web app
  *   • anything is editable while its month is running
+ *   • earlier months stay open back to the reporting start month, so missed
+ *     reports can be caught up on
  *   • a submitted month's report stays editable for 24h from first submission
  *   • an admin unlock overrides both until a chosen time
  * ------------------------------------------------------------------------- */
@@ -139,10 +158,15 @@ function editWindow(r, realNow = new Date()) {
   if (isCurrentPeriod(r.period, zoned)) {
     return { canEdit: true, reason: "month", until: periodEnd(r.period).toISOString() };
   }
+  if (isOpenPeriod(r.period, zoned)) {
+    return { canEdit: true, reason: "catch_up", until: null };
+  }
   return { canEdit: false, reason: "closed", until: periodEnd(r.period).toISOString() };
 }
-const canOpenReport = (period, week) => isCurrentPeriod(period) && week <= weekOfMonth();
-const goalsEditable = (period) => isCurrentPeriod(period);
+// This month up to the week we are in; every earlier open month in full.
+const canOpenReport = (period, week) =>
+  isOpenPeriod(period) && (isCurrentPeriod(period) ? week <= weekOfMonth() : true);
+const goalsEditable = (period) => isOpenPeriod(period);
 
 /* ---------------------------------------------------------------------------
  * Auth
@@ -446,8 +470,9 @@ async function unitMonth(userId, unit, period) {
     q(`SELECT id, week, status, submitted_at::text AS submitted_at FROM reports WHERE user_id = $1 AND unit_id = $2 AND period = $3`,
       [userId, unit.id, periodToDate(period)]),
   ]);
-  const monthOpen = isCurrentPeriod(period);
-  const currentWeek = monthOpen ? weekOfMonth() : periodHasEnded(period) ? WEEKS_PER_MONTH + 1 : 0;
+  const isNow = isCurrentPeriod(period);
+  const monthOpen = isOpenPeriod(period);
+  const currentWeek = isNow ? weekOfMonth() : periodHasEnded(period) ? WEEKS_PER_MONTH + 1 : 0;
   const weeks = [];
   for (let w = 1; w <= WEEKS_PER_MONTH; w += 1) {
     const r = rows.find((x) => x.week === w);
@@ -459,7 +484,7 @@ async function unitMonth(userId, unit, period) {
     weeks.push({ week: w, label: weekLabel(w), status, reportId: r?.id ?? null, submitted_at: r?.submitted_at ?? null });
   }
   return { unit, period, goals, weeks, missed: weeks.filter((w) => w.status === "missed").length,
-    currentWeek: Math.min(currentWeek, WEEKS_PER_MONTH), monthOpen };
+    currentWeek: Math.min(currentWeek, WEEKS_PER_MONTH), monthOpen, isCurrentMonth: isNow };
 }
 
 /* ---------------------------------------------------------------------------
@@ -1159,7 +1184,13 @@ module.exports = function nmmRoutes() {
 
   router.get("/nmm/periods", ...reporter, asyncHandler(async (_req, res) => {
     const rows = await q(`SELECT DISTINCT to_char(period, 'YYYY-MM') AS period FROM reports ORDER BY period DESC`);
-    ok(res, { periods: rows.map((r) => r.period), current: currentPeriod(), currentWeek: weekOfMonth() });
+    ok(res, {
+      periods: rows.map((r) => r.period),
+      open: openPeriods(),
+      start: START_PERIOD,
+      current: currentPeriod(),
+      currentWeek: weekOfMonth(),
+    });
   }));
 
   return router;

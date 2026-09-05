@@ -14,9 +14,11 @@ Each of those is a *unit* and each unit gets its own reports. A month has four
 report slots per unit: **Week 1, 2 and 3 Reports** (days 1–7, 8–14, 15–21) and
 the **Month's Report** (day 22 to month end). Before the first report of a month
 can be submitted, the user must set **monthly goals** for that unit; they tick
-those goals off as the weeks go by. Reports are editable while the month is
-running; the Month's Report, once submitted, stays editable for **24 hours**
-and then becomes final. Deadlines are judged in `Africa/Lagos` time.
+those goals off as the weeks go by. Reporting opens on **August 2026**
+(`REPORTING_START_PERIOD`): every month from then up to the current one stays
+open, so missed reports can still be filed. The Month's Report, once submitted,
+stays editable for **24 hours** and then becomes final. Deadlines are judged in
+`Africa/Lagos` time.
 
 ## Authentication
 
@@ -63,9 +65,9 @@ Success is `{ "status": true, … }`. Failure is
 | `onboarding_required` | 403 | Send the user to onboarding. |
 | `approval_required` | 403 | Account not approved yet. |
 | `forbidden` | 403 | Not the owner, or not a super admin. |
-| `not_open` | 409 | That week has not arrived, or its month has ended. |
+| `not_open` | 409 | That week has not arrived, or its month is before the reporting start month. |
 | `report_locked` | 409 | Past the edit window; the report cannot change. |
-| `period_closed` | 409 | Goals for a past month cannot change. |
+| `period_closed` | 409 | Goals for a month outside the open range cannot change. |
 | `validation_failed` | 422 | Submission rejected; `message` lists why. |
 | `upload_error` | 400/413 | File too large or type not allowed. |
 
@@ -150,12 +152,12 @@ runs), `upcoming`. Show `goals.total === 0` as a "set your goals" prompt, and
 | Method | Path | Notes |
 | --- | --- | --- |
 | `GET` | `/nmm/reports?kind=` | History for one unit, newest first. |
-| `POST` | `/nmm/reports` | `{ kind, period, week }` → opens (creates if needed) that report. 409 `not_open` if the week has not arrived or the month is over. Returns the report and the month's goals. |
+| `POST` | `/nmm/reports` | `{ kind, period, week }` → opens (creates if needed) that report. Any month from the reporting start month to the current one; in the current month, only weeks that have arrived. 409 `not_open` otherwise. Returns the report and the month's goals. |
 | `GET` | `/nmm/reports/:id` | Full report + goals. Owner or super admin. |
 | `PUT` | `/nmm/reports/:id` | Save sections. Allowed while `window.canEdit`, even after submission. |
 | `POST` | `/nmm/reports/:id/submit` | Requires goals for the month and at least one highlight. |
 | `DELETE` | `/nmm/reports/:id` | Drafts only, while the window is open. |
-| `GET` | `/nmm/periods` | Months with reports, plus `current` and `currentWeek`. |
+| `GET` | `/nmm/periods` | Months with reports, plus `open` (every month still fillable, newest first), `start` (the reporting start month), `current` and `currentWeek`. |
 
 ### Sections
 
@@ -189,7 +191,8 @@ Every report carries `window`:
 
 | `reason` | Meaning |
 | --- | --- |
-| `month` | Editable until the month ends. |
+| `month` | The current month. Editable until it ends. |
+| `catch_up` | An earlier month that is still open, so what was missed can be filed. `until` is `null`. |
 | `grace` | A submitted Month's Report, inside its 24-hour window. `until` is the deadline. |
 | `unlocked` | A super admin reopened it until `until`. |
 | `closed` | Final. Every write returns `report_locked`. |
