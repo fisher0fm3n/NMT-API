@@ -8,6 +8,10 @@
 //   POST   /pcdl/library/bookmarks  {email, token, publication_id, …} (auth)
 //   DELETE /pcdl/library/bookmarks  {email, token, publication_id, surface_id} (auth)
 //   GET    /pcdl/library/stars      ?email&token                      (auth)
+//   POST   /pcdl/library/highlights {email, token, publication_id, …} (auth)  create, or set the note when `id` is given
+//   DELETE /pcdl/library/highlights {email, token, id}                (auth)
+//   POST   /pcdl/library/notes      {email, token, publication_id, surface_id, body} (auth)  empty body deletes
+//   DELETE /pcdl/library/notes      {email, token, publication_id, surface_id} (auth)
 //
 // A star is awarded once per publication, the first time the reader reaches the
 // last page. Asking again is harmless: the endpoint reports the star it already
@@ -20,6 +24,9 @@ const axios = require("axios");
 const {
   ensureLibrarySchema,
   saveProgress,
+  saveHighlight,
+  deleteHighlight,
+  saveNote,
   readState,
   clampInt,
   trimTo,
@@ -218,6 +225,81 @@ module.exports = function pcdlLibraryRoutes() {
         return rowCount > 0;
       });
       return res.json({ status: true, data: { removed } });
+    }),
+  );
+
+  // ---------------- Highlights ----------------
+  router.post(
+    "/pcdl/library/highlights",
+    asyncHandler(async (req, res) => {
+      const email = await authed(req, res);
+      if (!email) return;
+      const b = req.body || {};
+      if (b.id == null && (!trimTo(b.publication_id, 120) || !trimTo(b.surface_id, 120) || !trimTo(b.text, 2000))) {
+        return res.status(400).json({
+          status: false,
+          error: "bad_request",
+          message: "publication_id, surface_id and text are required",
+        });
+      }
+      await ensureLibrarySchema(withClient);
+      const highlight = await withClient((db) => saveHighlight(db, email, b));
+      if (!highlight) return res.status(404).json({ status: false, error: "not_found" });
+      return res.json({ status: true, data: { highlight } });
+    }),
+  );
+
+  router.delete(
+    "/pcdl/library/highlights",
+    asyncHandler(async (req, res) => {
+      const email = await authed(req, res);
+      if (!email) return;
+      const src = { ...req.query, ...(req.body || {}) };
+      if (src.id == null || src.id === "") {
+        return res.status(400).json({ status: false, error: "bad_request", message: "id is required" });
+      }
+      await ensureLibrarySchema(withClient);
+      const removed = await withClient((db) => deleteHighlight(db, email, src.id));
+      return res.json({ status: true, data: { removed } });
+    }),
+  );
+
+  // ---------------- Chapter notes ----------------
+  router.post(
+    "/pcdl/library/notes",
+    asyncHandler(async (req, res) => {
+      const email = await authed(req, res);
+      if (!email) return;
+      const b = req.body || {};
+      if (!trimTo(b.publication_id, 120) || !trimTo(b.surface_id, 120)) {
+        return res.status(400).json({
+          status: false,
+          error: "bad_request",
+          message: "publication_id and surface_id are required",
+        });
+      }
+      await ensureLibrarySchema(withClient);
+      const note = await withClient((db) => saveNote(db, email, b));
+      return res.json({ status: true, data: { note } });
+    }),
+  );
+
+  router.delete(
+    "/pcdl/library/notes",
+    asyncHandler(async (req, res) => {
+      const email = await authed(req, res);
+      if (!email) return;
+      const src = { ...req.query, ...(req.body || {}) };
+      if (!trimTo(src.publication_id, 120) || !trimTo(src.surface_id, 120)) {
+        return res.status(400).json({
+          status: false,
+          error: "bad_request",
+          message: "publication_id and surface_id are required",
+        });
+      }
+      await ensureLibrarySchema(withClient);
+      await withClient((db) => saveNote(db, email, { ...src, body: "" }));
+      return res.json({ status: true, data: { removed: true } });
     }),
   );
 
