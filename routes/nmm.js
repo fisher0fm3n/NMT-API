@@ -41,7 +41,8 @@ const SESSION_DAYS = Number(process.env.NMM_SESSION_DAYS || 30);
 const TIMEZONE = process.env.NMM_REPORTING_TIMEZONE || "Africa/Lagos";
 const WEEKS_PER_MONTH = 4;
 const MONTHLY_WEEK = 4;
-const GRACE_HOURS = Number(process.env.NMM_MONTHLY_EDIT_GRACE_HOURS || 24);
+// Once submitted, any report can be changed for this long, then it is final.
+const GRACE_HOURS = Number(process.env.NMM_SUBMITTED_EDIT_GRACE_HOURS || 48);
 
 // Must be the SAME folder as the web app's UPLOAD_DIR for attachments to be
 // shared between the two.
@@ -137,11 +138,12 @@ const STATUSES = ["pending", "approved", "rejected", "removed"];
 
 /* ---------------------------------------------------------------------------
  * Edit windows — the same rules as the web app
- *   • anything is editable while its month is running
+ *   • a draft is editable while its month is open
  *   • earlier months stay open back to the reporting start month, so missed
  *     reports can be caught up on
- *   • a submitted month's report stays editable for 24h from first submission
- *   • an admin unlock overrides both until a chosen time
+ *   • any submitted report stays editable for 48h from first submission, then
+ *     it is final; re-submitting does not restart the clock
+ *   • an admin unlock overrides all of that until a chosen time
  * ------------------------------------------------------------------------- */
 
 function editWindow(r, realNow = new Date()) {
@@ -149,7 +151,7 @@ function editWindow(r, realNow = new Date()) {
   if (r.unlocked_until && new Date(r.unlocked_until) > realNow) {
     return { canEdit: true, reason: "unlocked", until: new Date(r.unlocked_until).toISOString() };
   }
-  if (isMonthly(r.week) && r.status === "submitted" && r.first_submitted_at) {
+  if (r.status === "submitted" && r.first_submitted_at) {
     const until = new Date(new Date(r.first_submitted_at).getTime() + GRACE_HOURS * 3_600_000);
     return until > realNow
       ? { canEdit: true, reason: "grace", until: until.toISOString() }
@@ -722,26 +724,26 @@ module.exports = function nmmRoutes() {
           const r = await client.query(
             `UPDATE monthly_goals SET position = $5, goal = $6, intended_outcome = $7, target_date = $8, updated_at = now()
              WHERE id = $1 AND user_id = $2 AND unit_id = $3 AND period = $4 RETURNING id`,
-            [g.id, req.nmmUser.id, unit.id, periodToDate(period), i, clean(g.goal), clean(g.intended_outcome), clean(g.target_date, 300)]);
+            [g.id, scope.ownerId, scope.unitId, periodToDate(period), i, clean(g.goal), clean(g.intended_outcome), clean(g.target_date, 300)]);
           if (r.rows[0]) { keep.push(r.rows[0].id); continue; }
         }
         const ins = await client.query(
           `INSERT INTO monthly_goals (user_id, unit_id, period, position, goal, intended_outcome, target_date)
            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-          [req.nmmUser.id, unit.id, periodToDate(period), i, clean(g.goal), clean(g.intended_outcome), clean(g.target_date, 300)]);
+          [scope.ownerId, scope.unitId, periodToDate(period), i, clean(g.goal), clean(g.intended_outcome), clean(g.target_date, 300)]);
         keep.push(ins.rows[0].id);
       }
       await client.query(`DELETE FROM monthly_goals WHERE user_id = $1 AND unit_id = $2 AND period = $3 AND NOT (id = ANY($4::int[]))`,
-        [req.nmmUser.id, unit.id, periodToDate(period), keep]);
+        [scope.ownerId, scope.unitId, periodToDate(period), keep]);
     });
-    ok(res, { goals: await listGoals(req.nmmUser.id, unit.id, period) });
+    ok(res, { goals: await listGoals(scope.ownerId, scope.unitId, period) });
   }));
 
   router.patch("/nmm/goals/:id", ...reporter, asyncHandler(async (req, res) => {
     const id = Number(req.params.id);
-    const g = await q1(`SELECT user_id, to_char(period, 'YYYY-MM') AS period FROM monthly_goals WHERE id = $1`, [id]);
+    const g = await q1(`SELECT user_id, unit_id, to_char(period, 'YYYY-MM') AS period FROM monthly_goals WHERE id = $1`, [id]);
     if (!g) return fail(res, 404, "not_found", "Goal not found.");
-    if (g.user_id !== req.nmmUser.id && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "Not your goal.");
+    if (!mayActFor(req.nmmUser, g.user_id, g.unit_id) && req.nmmUser.role !== "super_admin") return fail(res, 403, "forbidden", "Not your goal.");
     if (!goalsEditable(g.period)) return fail(res, 409, "period_closed", "Goals for that month can no longer be changed.");
     const completed = Boolean(req.body?.completed);
     await q(`UPDATE monthly_goals SET completed = $2, completed_at = CASE WHEN $2 THEN now() ELSE NULL END, updated_at = now() WHERE id = $1`,
@@ -1036,10 +1038,21 @@ module.exports = function nmmRoutes() {
       // Losing access to the unit also ends any delegation.
       if (status !== "approved") await q(`UPDATE users SET reports_for_id = NULL WHERE id = $1`, [id]);
     }
-    // Delegating: the staff member files for the head of the unit they belong to.
+    // Delegating: the staff member files for the head of the unit they belong
+    // to. A head can hand this to at most one staff member per unit.
     if (typeof canReport === "boolean") {
       if (canReport && req.nmmUser.role === "super_admin" && !mine) {
         return fail(res, 403, "forbidden", "Only a head of the unit can delegate their reports.");
+      }
+      if (canReport) {
+        const holder = await q1(
+          `SELECT id, COALESCE(full_name, kc_name, '@' || kc_username) AS name FROM users
+           WHERE role = 'staff' AND reports_for_id = $1 AND staff_unit_id = $2 AND id <> $3`,
+          [req.nmmUser.id, target.staff_unit_id, id]);
+        if (holder) {
+          return fail(res, 409, "delegate_exists",
+            `${holder.name} already has reporting access for this unit. Only one staff member can have it at a time — remove theirs first.`);
+        }
       }
       await q(`UPDATE users SET reports_for_id = $2, updated_at = now() WHERE id = $1 AND role = 'staff'`,
         [id, canReport ? req.nmmUser.id : null]);

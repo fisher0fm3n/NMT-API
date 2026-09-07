@@ -16,8 +16,8 @@ the **Month's Report** (day 22 to month end). Before the first report of a month
 can be submitted, the user must set **monthly goals** for that unit; they tick
 those goals off as the weeks go by. Reporting opens on **August 2026**
 (`REPORTING_START_PERIOD`): every month from then up to the current one stays
-open, so missed reports can still be filed. The Month's Report, once submitted,
-stays editable for **24 hours** and then becomes final. Deadlines are judged in
+open, so missed reports can still be filed. Any report, once submitted, stays
+editable for **48 hours** and then becomes final. Deadlines are judged in
 `Africa/Lagos` time.
 
 ## Authentication
@@ -65,6 +65,7 @@ Success is `{ "status": true, … }`. Failure is
 | `onboarding_required` | 403 | Send the user to onboarding. |
 | `approval_required` | 403 | Account not approved yet. |
 | `forbidden` | 403 | Not the owner, or not a super admin. |
+| `delegate_exists` | 409 | Another staff member in that unit already has reporting access. |
 | `not_open` | 409 | That week has not arrived, or its month is before the reporting start month. |
 | `report_locked` | 409 | Past the edit window; the report cannot change. |
 | `period_closed` | 409 | Goals for a month outside the open range cannot change. |
@@ -193,7 +194,7 @@ Every report carries `window`:
 | --- | --- |
 | `month` | The current month. Editable until it ends. |
 | `catch_up` | An earlier month that is still open, so what was missed can be filed. `until` is `null`. |
-| `grace` | A submitted Month's Report, inside its 24-hour window. `until` is the deadline. |
+| `grace` | A submitted report, inside its 48-hour window. `until` is the deadline. |
 | `unlocked` | A super admin reopened it until `until`. |
 | `closed` | Final. Every write returns `report_locked`. |
 
@@ -234,8 +235,10 @@ A head can let chosen staff help complete their unit's monthly goals and
 reports. `PATCH /nmm/staff/:id` with `{ "canReport": true }` sets that staff
 member's `reportsForId` to the head; `false` clears it. Only the head of the
 staff member's own unit can grant it, and only for an approved staff member — a
-super admin who does not head that unit gets 403. Declining or removing a staff
-member clears the delegation automatically.
+super admin who does not head that unit gets 403. **A head can delegate to one
+staff member per unit**: granting it while somebody else in that unit holds it
+returns 409 `delegate_exists` naming them — clear theirs first. Declining or
+removing a staff member clears the delegation automatically.
 
 A delegate then gets `/nmm/home`, `/nmm/goals` and `/nmm/reports` for that one
 unit, and everything they file belongs to the **head**: `report.user_id` is the
@@ -265,7 +268,7 @@ stay 403 for staff accounts.
 | `NMM_API_KEY` | falls back to `GENERAL_API_KEY` | The `x-api-key` value. |
 | `NMM_KC_CLIENT_ID` | `630166b6-6431-4239-8036-c40b1b0f2652` | KingsChat OAuth client id. |
 | `NMM_REPORTING_TIMEZONE` | `Africa/Lagos` | Clock used for week boundaries, month ends and submission dates. Keep equal to the web app's `REPORTING_TIMEZONE`. |
-| `NMM_MONTHLY_EDIT_GRACE_HOURS` | `24` | Edit window after submitting the Month's Report. |
+| `NMM_SUBMITTED_EDIT_GRACE_HOURS` | `48` | Edit window after submitting any report. |
 | `NMM_UPLOAD_DIR` | `<cwd>/uploads/nmm` | **Must match the web app's `UPLOAD_DIR`** to share attachments. |
 | `NMM_MAX_UPLOAD_MB` | `25` | Per-file limit. |
 | `NMM_SESSION_DAYS` | `30` | Token lifetime. |
