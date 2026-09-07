@@ -12,6 +12,12 @@
 //   DELETE /pcdl/library/highlights {email, token, id}                (auth)
 //   POST   /pcdl/library/notes      {email, token, publication_id, surface_id, body} (auth)  empty body deletes
 //   DELETE /pcdl/library/notes      {email, token, publication_id, surface_id} (auth)
+//   GET    /pcdl/library/poll       ?poll_id                          (open)  the tally
+//   POST   /pcdl/library/poll       {poll_id, option_id, voter, email?, token?}  (open)  cast or change a vote
+//
+// The poll is open to every reader, signed in or not: the e-magazine is free.
+// A signed-in reader's vote is keyed by their (verified) email; anyone else's
+// by an anonymous id their browser holds on to.
 //
 // A star is awarded once per publication, the first time the reader reaches the
 // last page. Asking again is harmless: the endpoint reports the star it already
@@ -28,6 +34,8 @@ const {
   deleteHighlight,
   saveNote,
   readState,
+  readPoll,
+  castVote,
   clampInt,
   trimTo,
 } = require("../lib/library");
@@ -95,6 +103,52 @@ async function authed(req, res) {
 
 module.exports = function pcdlLibraryRoutes() {
   const router = Router();
+
+  // ---------------- The reader poll in each e-magazine ----------------
+  router.get(
+    "/pcdl/library/poll",
+    asyncHandler(async (req, res) => {
+      const pollId = trimTo(req.query.poll_id, 120);
+      if (!pollId) {
+        return res.status(400).json({ status: false, error: "bad_request", message: "poll_id is required" });
+      }
+      await ensureLibrarySchema(withClient);
+      const data = await withClient((db) => readPoll(db, pollId));
+      return res.json({ status: true, data });
+    }),
+  );
+
+  router.post(
+    "/pcdl/library/poll",
+    asyncHandler(async (req, res) => {
+      const b = req.body || {};
+      const pollId = trimTo(b.poll_id, 120);
+      const optionId = trimTo(b.option_id, 60);
+      if (!pollId || !optionId) {
+        return res.status(400).json({ status: false, error: "bad_request", message: "poll_id and option_id are required" });
+      }
+      // Signed in: the vote belongs to the verified email. Otherwise to the
+      // browser's anonymous id — which can never collide with an email since
+      // it is prefixed.
+      let voter = null;
+      const email = String(b.email || "").trim().toLowerCase();
+      const token = String(b.token || "").trim();
+      if (email && token) {
+        const auth = await verifyUserToken(email, token);
+        if (auth.ok) voter = email;
+      }
+      if (!voter) {
+        const anon = trimTo(b.voter, 80).replace(/[^A-Za-z0-9_-]/g, "");
+        if (anon.length < 8) {
+          return res.status(400).json({ status: false, error: "bad_request", message: "voter is required" });
+        }
+        voter = "anon:" + anon;
+      }
+      await ensureLibrarySchema(withClient);
+      const data = await withClient((db) => castVote(db, pollId, voter, optionId));
+      return res.json({ status: true, data });
+    }),
+  );
 
   // ---------------- Everything the reader has, in one call ----------------
   router.get(
