@@ -11,6 +11,8 @@ const crypto = require("node:crypto");
 const { Client } = require("pg");
 
 const DB_URL = process.env.KP_TEST_DATABASE_URL || "postgres://localhost/kingspresenter_test";
+// Only a database on this computer: the test makes and deletes accounts, and drops the database.
+if (!["localhost", "127.0.0.1", "::1", ""].includes(new URL(DB_URL).hostname)) throw new Error("KP_TEST_DATABASE_URL must be a database on this computer");
 const MEDIA = fs.mkdtempSync(path.join(os.tmpdir(), "kp-media-"));
 
 // KingsChat, as far as sign-in goes: a code becomes a token, a token a profile.
@@ -41,8 +43,9 @@ let routes;
 test.before(async () => {
   await new Promise((r) => kingschat.listen(0, "127.0.0.1", r));
   const kc = `http://127.0.0.1:${kingschat.address().port}`;
+  // The API's .env is not read (KP_SKIP_ENV_FILE), and the database is set outright.
   Object.assign(process.env, {
-    KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
+    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
     KP_API_KEY: "app-key", KP_RELAY_KEY: "relay-key", KP_MEDIA_DIR: MEDIA, KP_RELAY_URL: "wss://relay.test", KP_SITE_URL: "http://localhost:3000",
   });
   delete process.env.KP_TOKEN_SECRET;

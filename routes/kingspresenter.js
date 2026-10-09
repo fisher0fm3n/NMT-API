@@ -28,6 +28,14 @@ const path = require("path");
 const fs = require("fs");
 const fsp = require("fs/promises");
 
+// The API's own .env (beside server.js), wherever pm2 was started from: dotenv's default is
+// the working folder, which pm2 does not set. Values already set are kept.
+const ENV_FILE = path.join(__dirname, "..", ".env");
+// KP_SKIP_ENV_FILE: the environment only (tests, so they never reach the real database).
+if (!process.env.KP_SKIP_ENV_FILE) {
+  try { require("dotenv").config({ path: ENV_FILE, quiet: true }); } catch { /* no dotenv: the environment only */ }
+}
+
 /* ---------------------------------------------------------------------------
  * ENV
  * ------------------------------------------------------------------------- */
@@ -91,6 +99,10 @@ const poolConfig = dbConfigFrom(process.env);
 const DB_MISSING = !poolConfig.connectionString && typeof poolConfig.password !== "string"
   ? "The KingsPresenter database is not set up on this server: add KINGSPRESENTER_DATABASE_URL to its .env (postgres://user:password@host:5432/kingspresenter)."
   : "";
+if (DB_MISSING) {
+  const found = fs.existsSync(ENV_FILE) ? "it is there, without KINGSPRESENTER_DATABASE_URL" : "there is no such file";
+  console.error(`[kp] ${DB_MISSING} Looked in ${ENV_FILE}: ${found}.`);
+}
 const pool = new Pool({ ...poolConfig, max: Number(env("KP_DB_POOL_SIZE") || 10) });
 pool.on("error", (err) => console.error("[kp] idle pg client error:", err.message));
 
