@@ -13,6 +13,7 @@ const ceflixRoutes = require("./ceflix");
 const nmtRoutes = require("./nmt");
 const nmmRoutes = require("./nmm");
 const pcdlAffiliateRoutes = require("./pcdl_affiliate");
+const kingsPresenterRoutes = require("./kingspresenter");
 
 module.exports = function buildRoutes(deps) {
   const router = Router();
@@ -32,6 +33,7 @@ module.exports = function buildRoutes(deps) {
   router.use(nmtRoutes(deps));
   router.use(nmmRoutes(deps));
   router.use(pcdlAffiliateRoutes(deps));
+  router.use(kingsPresenterRoutes(deps));
 
   return router;
 };
