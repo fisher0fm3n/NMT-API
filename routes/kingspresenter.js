@@ -62,15 +62,33 @@ const KINDS = new Set(["services", "songs", "presentations", "media", "templates
  * ------------------------------------------------------------------------- */
 
 const DB_NAME = env("KP_DB_NAME") || "kingspresenter";
-const poolConfig = env("KP_DATABASE_URL")
-  ? { connectionString: env("KP_DATABASE_URL") }
-  : {
-      user: env("KP_DB_USER", "PCO_FN_DB_USER") || "postgres",
-      host: env("KP_DB_HOST", "PCO_FN_DB_HOST"),
-      database: DB_NAME,
-      password: env("KP_DB_PASSWORD", "PCO_FN_DB_PASSWORD"),
-      port: Number(env("KP_DB_PORT", "PCO_FN_DB_PORT") || 5432),
-    };
+
+/**
+ * Where the database is: KingsPresenter's own settings (KP_DATABASE_URL, KP_DB_*), else
+ * NMM reporting's Postgres server (NMM_DATABASE_URL, NMM_DB_*), else PCO_FN's, always with
+ * the database `kingspresenter` on it.
+ */
+function dbConfigFrom(e) {
+  const pick = (...names) => names.map((n) => e[n]).find((v) => v != null && v !== "");
+  if (pick("KP_DATABASE_URL")) return { connectionString: pick("KP_DATABASE_URL") };
+  if (pick("NMM_DATABASE_URL")) {
+    const u = new URL(pick("NMM_DATABASE_URL"));
+    u.pathname = `/${pick("KP_DB_NAME") || "kingspresenter"}`;
+    return { connectionString: u.toString() };
+  }
+  return {
+    user: pick("KP_DB_USER", "NMM_DB_USER", "PCO_FN_DB_USER") || "postgres",
+    host: pick("KP_DB_HOST", "NMM_DB_HOST", "PCO_FN_DB_HOST"),
+    database: pick("KP_DB_NAME") || "kingspresenter",
+    password: pick("KP_DB_PASSWORD", "NMM_DB_PASSWORD", "PCO_FN_DB_PASSWORD"),
+    port: Number(pick("KP_DB_PORT", "NMM_DB_PORT", "PCO_FN_DB_PORT") || 5432),
+  };
+}
+const poolConfig = dbConfigFrom(process.env);
+// No password anywhere: say so, rather than Postgres's "client password must be a string".
+const DB_MISSING = !poolConfig.connectionString && typeof poolConfig.password !== "string"
+  ? "The KingsPresenter database is not set up on this server: add KP_DATABASE_URL to its .env (postgres://user:password@host:5432/kingspresenter)."
+  : "";
 const pool = new Pool({ ...poolConfig, max: Number(env("KP_DB_POOL_SIZE") || 10) });
 pool.on("error", (err) => console.error("[kp] idle pg client error:", err.message));
 
@@ -197,6 +215,7 @@ async function createDatabase() {
   }
 }
 function ensureSchema() {
+  if (DB_MISSING) return Promise.reject(Object.assign(new Error(DB_MISSING), { statusCode: 503 }));
   if (!schemaReady) {
     schemaReady = (async () => {
       try {
@@ -659,4 +678,5 @@ module.exports = function kingsPresenterRoutes() {
 
 // For scripts/kp-migrate.js and tests: making the database, and the pool (to close it).
 module.exports.ensureSchema = ensureSchema;
+module.exports.dbConfigFrom = dbConfigFrom;
 module.exports.pool = pool;

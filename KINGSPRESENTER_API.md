@@ -81,7 +81,7 @@ Library kinds: `services`, `songs`, `presentations`, `media`, `templates`, `sett
 | `KP_API_KEY` | none | App key; unset, none is asked for |
 | `KP_TOKEN_SECRET` | made once, kept in `settings` | Signs access tokens |
 | `KP_ACCESS_TTL_SECONDS` / `KP_REFRESH_DAYS` | 3600 / 90 | Token lifetimes |
-| `KP_DATABASE_URL` | `KP_DB_*`, else `PCO_FN_DB_*` with database `kingspresenter` | The database |
+| `KP_DATABASE_URL` | NMM reporting's server (`NMM_DATABASE_URL` / `NMM_DB_*`), else `KP_DB_*` / `PCO_FN_DB_*`, with database `kingspresenter` | The database |
 | `KP_MEDIA_DIR` | `~/kingspresenter-media` | Media files (outside the project: pm2 restarts on changes inside it) |
 | `KP_MAX_MEDIA_MB` | 2048 | Largest upload |
 | `KP_RELAY_KEY` | none | Lets relays report sessions |
