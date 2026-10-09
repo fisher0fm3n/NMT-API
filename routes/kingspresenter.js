@@ -64,13 +64,13 @@ const KINDS = new Set(["services", "songs", "presentations", "media", "templates
 const DB_NAME = env("KP_DB_NAME") || "kingspresenter";
 
 /**
- * Where the database is: KingsPresenter's own settings (KP_DATABASE_URL, KP_DB_*), else
- * NMM reporting's Postgres server (NMM_DATABASE_URL, NMM_DB_*), else PCO_FN's, always with
- * the database `kingspresenter` on it.
+ * Where the database is: KP_DATABASE_URL or DATABASE_URL (as given), else KingsPresenter's
+ * own fields (KP_DB_*), else NMM reporting's Postgres server (NMM_DATABASE_URL, NMM_DB_*),
+ * else PCO_FN's, those with the database `kingspresenter` on it.
  */
 function dbConfigFrom(e) {
   const pick = (...names) => names.map((n) => e[n]).find((v) => v != null && v !== "");
-  if (pick("KP_DATABASE_URL")) return { connectionString: pick("KP_DATABASE_URL") };
+  if (pick("KP_DATABASE_URL", "DATABASE_URL")) return { connectionString: pick("KP_DATABASE_URL", "DATABASE_URL") };
   if (pick("NMM_DATABASE_URL")) {
     const u = new URL(pick("NMM_DATABASE_URL"));
     u.pathname = `/${pick("KP_DB_NAME") || "kingspresenter"}`;
@@ -87,7 +87,7 @@ function dbConfigFrom(e) {
 const poolConfig = dbConfigFrom(process.env);
 // No password anywhere: say so, rather than Postgres's "client password must be a string".
 const DB_MISSING = !poolConfig.connectionString && typeof poolConfig.password !== "string"
-  ? "The KingsPresenter database is not set up on this server: add KP_DATABASE_URL to its .env (postgres://user:password@host:5432/kingspresenter)."
+  ? "The KingsPresenter database is not set up on this server: add DATABASE_URL to its .env (postgres://user:password@host:5432/kingspresenter)."
   : "";
 const pool = new Pool({ ...poolConfig, max: Number(env("KP_DB_POOL_SIZE") || 10) });
 pool.on("error", (err) => console.error("[kp] idle pg client error:", err.message));

@@ -194,9 +194,11 @@ test("deleting the account removes it and its media", async () => {
   assert.deepEqual(fs.readdirSync(MEDIA).flatMap((d) => fs.readdirSync(path.join(MEDIA, d))), []);
 });
 
-test("the database is found from KingsPresenter's settings, else NMM reporting's server, else PCO_FN's", () => {
+test("the database is found from KP_DATABASE_URL / DATABASE_URL, else NMM reporting's server, else PCO_FN's", () => {
   const { dbConfigFrom } = routes;
   assert.deepEqual(dbConfigFrom({ KP_DATABASE_URL: "postgres://a:b@h/kp", NMM_DATABASE_URL: "postgres://x:y@z/nmm" }), { connectionString: "postgres://a:b@h/kp" });
+  assert.deepEqual(dbConfigFrom({ DATABASE_URL: "postgres://d:e@h/kingspresenter", NMM_DATABASE_URL: "postgres://x:y@z/nmm" }), { connectionString: "postgres://d:e@h/kingspresenter" });
+  assert.deepEqual(dbConfigFrom({ KP_DATABASE_URL: "postgres://a:b@h/kp", DATABASE_URL: "postgres://d:e@h/kingspresenter" }), { connectionString: "postgres://a:b@h/kp" }, "KingsPresenter's own first");
   assert.deepEqual(dbConfigFrom({ NMM_DATABASE_URL: "postgres://nmm:p%40ss@db.example:5433/nmm_reporting?sslmode=require" }),
     { connectionString: "postgres://nmm:p%40ss@db.example:5433/kingspresenter?sslmode=require" }, "the same server, its own database");
   const fields = dbConfigFrom({ NMM_DB_USER: "nmm", NMM_DB_HOST: "db.example", NMM_DB_PASSWORD: "secret", PCO_FN_DB_PASSWORD: "other" });
