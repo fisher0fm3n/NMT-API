@@ -12,6 +12,7 @@
 //   DELETE /pcdl/library/highlights {email, token, id}                (auth)
 //   POST   /pcdl/library/notes      {email, token, publication_id, surface_id, body} (auth)  empty body deletes
 //   DELETE /pcdl/library/notes      {email, token, publication_id, surface_id} (auth)
+//   DELETE /pcdl/library/account    {email, token, voter?}           (auth)  erase all of the reader's library data
 //   GET    /pcdl/library/poll       ?poll_id                          (open)  the tally
 //   POST   /pcdl/library/poll       {poll_id, option_id, voter, email?, token?}  (open)  cast or change a vote
 //
@@ -34,6 +35,7 @@ const {
   deleteHighlight,
   saveNote,
   readState,
+  deleteLibraryData,
   readPoll,
   castVote,
   clampInt,
@@ -103,6 +105,26 @@ async function authed(req, res) {
 
 module.exports = function pcdlLibraryRoutes() {
   const router = Router();
+
+  // ---------------- Erase a reader's library data ----------------
+  // Backs the "delete my data" and "delete my account" actions the app store
+  // rules require. Authenticated like every other write, so a reader can only
+  // ever erase their own rows. `voter` is optional: the anonymous poll id their
+  // browser held, so votes cast before signing in are removed as well.
+  router.delete(
+    "/pcdl/library/account",
+    asyncHandler(async (req, res) => {
+      const email = await authed(req, res);
+      if (!email) return;
+      const src = { ...req.query, ...(req.body || {}) };
+      const anon = trimTo(src.voter, 80).replace(/[^A-Za-z0-9_-]/g, "");
+      await ensureLibrarySchema(withClient);
+      const data = await withClient((db) =>
+        deleteLibraryData(db, email, anon.length >= 8 ? "anon:" + anon : null),
+      );
+      return res.json({ status: true, data });
+    }),
+  );
 
   // ---------------- The reader poll in each e-magazine ----------------
   router.get(

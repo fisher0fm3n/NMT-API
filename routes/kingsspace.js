@@ -79,22 +79,7 @@ const AI_VIDEO_TABLE = process.env.IMMTV_AI_VIDEO_TABLE || "ks_ai_videos";
 const AI_SEGMENT_TABLE =
   process.env.IMMTV_AI_SEGMENT_TABLE || "ks_ai_video_segments";
 
-const externalMysqlPool = mysql.createPool({
-  host: IMMTV_DB_HOST,
-  port: IMMTV_DB_PORT,
-  user: IMMTV_DB_USER,
-  password: IMMTV_DB_PASSWORD,
-  database: IMMTV_DB_NAME,
-  waitForConnections: true,
-  connectionLimit: Number(process.env.IMMTV_DB_POOL_SIZE || 10),
-  queueLimit: 0,
-  charset: "utf8mb4",
-  connectTimeout: 10000,
-  ssl:
-    String(process.env.IMMTV_DB_SSL || "").toLowerCase() === "false"
-      ? undefined
-      : { rejectUnauthorized: false },
-});
+const externalMysqlPool = require("../lib/immtvDb").getImmtvPool();
 
 const openai = new OpenAI({
   apiKey: OPENAI_API_KEY,

@@ -220,7 +220,7 @@ async function scriptureText(db, row) {
   if (row.scripture_text) return row.scripture_text;
   try {
     const resp = await axios.get(
-      `https://bible-api.com/${encodeURIComponent(row.scripture_ref)}?translation=web`,
+      `https://bible-api.com/${encodeURIComponent(row.scripture_ref)}?translation=kjv`,
       { timeout: 8000 },
     );
     const text = String(resp?.data?.text || "").replace(/\s+/g, " ").trim();

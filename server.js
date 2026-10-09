@@ -176,6 +176,10 @@ const port = Number(process.env.PORT || 3001);
 const host = process.env.HOST || "0.0.0.0";
 
 // IMPORTANT: listen on the HTTP server, not app
+// Daily "new video in your interests" push. Claims each day in Mongo, so a
+// pm2 restart cannot make it send twice.
+require("./jobs/dailyInterestVideo").start({ getDb });
+
 server.listen(port, host, () => {
   console.log(`API + Socket.IO up on port ${port}`);
   console.log(`Local:   http://localhost:${port}`);

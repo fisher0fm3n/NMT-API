@@ -4,6 +4,8 @@ const { Client } = require("pg");
 const axios = require("axios");
 const { trimDeep } = require("../lib/utils");
 const { getFirebaseAdmin } = require("../lib/firebaseAdmin");
+const { sendExpoPushNotifications } = require("../lib/expoPush");
+const dailyInterestVideo = require("../jobs/dailyInterestVideo");
 
 // ---------------------------------------------------------------------
 // DB
@@ -74,31 +76,6 @@ function isValidHttpsImageUrl(value) {
   }
 }
 
-async function sendExpoPushNotifications(messages = []) {
-  if (!Array.isArray(messages) || !messages.length) return [];
-
-  const chunks = chunkArray(messages, 100);
-  const responses = [];
-
-  for (const chunk of chunks) {
-    const { data } = await axios.post(
-      "https://exp.host/--/api/v2/push/send",
-      chunk,
-      {
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        timeout: 30000,
-      },
-    );
-
-    responses.push(data);
-  }
-
-  return responses;
-}
-
 async function getUserNotificationSetting(db, userID) {
   const doc = await db.collection("ceflix_user_notification_settings").findOne({
     userID: String(userID),
@@ -118,6 +95,27 @@ async function getUserNotificationSetting(db, userID) {
 // ---------------------------------------------------------------------
 module.exports = function ceflixRoutes({ getDb }) {
   const router = Router();
+
+  // ---------------- Daily interest notification: run now ----------------
+  // Protected: set CEFLIX_JOBS_KEY in the environment and send it as the
+  // x-jobs-key header. ?dryRun=1 reports who would get what without sending;
+  // ?force=1 sends even if today's scheduled run already happened.
+  router.post(
+    "/ceflix/notifications/daily-interest/run",
+    asyncHandler(async (req, res) => {
+      const expected = process.env.CEFLIX_JOBS_KEY;
+
+      if (!expected || req.get("x-jobs-key") !== expected) {
+        return res.status(403).json({ status: false, msg: "Forbidden" });
+      }
+
+      const dryRun = ["1", "true"].includes(String(req.query.dryRun || "").toLowerCase());
+      const force = ["1", "true"].includes(String(req.query.force || "").toLowerCase());
+      const summary = await dailyInterestVideo.run({ db: await getDb(), dryRun, force });
+
+      return res.json({ status: true, ...summary });
+    }),
+  );
 
   router.get("/ceflix/test", (_req, res) =>
     res.json({ status: true, test: "hello m8" }),
