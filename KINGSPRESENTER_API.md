@@ -75,6 +75,9 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `no_token` / `invalid_token` | 401 | No or expired access token, used-up refresh token |
 | `missing_code` | 400 | No `code` or `accessToken` |
 | `missing_ticket` / `invalid_ticket` | 400 / 401 | No ticket; one expired or already collected |
+| `account_disabled` | 403 | The account was disabled by the administrator |
+| `unauthorized_admin_key` / `admin_off` | 401 / 503 | Wrong `x-admin-key`; `KP_ADMIN_KEY` unset |
+| `device_limit` | 403 | Signed in on as many devices as `KP_MAX_DEVICES` allows; sign one out first |
 | `kc_exchange_failed` / `kc_profile_failed` / `kc_no_identity` | 502 | KingsChat refused |
 | `kc_not_configured` | 500 | `KP_KC_CLIENT_ID` (or `NMM_KC_CLIENT_ID`) unset |
 
@@ -87,7 +90,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `POST /kp/auth/kingschat`, `/kp/auth/refresh`, `/kp/auth/logout` | Above |
 | `/kp/auth/kingschat/callback`, `POST /kp/auth/ticket` | KingsChat's redirect and the desktop's ticket (above) |
 | `GET /kp/me` | `{ user }` |
-| `GET /kp/devices` | The computers and phones signed in: `{ devices: [{ id, name, kind, lastSeen, signedIn, current }] }` |
+| `GET /kp/devices` | The computers and phones signed in: `{ devices: [{ id, name, kind, lastSeen, signedIn, current }], signedIn, max }` |
 | `DELETE /kp/devices/:id` | Signs that device out and forgets it |
 | `DELETE /kp/account` | The account, its library and media, for good |
 | `GET /kp/sync/pull?since=<cursor>` | Library changes after a cursor: `{ changes: [{ kind, id, rev, updatedAt, deletedAt, doc }], cursor, more }` (500 at a time) |
@@ -167,6 +170,43 @@ x-filename: KingsPresenter-0.1.2-arm64.dmg   x-sha256: <the file's>   x-notes: <
 Errors: `unauthorized_upload_key` (401), `bad_request` / `hash_mismatch` / `empty_upload`
 (400), `too_large` (413, over `KP_MAX_RELEASE_MB`), `uploads_off` (503, no key set).
 
+## May this copy run?
+
+The desktop app asks at start and every few hours, signed in or not:
+
+```
+GET /kp/app/check?installId=<uuid>&version=0.1.1&platform=darwin&arch=arm64&name=<computer>   (x-api-key; a Bearer token when signed in)
+→ { "status": true, "allowed": true|false, "reason": ""|"update"|"disabled", "message", "minVersion" }
+```
+
+`installId` is the copy's own id (made once on that computer); every copy that asks is kept
+in `installs` with its version, computer name, platform, last account and when it was last
+seen. `update`: the copy is older than the oldest version allowed and must update first.
+`disabled`: the copy, or the account signed in on it, was disabled. The app keeps the last
+answer, so a copy told to stop stays stopped offline (one that updates past the version
+required is let in again by itself).
+
+A disabled account also cannot sign in (`account_disabled`, 403) or use any signed-in call.
+
+### The administrator (`x-admin-key: KP_ADMIN_KEY`)
+
+| Call | |
+| --- | --- |
+| `GET /kp/admin/installs?q=` | Copies, newest first (q: computer name, version, account name or id) |
+| `POST /kp/admin/installs/:id` | `{ "disabled": true, "reason": "Licence ended." }` — one copy off (`false`: on again) |
+| `GET /kp/admin/users?q=` | Accounts, with their copies and signed-in devices |
+| `POST /kp/admin/users/:id` | `{ "disabled": true, "reason" }` — `:id` is the account id or its KingsChat username |
+| `GET /kp/admin/policy` | `{ minVersion, message }` |
+| `PUT /kp/admin/policy` | `{ "minVersion": "0.2.0", "message": "Please update before Sunday." }` — `""` lets every version run |
+
+An installer uploaded with `x-required: 1` becomes the oldest version allowed by itself.
+
+```bash
+curl -H "x-admin-key: $KEY" "https://nmt.loveworldapis.com/api/kp/admin/installs?q=Main%20Hall"
+curl -X POST -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"disabled":true,"reason":"Licence ended."}' https://nmt.loveworldapis.com/api/kp/admin/installs/<id>
+curl -X PUT -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"minVersion":"0.2.0"}' https://nmt.loveworldapis.com/api/kp/admin/policy
+```
+
 ## Configuration
 
 | Variable | Default | |
@@ -186,6 +226,8 @@ Errors: `unauthorized_upload_key` (401), `bad_request` / `hash_mismatch` / `empt
 | `OPENAI_API_KEY` | (the API's own) | The AI for recording summaries; unset, summaries answer `summaries_off` |
 | `KP_SUMMARY_MODEL` | `gpt-4.1-mini` | The model that writes them |
 | `KP_SUMMARY_MAX_CHARS` | 600000 | The longest transcript summarised |
+| `KP_ADMIN_KEY` | none | The administrator's key for `/kp/admin/*`; unset: no admin routes |
+| `KP_MAX_DEVICES` | 0 (no limit) | How many devices one account may be signed in on at once; a new device beyond it is refused (`device_limit`, 403). `/kp/me` and `/kp/devices` report `signedIn` and `max`. Read on each sign-in, so it can change without a restart |
 | `KP_UPDATE_UPLOAD_KEY` | none | Lets the build upload installers (the GitHub secret of the same name) |
 | `KP_RELEASES_DIR` | `~/kingspresenter-releases` | The installers (outside the project, as the media) |
 | `KP_MAX_RELEASE_MB` | 1024 | Largest installer |

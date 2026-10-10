@@ -12,6 +12,8 @@
 //   remote_sessions  a church computer's Remote sessions, as its relay reports them
 //   remote_joins     the phones that joined them
 //   signin_tickets   one-time tickets from the callback page, for the app to collect its tokens
+//   installs         every copy of the desktop app that has asked whether it may run (its version,
+//                    computer, last account, and whether the administrator disabled it)
 //   recording_summaries  a recording's summary, written by the AI from its transcript (kept by recording)
 //   releases         KingsPresenter's installers, one per version and platform, for updates
 //   settings         this service's own values (the token signing key when none is set)
@@ -62,6 +64,13 @@ const KC_LOGIN_URL = "https://accounts.kingschat.online/log-in";
 const SITE_URL = (env("KP_SITE_URL", "NMM_SITE_URL") || "").replace(/\/+$/, "");
 
 const ACCESS_TTL = Number(env("KP_ACCESS_TTL_SECONDS") || 3600);
+// How many devices (computers and phones) one account may be signed in on at once; 0: no
+// limit. Read when asked, so a change takes effect without a restart (and tests can set it).
+const maxDevices = () => Math.max(0, Number(env("KP_MAX_DEVICES") || 0) || 0);
+// The administrator's key (x-admin-key) for /kp/admin/*: who may use KingsPresenter, and the
+// oldest version allowed. Unset: no admin routes. Read when asked (tests set it).
+const adminKey = () => env("KP_ADMIN_KEY") || "";
+const DISABLED_TEXT = "This copy of KingsPresenter has been disabled. Contact your KingsPresenter administrator.";
 const REFRESH_DAYS = Number(env("KP_REFRESH_DAYS") || 90);
 // Outside the project folder: pm2 restarts the API when a file in it changes.
 const MEDIA_DIR = path.resolve(env("KP_MEDIA_DIR") || path.join(os.homedir(), "kingspresenter-media"));
@@ -164,6 +173,23 @@ const SCHEMA = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   );
   CREATE INDEX IF NOT EXISTS refresh_tokens_user ON refresh_tokens (user_id);
+
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
+
+  CREATE TABLE IF NOT EXISTS installs (
+    id UUID PRIMARY KEY,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    name TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    arch TEXT NOT NULL DEFAULT '',
+    version TEXT NOT NULL DEFAULT '',
+    first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    last_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+    disabled_at TIMESTAMPTZ,
+    disabled_reason TEXT
+  );
+  CREATE INDEX IF NOT EXISTS installs_user ON installs (user_id);
 
   CREATE TABLE IF NOT EXISTS signin_tickets (
     ticket_hash TEXT PRIMARY KEY,
@@ -546,21 +572,54 @@ const requireUser = asyncHandler(async (req, res, next) => {
   if (!token) return fail(res, 401, "no_token", "Sign in to continue.");
   const payload = await verifyAccess(token);
   if (!payload) return fail(res, 401, "invalid_token", "Your session has expired. Sign in again.");
+  const off = await q1(`SELECT disabled_reason FROM users WHERE id = $1 AND disabled_at IS NOT NULL`, [payload.sub]);
+  if (off) return fail(res, 403, "account_disabled", off.disabled_reason || DISABLED_TEXT);
   req.kpUserId = payload.sub;
   req.kpDeviceId = payload.dev || null;
   next();
 });
 
+function requireAdmin(req, res, next) {
+  const key = adminKey();
+  if (!key) return fail(res, 503, "admin_off", "KP_ADMIN_KEY is not set on this server.");
+  const given = (req.header("x-admin-key") || "").trim();
+  if (!given || !safeEqual(given, key)) return fail(res, 401, "unauthorized_admin_key", "Invalid or missing x-admin-key.");
+  next();
+}
+
+/** A value kept in the settings table, or "" (the oldest version allowed, its message). */
+const setting = async (key) => (await q1(`SELECT value FROM settings WHERE key = $1`, [key]))?.value || "";
+const setSetting = (key, value) => (value
+  ? q(`INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`, [key, value])
+  : q(`DELETE FROM settings WHERE key = $1`, [key]));
+
 const DEVICE_KINDS = new Set(["desktop", "phone", "web"]);
 
 /** A device's tokens: the access token and a new refresh token (its hash stored). */
+/** How many of the account's devices hold a live sign-in (a refresh token not yet expired). */
+async function signedInCount(userId, { except = null } = {}) {
+  const row = await q1(
+    `SELECT count(DISTINCT t.device_id)::int AS n FROM refresh_tokens t WHERE t.user_id = $1 AND t.expires_at > now() AND t.device_id IS NOT NULL ${except ? "AND t.device_id <> $2" : ""}`,
+    except ? [userId, except] : [userId]);
+  return row?.n || 0;
+}
+
 async function issue(userId, { deviceId, deviceName, deviceKind, userAgent }) {
+  const off = await q1(`SELECT disabled_reason FROM users WHERE id = $1 AND disabled_at IS NOT NULL`, [userId]);
+  if (off) throw Object.assign(new Error(off.disabled_reason || DISABLED_TEXT), { statusCode: 403, code: "account_disabled" });
   const user = await getUserById(userId);
   // The device's own id when it has one (and it is not another account's), else a new one.
   let device = isUuid(deviceId) ? deviceId : null;
   if (device && (await q1(`SELECT 1 FROM devices WHERE id = $1 AND user_id <> $2`, [device, userId]))) device = null;
   device = device || crypto.randomUUID();
   const kind = DEVICE_KINDS.has(deviceKind) ? deviceKind : "desktop";
+  // A new device on an account already signed in on as many as allowed: refused, with the
+  // way out. A device signing in again (its own id) always may.
+  const max = maxDevices();
+  if (max) {
+    const others = await signedInCount(userId, { except: device });
+    if (others >= max) throw Object.assign(new Error(`This account is signed in on ${others} device${others === 1 ? "" : "s"} already, the most allowed (${max}). Sign one out in KingsPresenter → Settings → Account → Devices, then try again.`), { statusCode: 403, code: "device_limit", signedIn: others, max });
+  }
   await q(
     `INSERT INTO devices (id, user_id, name, kind) VALUES ($1, $2, $3, $4)
      ON CONFLICT (id) DO UPDATE SET last_seen = now(),
@@ -663,7 +722,7 @@ function callbackPage(payload) {
   const body = payload.status
     ? `<p id="m">Signed in${name ? ` as <b>${name}</b>` : ""}. Returning to KingsPresenter…</p>
 <p id="open" hidden><a class="btn" href="${link}">Open KingsPresenter</a><br><small>If nothing happens, open KingsPresenter and sign in from Settings → Account.</small></p>`
-    : `<p id="m">Sign-in did not work${payload.error ? ` (${String(payload.error).replace(/[<>&"]/g, "")})` : ""}. Close this and try again.</p>`;
+    : `<p id="m">${payload.message ? String(payload.message).replace(/[<>&"]/g, "") : `Sign-in did not work${payload.error ? ` (${String(payload.error).replace(/[<>&"]/g, "")})` : ""}. Close this and try again.`}</p>`;
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>KingsPresenter</title><style>body{font-family:system-ui,sans-serif;background:#1c1d21;color:#f2f3f5;display:grid;place-items:center;min-height:100vh;margin:0}p{max-width:22rem;text-align:center;line-height:1.5}.btn{display:inline-block;margin:.5rem 0;padding:.6rem 1.2rem;border-radius:.5rem;background:#3b82f6;color:#fff;text-decoration:none;font-weight:600}small{color:#9aa0a6}</style></head>
 <body>${body}
@@ -717,15 +776,19 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
 
   /* ---- auth ------------------------------------------------------------ */
 
+  // issue() refusing a device over the account's limit: the refusal, as the answer.
+  const limited = (res, err) => { if (err?.code !== "device_limit" && err?.code !== "account_disabled") throw err; return fail(res, 403, err.code, err.message); };
+
   router.post("/kp/auth/kingschat", ...app, asyncHandler(async (req, res) => {
     const code = clean(req.body?.code || req.body?.authCode, 4096);
     const accessToken = clean(req.body?.accessToken, 4096);
     if (!code && !accessToken) return fail(res, 400, "missing_code", "Provide `code` from KingsChat, or an `accessToken`.");
     const kc = await kingsChatUser({ code, accessToken });
     if (kc.error) return fail(res, ...kc.error);
-    const out = await issue(kc.userId, {
-      deviceId: req.body?.deviceId, deviceName: req.body?.deviceName, deviceKind: req.body?.deviceKind, userAgent: req.get("user-agent"),
-    });
+    let out;
+    try {
+      out = await issue(kc.userId, { deviceId: req.body?.deviceId, deviceName: req.body?.deviceName, deviceKind: req.body?.deviceKind, userAgent: req.get("user-agent") });
+    } catch (err) { return limited(res, err); }
     ok(res, out);
   }));
 
@@ -742,7 +805,13 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     if (!code) return res.status(400).send(callbackPage({ status: false, error: "missing_code" }));
     const kc = await kingsChatUser({ code });
     if (kc.error) return res.status(kc.error[0]).send(callbackPage({ status: false, error: kc.error[1] }));
-    const out = await issue(kc.userId, { deviceKind: clean(req.query.kind, 20) || "phone", deviceName: clean(req.query.device, 120), userAgent: req.get("user-agent") });
+    let out;
+    try {
+      out = await issue(kc.userId, { deviceKind: clean(req.query.kind, 20) || "phone", deviceName: clean(req.query.device, 120), userAgent: req.get("user-agent") });
+    } catch (err) {
+      if (err?.code !== "device_limit" && err?.code !== "account_disabled") throw err;
+      return res.status(403).send(callbackPage({ status: false, error: err.code, message: err.message }));
+    }
     // The ticket remembers the tokens made for the page, so the app's collecting it can
     // retire them (a browser sign-in would otherwise leave a phantom phone on the account).
     const ticket = crypto.randomBytes(32).toString("base64url");
@@ -762,9 +831,10 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       const gone = await q1(`DELETE FROM refresh_tokens WHERE token_hash = $1 RETURNING device_id`, [row.page_token_hash]);
       if (gone?.device_id) await q(`DELETE FROM devices WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM refresh_tokens WHERE device_id = $1)`, [gone.device_id]);
     }
-    const out = await issue(row.user_id, {
-      deviceId: req.body?.deviceId, deviceName: req.body?.deviceName, deviceKind: req.body?.deviceKind || "desktop", userAgent: req.get("user-agent"),
-    });
+    let out;
+    try {
+      out = await issue(row.user_id, { deviceId: req.body?.deviceId, deviceName: req.body?.deviceName, deviceKind: req.body?.deviceKind || "desktop", userAgent: req.get("user-agent") });
+    } catch (err) { return limited(res, err); }
     ok(res, out);
   }));
 
@@ -789,7 +859,7 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     const u = await getUserById(req.kpUserId);
     if (!u) return fail(res, 401, "invalid_token", "This account no longer exists.");
     if (req.kpDeviceId) await q(`UPDATE devices SET last_seen = now() WHERE id = $1 AND user_id = $2`, [req.kpDeviceId, u.id]);
-    ok(res, { user: u });
+    ok(res, { user: u, devices: { signedIn: await signedInCount(u.id), max: maxDevices() } });
   }));
 
   // The computers and phones signed in to this account; signing one out.
@@ -798,7 +868,8 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       `SELECT d.id, d.name, d.kind, d.created_at, d.last_seen,
               EXISTS (SELECT 1 FROM refresh_tokens t WHERE t.device_id = d.id AND t.expires_at > now()) AS signed_in
        FROM devices d WHERE d.user_id = $1 ORDER BY d.last_seen DESC`, [req.kpUserId]);
-    ok(res, { devices: rows.map((d) => ({ id: d.id, name: d.name, kind: d.kind, createdAt: d.created_at, lastSeen: d.last_seen, signedIn: d.signed_in, current: d.id === req.kpDeviceId })) });
+    const devices = rows.map((d) => ({ id: d.id, name: d.name, kind: d.kind, createdAt: d.created_at, lastSeen: d.last_seen, signedIn: d.signed_in, current: d.id === req.kpDeviceId }));
+    ok(res, { devices, signedIn: devices.filter((d) => d.signedIn).length, max: maxDevices() });
   }));
 
   router.delete("/kp/devices/:id", ...user, asyncHandler(async (req, res) => {
@@ -1023,8 +1094,109 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       [version, platform, arch, filename, storageKey, bytes, sha, notes]);
     // An older file this one replaced (a different name for the same version and platform) goes.
     for (const f of await fsp.readdir(dir).catch(() => [])) if (f.startsWith(`${platform}-${arch}-`) && f !== `${platform}-${arch}-${filename}`) await fsp.rm(path.join(dir, f), { force: true });
+    // x-required: 1 — everyone older must update to this one before using KingsPresenter again.
+    const required = /^(1|true|yes)$/i.test(clean(req.header("x-required"), 8));
+    if (required && newer(version, await setting("min_version"))) await setSetting("min_version", version);
     res.status(201);
-    ok(res, { release: shapeRelease(req, row) });
+    ok(res, { release: shapeRelease(req, row), required });
+  }));
+
+  /* ---- May this copy run? -------------------------------------------- */
+
+  // The desktop app asks at start and every few hours (signed in or not): is this version
+  // still allowed, and has this copy, or the account using it, been disabled? Each copy
+  // has its own id (installId), so it can be seen and disabled on its own.
+  router.get("/kp/app/check", ...app, asyncHandler(async (req, res) => {
+    const installId = isUuid(req.query.installId) ? String(req.query.installId) : null;
+    const version = clean(req.query.version, 40);
+    const payload = await verifyAccess(bearerToken(req)); // optional: who is signed in on it
+    let install = null;
+    if (installId) {
+      install = await q1(
+        `INSERT INTO installs (id, user_id, name, platform, arch, version) VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (id) DO UPDATE SET user_id = COALESCE(EXCLUDED.user_id, installs.user_id), name = CASE WHEN EXCLUDED.name <> '' THEN EXCLUDED.name ELSE installs.name END,
+           platform = EXCLUDED.platform, arch = EXCLUDED.arch, version = EXCLUDED.version, last_seen = now()
+         RETURNING *`,
+        [installId, payload?.sub || null, clean(req.query.name, 120), clean(req.query.platform, 20), clean(req.query.arch, 20), version]);
+    }
+    const userId = payload?.sub || install?.user_id || null;
+    const user = userId ? await q1(`SELECT disabled_at, disabled_reason FROM users WHERE id = $1`, [userId]) : null;
+    if (install?.disabled_at) return ok(res, { allowed: false, reason: "disabled", message: install.disabled_reason || DISABLED_TEXT, minVersion: "" });
+    if (user?.disabled_at) return ok(res, { allowed: false, reason: "disabled", message: user.disabled_reason || DISABLED_TEXT, minVersion: "" });
+    const min = await setting("min_version");
+    if (min && version && newer(min, version)) {
+      const message = (await setting("min_version_message")) || `This version of KingsPresenter (${version}) is no longer supported. Update to ${min} or later to keep using it.`;
+      return ok(res, { allowed: false, reason: "update", message, minVersion: min });
+    }
+    ok(res, { allowed: true, reason: "", message: "", minVersion: min });
+  }));
+
+  /* ---- The administrator ---------------------------------------------- */
+
+  const shapeInstall = (r) => ({
+    id: r.id, name: r.name, platform: r.platform, arch: r.arch, version: r.version, firstSeen: r.first_seen, lastSeen: r.last_seen,
+    disabled: Boolean(r.disabled_at), disabledReason: r.disabled_reason || "", user: r.user_id ? { id: r.user_id, username: r.kc_username, name: r.kc_name } : null,
+  });
+
+  // The copies that have asked, newest first; q: a computer's name, a version, or an account's name.
+  router.get("/kp/admin/installs", requireAdmin, asyncHandler(async (req, res) => {
+    const term = clean(req.query.q, 80);
+    const rows = await q(
+      `SELECT i.*, u.kc_username, u.kc_name FROM installs i LEFT JOIN users u ON u.id = i.user_id
+       ${term ? `WHERE i.name ILIKE $2 OR i.version = $3 OR u.kc_username ILIKE $2 OR u.kc_name ILIKE $2 OR i.id::text = $3` : ""}
+       ORDER BY i.last_seen DESC LIMIT $1`,
+      term ? [Math.min(500, Number(req.query.limit) || 100), `%${term}%`, term] : [Math.min(500, Number(req.query.limit) || 100)]);
+    ok(res, { installs: rows.map(shapeInstall) });
+  }));
+
+  // One copy on or off: { disabled: true, reason: "…" } (the reason is what it shows).
+  router.post("/kp/admin/installs/:id", requireAdmin, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 400, "invalid_install", "No such copy.");
+    const off = Boolean(req.body?.disabled);
+    const row = await q1(`UPDATE installs SET disabled_at = ${off ? "now()" : "NULL"}, disabled_reason = $2 WHERE id = $1 RETURNING *`, [req.params.id, off ? clean(req.body?.reason, 500) || null : null]);
+    if (!row) return fail(res, 404, "not_found", "No such copy.");
+    ok(res, { install: shapeInstall(row) });
+  }));
+
+  // Accounts: q a KingsChat username or name. With their copies and signed-in devices.
+  router.get("/kp/admin/users", requireAdmin, asyncHandler(async (req, res) => {
+    const term = clean(req.query.q, 80).replace(/^@/, "");
+    const rows = await q(
+      `SELECT u.id, u.kc_username, u.kc_name, u.created_at, u.last_login_at, u.disabled_at, u.disabled_reason,
+              (SELECT count(*)::int FROM installs i WHERE i.user_id = u.id) AS installs,
+              (SELECT count(DISTINCT t.device_id)::int FROM refresh_tokens t WHERE t.user_id = u.id AND t.expires_at > now()) AS signed_in
+       FROM users u ${term ? `WHERE u.kc_username ILIKE $2 OR u.kc_name ILIKE $2 OR u.id::text = $3` : ""}
+       ORDER BY u.last_login_at DESC NULLS LAST LIMIT $1`,
+      term ? [Math.min(500, Number(req.query.limit) || 100), `%${term}%`, term] : [Math.min(500, Number(req.query.limit) || 100)]);
+    ok(res, { users: rows.map((u) => ({ id: u.id, username: u.kc_username, name: u.kc_name, createdAt: u.created_at, lastLoginAt: u.last_login_at, installs: u.installs, signedIn: u.signed_in, disabled: Boolean(u.disabled_at), disabledReason: u.disabled_reason || "" })) });
+  }));
+
+  // An account on or off (its id, or its KingsChat username): off, every copy it is signed in
+  // on stops, and it cannot sign in or sync until it is on again.
+  router.post("/kp/admin/users/:id", requireAdmin, asyncHandler(async (req, res) => {
+    const who = clean(req.params.id, 120).replace(/^@/, "");
+    const off = Boolean(req.body?.disabled);
+    const row = await q1(
+      `UPDATE users SET disabled_at = ${off ? "now()" : "NULL"}, disabled_reason = $2 WHERE ${isUuid(who) ? "id = $1::uuid" : "lower(kc_username) = lower($1)"} RETURNING id, kc_username, kc_name, disabled_at, disabled_reason`,
+      [who, off ? clean(req.body?.reason, 500) || null : null]);
+    if (!row) return fail(res, 404, "not_found", "No such account.");
+    ok(res, { user: { id: row.id, username: row.kc_username, name: row.kc_name, disabled: Boolean(row.disabled_at), disabledReason: row.disabled_reason || "" } });
+  }));
+
+  // The oldest version allowed (everyone older must update before using KingsPresenter), and
+  // what they are told. { minVersion: "" } lets every version run again.
+  router.get("/kp/admin/policy", requireAdmin, asyncHandler(async (_req, res) => {
+    ok(res, { minVersion: await setting("min_version"), message: await setting("min_version_message") });
+  }));
+  router.put("/kp/admin/policy", requireAdmin, asyncHandler(async (req, res) => {
+    const body = req.body || {};
+    if ("minVersion" in body) {
+      const v = clean(body.minVersion, 40).replace(/^v/i, "");
+      if (v && !/^\d+\.\d+\.\d+/.test(v)) return fail(res, 400, "bad_request", "minVersion must be a version, e.g. 0.1.3, or empty.");
+      await setSetting("min_version", v);
+    }
+    if ("message" in body) await setSetting("min_version_message", clean(body.message, 1000));
+    ok(res, { minVersion: await setting("min_version"), message: await setting("min_version_message") });
   }));
 
   const latestFor = async (platform, arch) => {

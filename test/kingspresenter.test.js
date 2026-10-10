@@ -99,7 +99,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -313,6 +313,87 @@ test("installers: uploaded by the build with the key, checked against their hash
   await call("PUT", "/kp/updates/upload", { body: dmg2, key: null, headers: headers({ "x-filename": "KingsPresenter-0.1.2-arm64-fixed.dmg", "x-sha256": crypto.createHash("sha256").update(dmg2).digest("hex") }) });
   assert.deepEqual(fs.readdirSync(path.join(RELEASES, "0.1.2")).sort(), ["darwin-arm64-KingsPresenter-0.1.2-arm64-fixed.dmg", "win32-x64-KingsPresenter Setup 0.1.2.exe"]);
   assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.1.1", { token: auth.accessToken })).json.size, 5000);
+});
+
+test("signed-in devices are counted, and a limit (KP_MAX_DEVICES) refuses one more until one signs out", async () => {
+  const me = (await call("GET", "/kp/me", { token: auth.accessToken })).json;
+  assert.equal(typeof me.devices.signedIn, "number");
+  assert.equal(me.devices.max, 0, "no limit by default");
+  const list = (await call("GET", "/kp/devices", { token: auth.accessToken })).json;
+  assert.equal(list.signedIn, list.devices.filter((d) => d.signedIn).length);
+  process.env.KP_MAX_DEVICES = String(list.signedIn);
+  try {
+    const more = await call("POST", "/kp/auth/kingschat", { body: { code: "good-code", deviceName: "One too many", deviceKind: "phone" } });
+    assert.deepEqual([more.status, more.json.error], [403, "device_limit"]);
+    assert.match(more.json.message, /signed in on \d+ devices? already/);
+    assert.equal((await call("GET", "/kp/me", { token: auth.accessToken })).json.devices.max, list.signedIn);
+    // The same device again: allowed (it is not one more).
+    const again = await call("POST", "/kp/auth/kingschat", { body: { code: "good-code", deviceId: auth.deviceId, deviceName: "Desk again" } });
+    assert.equal(again.status, 200, again.text);
+    auth.accessToken = again.json.accessToken; auth.refreshToken = again.json.refreshToken;
+    // One signed out: room for one more.
+    const other = list.devices.find((d) => d.signedIn && !d.current);
+    assert.ok(other, "another signed-in device to sign out");
+    assert.equal((await call("DELETE", `/kp/devices/${other.id}`, { token: auth.accessToken })).json.deleted, true);
+    const now = await call("POST", "/kp/auth/kingschat", { body: { code: "good-code", deviceName: "One more", deviceKind: "phone" } });
+    assert.equal(now.status, 200, now.text);
+  } finally { delete process.env.KP_MAX_DEVICES; }
+});
+
+test("may this copy run: an oldest version allowed, a copy or an account disabled, by the administrator's key", async () => {
+  const install = crypto.randomUUID();
+  const check = (version = "0.1.1", token) => call("GET", `/kp/app/check?installId=${install}&version=${version}&platform=darwin&arch=arm64&name=Main%20Hall%20Mac`, { token });
+  // Nothing set: allowed, and the copy is on the list.
+  assert.deepEqual([(await check()).json.allowed, (await check()).json.reason], [true, ""]);
+  const admin = { "x-admin-key": "admin-key" };
+  assert.equal((await call("GET", "/kp/admin/installs", { headers: admin })).json.error, "admin_off", "no admin key on the server: no admin");
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    assert.equal((await call("GET", "/kp/admin/installs", { headers: { "x-admin-key": "wrong" } })).status, 401);
+    const listed = (await call("GET", "/kp/admin/installs?q=Main Hall", { headers: admin })).json.installs.find((i) => i.id === install);
+    assert.deepEqual([listed.name, listed.version, listed.platform, listed.disabled], ["Main Hall Mac", "0.1.1", "darwin", false]);
+
+    // An oldest version: older copies must update first; that version and newer may run.
+    assert.equal((await call("PUT", "/kp/admin/policy", { headers: admin, body: { minVersion: "nope" } })).json.error, "bad_request");
+    assert.equal((await call("PUT", "/kp/admin/policy", { headers: admin, body: { minVersion: "0.2.0" } })).json.minVersion, "0.2.0");
+    const old = (await check("0.1.1")).json;
+    assert.deepEqual([old.allowed, old.reason, old.minVersion], [false, "update", "0.2.0"]);
+    assert.match(old.message, /0\.1\.1\) is no longer supported\. Update to 0\.2\.0/);
+    assert.equal((await check("0.2.0")).json.allowed, true);
+    await call("PUT", "/kp/admin/policy", { headers: admin, body: { message: "Please update before Sunday." } });
+    assert.equal((await check("0.1.1")).json.message, "Please update before Sunday.");
+    await call("PUT", "/kp/admin/policy", { headers: admin, body: { minVersion: "", message: "" } });
+    assert.equal((await check("0.1.1")).json.allowed, true, "cleared: every version again");
+
+    // One copy disabled, with what it is told; on again.
+    const off = await call("POST", `/kp/admin/installs/${install}`, { headers: admin, body: { disabled: true, reason: "Licence ended." } });
+    assert.equal(off.json.install.disabled, true);
+    assert.deepEqual([(await check()).json.allowed, (await check()).json.reason, (await check()).json.message], [false, "disabled", "Licence ended."]);
+    await call("POST", `/kp/admin/installs/${install}`, { headers: admin, body: { disabled: false } });
+    assert.equal((await check()).json.allowed, true);
+
+    // An account disabled (by its KingsChat username): its copies stop, it cannot use the API or sign in.
+    await check("0.1.1", auth.accessToken); // this copy now knows who uses it
+    const user = await call("POST", "/kp/admin/users/@pastor_ade", { headers: admin, body: { disabled: true } });
+    assert.equal(user.json.user.disabled, true);
+    assert.deepEqual([(await check()).json.allowed, (await check()).json.reason], [false, "disabled"], "even asked without a token");
+    assert.match((await check()).json.message, /has been disabled/);
+    assert.equal((await call("GET", "/kp/me", { token: auth.accessToken })).json.error, "account_disabled");
+    assert.equal((await call("POST", "/kp/auth/kingschat", { body: { code: "good-code" } })).json.error, "account_disabled");
+    const users = (await call("GET", "/kp/admin/users?q=pastor", { headers: admin })).json.users;
+    assert.deepEqual([users[0].username, users[0].disabled, users[0].installs >= 1], ["pastor_ade", true, true]);
+    await call("POST", `/kp/admin/users/${user.json.user.id}`, { headers: admin, body: { disabled: false } });
+    assert.equal((await call("GET", "/kp/me", { token: auth.accessToken })).status, 200);
+    assert.equal((await check()).json.allowed, true);
+
+    // A release uploaded as required becomes the oldest version allowed.
+    const exe = crypto.randomBytes(500);
+    const up = await call("PUT", "/kp/updates/upload", { body: exe, key: null, headers: { "x-upload-key": "upload-key", "x-version": "0.3.0", "x-platform": "win32", "x-arch": "x64", "x-filename": "KingsPresenter Setup 0.3.0.exe", "x-sha256": crypto.createHash("sha256").update(exe).digest("hex"), "x-required": "1" } });
+    assert.equal(up.json.required, true);
+    assert.equal((await call("GET", "/kp/admin/policy", { headers: admin })).json.minVersion, "0.3.0");
+    assert.equal((await check("0.2.9")).json.reason, "update");
+    await call("PUT", "/kp/admin/policy", { headers: admin, body: { minVersion: "" } });
+  } finally { delete process.env.KP_ADMIN_KEY; }
 });
 
 test("versions compare as numbers", () => {
