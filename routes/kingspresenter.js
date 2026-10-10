@@ -11,6 +11,7 @@
 //   relays           the relay servers phones and church computers meet at
 //   remote_sessions  a church computer's Remote sessions, as its relay reports them
 //   remote_joins     the phones that joined them
+//   signin_tickets   one-time tickets from the callback page, for the app to collect its tokens
 //   recording_summaries  a recording's summary, written by the AI from its transcript (kept by recording)
 //   releases         KingsPresenter's installers, one per version and platform, for updates
 //   settings         this service's own values (the token signing key when none is set)
@@ -49,6 +50,11 @@ const KP_API_KEY = env("KP_API_KEY") || "";
 
 // KingsChat: the same client as NMM reporting (KP_* to give KingsPresenter its own).
 const KC_CLIENT_ID = env("KP_KC_CLIENT_ID", "NMM_KC_CLIENT_ID") || "";
+// Set when KingsChat's registration of the app came with a client secret (sent with the code).
+const KC_CLIENT_SECRET = env("KP_KC_CLIENT_SECRET") || "";
+// A sign-in finished on this API's own callback page is handed to the desktop app as a
+// one-time ticket (kingspresenter://auth?ticket=…), good for this long.
+const TICKET_SECONDS = 300;
 const KC_API_KEY = env("KP_KC_API_KEY", "NMM_KC_API_KEY") || "";
 const KC_TOKEN_URL = env("KP_KC_TOKEN_URL") || "https://connect.kingsch.at/developer/api/oauth2/token";
 const KC_PROFILE_URL = env("KP_KC_PROFILE_URL") || "https://connect.kingsch.at/developer/api/user/profile";
@@ -158,6 +164,14 @@ const SCHEMA = `
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
   );
   CREATE INDEX IF NOT EXISTS refresh_tokens_user ON refresh_tokens (user_id);
+
+  CREATE TABLE IF NOT EXISTS signin_tickets (
+    ticket_hash TEXT PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    page_token_hash TEXT,
+    expires_at TIMESTAMPTZ NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
 
   CREATE TABLE IF NOT EXISTS documents (
     seq BIGSERIAL,
@@ -570,7 +584,7 @@ async function issue(userId, { deviceId, deviceName, deviceKind, userAgent }) {
 async function exchangeKcCode(code) {
   const resp = await fetch(KC_TOKEN_URL, {
     method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ grant_type: "code", client_id: KC_CLIENT_ID, code }),
+    body: JSON.stringify({ grant_type: "code", client_id: KC_CLIENT_ID, code, ...(KC_CLIENT_SECRET ? { client_secret: KC_CLIENT_SECRET } : {}) }),
   }).catch(() => null);
   if (!resp || !resp.ok) return null;
   const json = await resp.json().catch(() => null);
@@ -637,14 +651,35 @@ async function kingsChatUser({ code, accessToken }) {
   return { userId: await upsertKcUser(profile) };
 }
 
-// The page KingsChat sends a phone back to when the app uses this API as its redirect:
-// it hands the app its tokens (inside the app's sign-in view) and says where to go.
+// The page KingsChat sends people back to (the app's registered redirect is this API's own
+// callback). In KingsPresenter Remote's sign-in view it hands the phone its tokens; in a
+// browser it opens KingsPresenter with a one-time ticket (kingspresenter://auth?ticket=…),
+// which the app swaps for its tokens at POST /kp/auth/ticket. Nothing is posted to an
+// opening window: a page that opened KingsChat's sign-in is not thereby KingsPresenter.
 function callbackPage(payload) {
   const data = JSON.stringify({ type: "kp-auth", ...payload }).replace(/</g, "\\u003c");
+  const name = String(payload.user?.name || payload.user?.username || "").replace(/[<>&"]/g, "");
+  const link = payload.deepLink ? String(payload.deepLink).replace(/["<>&]/g, "") : "";
+  const body = payload.status
+    ? `<p id="m">Signed in${name ? ` as <b>${name}</b>` : ""}. Returning to KingsPresenter…</p>
+<p id="open" hidden><a class="btn" href="${link}">Open KingsPresenter</a><br><small>If nothing happens, open KingsPresenter and sign in from Settings → Account.</small></p>`
+    : `<p id="m">Sign-in did not work${payload.error ? ` (${String(payload.error).replace(/[<>&"]/g, "")})` : ""}. Close this and try again.</p>`;
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>KingsPresenter</title><style>body{font-family:system-ui,sans-serif;background:#1c1d21;color:#f2f3f5;display:grid;place-items:center;min-height:100vh;margin:0}p{max-width:22rem;text-align:center;line-height:1.5}</style></head>
-<body><p id="m">${payload.status ? "Signed in. Returning to KingsPresenter…" : "Sign-in did not work. Close this and try again."}</p>
-<script>var d=${data};try{if(window.ReactNativeWebView)window.ReactNativeWebView.postMessage(JSON.stringify(d));else if(window.opener)window.opener.postMessage(d,"*");}catch(e){}</script></body></html>`;
+<title>KingsPresenter</title><style>body{font-family:system-ui,sans-serif;background:#1c1d21;color:#f2f3f5;display:grid;place-items:center;min-height:100vh;margin:0}p{max-width:22rem;text-align:center;line-height:1.5}.btn{display:inline-block;margin:.5rem 0;padding:.6rem 1.2rem;border-radius:.5rem;background:#3b82f6;color:#fff;text-decoration:none;font-weight:600}small{color:#9aa0a6}</style></head>
+<body>${body}
+<script>var d=${data};try{if(window.ReactNativeWebView){window.ReactNativeWebView.postMessage(JSON.stringify(d));}else if(d.status&&d.deepLink){document.getElementById("open").hidden=false;setTimeout(function(){location.href=d.deepLink;},400);}}catch(e){}</script></body></html>`;
+}
+
+/** The code KingsChat sent, by whichever name it used, from the body (form or JSON) or the address. */
+function codeSent(req) {
+  for (const src of [req.body, req.query]) {
+    if (!src || typeof src !== "object") continue;
+    for (const k of ["code", "authCode", "authorizationCode", "authorization_code"]) {
+      const v = clean(src[k], 4096);
+      if (v) return v;
+    }
+  }
+  return "";
 }
 
 /* ---------------------------------------------------------------------------
@@ -694,16 +729,43 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     ok(res, out);
   }));
 
-  // KingsChat's redirect, for an app that sends people back here (KingsChat posts the code,
-  // or puts it in the address). No app key: KingsChat itself calls it.
+  // KingsChat's redirect: the app's registered redirect URL is this route, and KingsChat
+  // posts the code here as a form (or puts it in the address). No app key: KingsChat
+  // itself calls it. The person is signed in here, and the page hands the result on:
+  // tokens to KingsPresenter Remote's sign-in view, a one-time ticket to the desktop
+  // app (the desktop usually takes the code before this page loads, and needs neither).
   router.all("/kp/auth/kingschat/callback", asyncHandler(async (req, res) => {
     res.type("html");
-    const code = clean(req.body?.code || req.body?.authCode || req.query.code || req.query.authCode, 4096);
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    const code = codeSent(req);
     if (!code) return res.status(400).send(callbackPage({ status: false, error: "missing_code" }));
     const kc = await kingsChatUser({ code });
     if (kc.error) return res.status(kc.error[0]).send(callbackPage({ status: false, error: kc.error[1] }));
     const out = await issue(kc.userId, { deviceKind: clean(req.query.kind, 20) || "phone", deviceName: clean(req.query.device, 120), userAgent: req.get("user-agent") });
-    res.send(callbackPage({ status: true, ...out }));
+    // The ticket remembers the tokens made for the page, so the app's collecting it can
+    // retire them (a browser sign-in would otherwise leave a phantom phone on the account).
+    const ticket = crypto.randomBytes(32).toString("base64url");
+    await q(`INSERT INTO signin_tickets (ticket_hash, user_id, page_token_hash, expires_at) VALUES ($1, $2, $3, now() + make_interval(secs => $4::int))`,
+      [sha256(ticket), kc.userId, sha256(out.refreshToken), TICKET_SECONDS]);
+    res.send(callbackPage({ status: true, ...out, ticket, deepLink: `kingspresenter://auth?ticket=${ticket}` }));
+  }));
+
+  // The desktop app, opened by the callback page's link: its ticket for its tokens. Once.
+  router.post("/kp/auth/ticket", ...app, asyncHandler(async (req, res) => {
+    const ticket = clean(req.body?.ticket, 200);
+    if (!ticket) return fail(res, 400, "missing_ticket", "Provide the `ticket` from the sign-in page.");
+    await q(`DELETE FROM signin_tickets WHERE expires_at < now()`);
+    const row = await q1(`DELETE FROM signin_tickets WHERE ticket_hash = $1 AND expires_at > now() RETURNING user_id, page_token_hash`, [sha256(ticket)]);
+    if (!row) return fail(res, 401, "invalid_ticket", "That sign-in has expired or was used already. Sign in again.");
+    if (row.page_token_hash) {
+      const gone = await q1(`DELETE FROM refresh_tokens WHERE token_hash = $1 RETURNING device_id`, [row.page_token_hash]);
+      if (gone?.device_id) await q(`DELETE FROM devices WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM refresh_tokens WHERE device_id = $1)`, [gone.device_id]);
+    }
+    const out = await issue(row.user_id, {
+      deviceId: req.body?.deviceId, deviceName: req.body?.deviceName, deviceKind: req.body?.deviceKind || "desktop", userAgent: req.get("user-agent"),
+    });
+    ok(res, out);
   }));
 
   // A new access token for a refresh token, which is used up and replaced.

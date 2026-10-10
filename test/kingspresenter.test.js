@@ -51,7 +51,7 @@ test.before(async () => {
   const kc = `http://127.0.0.1:${kingschat.address().port}`;
   // The API's .env is not read (KP_SKIP_ENV_FILE), and the database is set outright.
   Object.assign(process.env, {
-    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
+    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_CLIENT_SECRET: "shh", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
     KP_API_KEY: "app-key", KP_RELAY_KEY: "relay-key", KP_MEDIA_DIR: MEDIA, KP_RELAY_URL: "wss://relay.test", KP_SITE_URL: "http://localhost:3000",
     KP_RELEASES_DIR: RELEASES, KP_UPDATE_UPLOAD_KEY: "upload-key", KP_SUMMARY_MAX_CHARS: "5000",
   });
@@ -99,7 +99,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -119,7 +119,7 @@ test("signing in with KingsChat: the code is exchanged, the profile read, the ac
   const r = await call("POST", "/kp/auth/kingschat", { body: { code: "good-code", deviceName: "Main Hall Mac", deviceKind: "desktop" } });
   assert.equal(r.status, 200);
   auth = r.json;
-  assert.deepEqual(kcCalls.find((c) => c.url === "/token" && c.body.code === "good-code").body, { grant_type: "code", client_id: "test-client", code: "good-code" });
+  assert.deepEqual(kcCalls.find((c) => c.url === "/token" && c.body.code === "good-code").body, { grant_type: "code", client_id: "test-client", code: "good-code", client_secret: "shh" });
   assert.deepEqual([auth.user.kcId, auth.user.username, auth.user.name, auth.user.email], ["kc-123", "pastor_ade", "Ade Bello", "ade@church.org"]);
   assert.match(auth.accessToken, /^[\w-]+\.[\w-]+\.[\w-]+$/);
   const claims = JSON.parse(Buffer.from(auth.accessToken.split(".")[1], "base64url"));
@@ -186,17 +186,45 @@ test("relays report church computers' sessions and the phones that join; the acc
   assert.ok(sessions[0].closedAt);
 });
 
-test("KingsChat's redirect to this API: a phone's sign-in view is handed its tokens", async () => {
+test("KingsChat's redirect to this API: a phone's sign-in view is handed its tokens; the code by any name, with the client secret", async () => {
   const r = await fetch(`${base}/kp/auth/kingschat/callback?kind=phone`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "code=good-code" });
   const html = await r.text();
   assert.equal(r.status, 200);
+  assert.equal(r.headers.get("cache-control"), "no-store");
   assert.match(html, /ReactNativeWebView/);
+  assert.doesNotMatch(html, /window\.opener/, "tokens are not posted to whatever opened the window");
   const data = JSON.parse(html.match(/var d=(\{.*?\});try/)[1]);
   assert.deepEqual([data.type, data.status, data.user.username], ["kp-auth", true, "pastor_ade"]);
   assert.ok(data.accessToken && data.refreshToken);
+  assert.match(data.deepLink, /^kingspresenter:\/\/auth\?ticket=/);
+  assert.equal(kcCalls.filter((c) => c.url === "/token").at(-1).body.client_secret, "shh");
+  // The code as JSON, under KingsChat's other name for it.
+  const j = await fetch(`${base}/kp/auth/kingschat/callback`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ authCode: "second-code" }) });
+  assert.equal(j.status, 200);
   const bad = await fetch(`${base}/kp/auth/kingschat/callback?code=nope`);
   assert.equal(bad.status, 502);
   assert.match(await bad.text(), /did not work/);
+  assert.equal((await fetch(`${base}/kp/auth/kingschat/callback`)).status, 400);
+});
+
+test("a sign-in finished in a browser: the desktop app collects its tokens with the page's ticket, once, and the page's own tokens are retired", async () => {
+  const before = (await call("GET", "/kp/devices", { token: auth.accessToken })).json.devices.length;
+  const r = await fetch(`${base}/kp/auth/kingschat/callback`, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: "code=good-code" });
+  const data = JSON.parse((await r.text()).match(/var d=(\{.*?\});try/)[1]);
+  assert.equal((await call("GET", "/kp/devices", { token: auth.accessToken })).json.devices.length, before + 1, "the page's sign-in is a device for now");
+  const got = await call("POST", "/kp/auth/ticket", { body: { ticket: data.ticket, deviceName: "Main Hall Mac", deviceKind: "desktop" } });
+  assert.equal(got.status, 200, got.text);
+  assert.ok(got.json.accessToken && got.json.refreshToken);
+  assert.equal(got.json.user.username, "pastor_ade");
+  const devices = (await call("GET", "/kp/devices", { token: auth.accessToken })).json.devices;
+  assert.equal(devices.length, before + 1, "the page's phantom device is gone; the desktop took its place");
+  assert.ok(devices.some((d) => d.name === "Main Hall Mac" && d.kind === "desktop"));
+  // The page's refresh token no longer works; the ticket is spent.
+  assert.equal((await call("POST", "/kp/auth/refresh", { body: { refreshToken: data.refreshToken } })).json.error, "invalid_token");
+  assert.equal((await call("POST", "/kp/auth/ticket", { body: { ticket: data.ticket } })).json.error, "invalid_ticket");
+  assert.equal((await call("POST", "/kp/auth/ticket", { body: { ticket: "made-up" } })).status, 401);
+  assert.equal((await call("POST", "/kp/auth/ticket", { body: {} })).json.error, "missing_ticket");
+  assert.equal((await call("POST", "/kp/auth/ticket", { body: { ticket: "x" }, key: null })).status, 401, "needs the app key");
 });
 
 const SUMMARY = {

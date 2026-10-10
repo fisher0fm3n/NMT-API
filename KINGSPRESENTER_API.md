@@ -19,9 +19,12 @@ POST /kp/auth/kingschat   { "code": "<authCode>", "deviceId"?, "deviceName"?, "d
 ```
 
 The app opens
-`https://accounts.kingschat.online/log-in?clientId=<KP_KC_CLIENT_ID>&redirect_uri=<KP_SITE_URL>/auth/kingschat/callback`
-(the same client and site as NMM reporting), takes the `authCode` KingsChat sends
-back, and posts it here. An existing KingsChat `accessToken` may be sent instead.
+`https://accounts.kingschat.online/log-in?clientId=<KP_KC_CLIENT_ID>&redirect_uri=<KP_SITE_URL>/auth/kingschat/callback`,
+takes the `code` KingsChat sends back, and posts it here. An existing KingsChat
+`accessToken` may be sent instead. KingsPresenter's registration with KingsChat is a
+Web application whose Redirect URL is this API's own callback
+(`https://nmt.loveworldapis.com/api/kp/auth/kingschat/callback`, so `KP_SITE_URL` is
+`https://nmt.loveworldapis.com/api/kp`) and whose Callback Delivery is Form POST.
 
 ```json
 { "status": true, "accessToken": "<JWT, 1 h>", "refreshToken": "<opaque, 90 days>",
@@ -34,10 +37,33 @@ it by calling `GET /kp/me`. `POST /kp/auth/refresh { refreshToken }` returns a n
 pair; each refresh token works once. `POST /kp/auth/logout { refreshToken }` ends
 that device's sign-in.
 
-`/kp/auth/kingschat/callback` (GET or POST, no app key) is a redirect a phone may
-give KingsChat instead: it exchanges the code and returns a page that hands the
-tokens to the app's sign-in view (`window.ReactNativeWebView.postMessage`,
-`{ type: "kp-auth", status, accessToken, refreshToken, user, … }`).
+### The callback
+
+`/kp/auth/kingschat/callback` (GET or POST, no app key) is where KingsChat sends
+people back. It takes the code from the posted form or JSON (`code`, `authCode`,
+`authorizationCode`, `authorization_code`) or from the address, signs the person in,
+and returns a page (`Cache-Control: no-store`) that hands the result on:
+
+- In KingsPresenter Remote's sign-in view: the tokens, by
+  `window.ReactNativeWebView.postMessage` — `{ type: "kp-auth", status, accessToken,
+  refreshToken, expiresIn, deviceId, user, ticket, deepLink }` (`?kind=phone`, `?device=`
+  name the device; a phone by default).
+- In a browser (the desktop app signing in through it): a one-time ticket, opened as
+  `kingspresenter://auth?ticket=<ticket>` (an "Open KingsPresenter" button when the link
+  does not open by itself). The app swaps it for its tokens:
+
+```
+POST /kp/auth/ticket   { "ticket", "deviceId"?, "deviceName"?, "deviceKind"?: "desktop" }
+```
+
+The answer is as `POST /kp/auth/kingschat`'s. A ticket works once and for 5 minutes
+(`invalid_ticket`, 401, after that); collecting it retires the tokens the page was given,
+so a browser sign-in leaves no phantom phone on the account. The page posts nothing to
+the window that opened it.
+
+The desktop app usually takes the code out of KingsChat's redirect before this page
+loads (its own sign-in window) and posts it to `/kp/auth/kingschat` itself; the page is
+for phones and for sign-ins through an ordinary browser.
 
 ## Responses
 
@@ -48,6 +74,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `unauthorized_api_key` | 401 | Missing or wrong `x-api-key` |
 | `no_token` / `invalid_token` | 401 | No or expired access token, used-up refresh token |
 | `missing_code` | 400 | No `code` or `accessToken` |
+| `missing_ticket` / `invalid_ticket` | 400 / 401 | No ticket; one expired or already collected |
 | `kc_exchange_failed` / `kc_profile_failed` / `kc_no_identity` | 502 | KingsChat refused |
 | `kc_not_configured` | 500 | `KP_KC_CLIENT_ID` (or `NMM_KC_CLIENT_ID`) unset |
 
@@ -58,6 +85,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /kp/ping` | Alive; the number of accounts |
 | `GET /kp/config` | `{ kingschat: { clientId, loginUrl, redirectUri }, relays: [{ name, url, region }] }` |
 | `POST /kp/auth/kingschat`, `/kp/auth/refresh`, `/kp/auth/logout` | Above |
+| `/kp/auth/kingschat/callback`, `POST /kp/auth/ticket` | KingsChat's redirect and the desktop's ticket (above) |
 | `GET /kp/me` | `{ user }` |
 | `GET /kp/devices` | The computers and phones signed in: `{ devices: [{ id, name, kind, lastSeen, signedIn, current }] }` |
 | `DELETE /kp/devices/:id` | Signs that device out and forgets it |
@@ -143,8 +171,9 @@ Errors: `unauthorized_upload_key` (401), `bad_request` / `hash_mismatch` / `empt
 
 | Variable | Default | |
 | --- | --- | --- |
-| `KP_KC_CLIENT_ID` | `NMM_KC_CLIENT_ID` | KingsChat client (the same one as NMM reporting) |
-| `KP_SITE_URL` | `NMM_SITE_URL` | KingsChat's redirect site, as NMM reporting's |
+| `KP_KC_CLIENT_ID` | `NMM_KC_CLIENT_ID` | KingsChat client id (KingsPresenter's Web application) |
+| `KP_KC_CLIENT_SECRET` | none | Its client secret, when KingsChat issued one (sent with the code) |
+| `KP_SITE_URL` | `NMM_SITE_URL` | The site KingsChat sends people back to: `https://nmt.loveworldapis.com/api/kp` (this API's own callback) |
 | `KP_KC_API_KEY` | `NMM_KC_API_KEY` | Optional KingsChat `api-key` header |
 | `KP_API_KEY` | none | App key; unset, none is asked for |
 | `KP_TOKEN_SECRET` | made once, kept in `settings` | Signs access tokens |
