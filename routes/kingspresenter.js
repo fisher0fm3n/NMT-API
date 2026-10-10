@@ -11,6 +11,8 @@
 //   relays           the relay servers phones and church computers meet at
 //   remote_sessions  a church computer's Remote sessions, as its relay reports them
 //   remote_joins     the phones that joined them
+//   recording_summaries  a recording's summary, written by the AI from its transcript (kept by recording)
+//   releases         KingsPresenter's installers, one per version and platform, for updates
 //   settings         this service's own values (the token signing key when none is set)
 //
 // Auth: POST /kp/auth/kingschat exchanges a KingsChat authCode for an access token
@@ -62,6 +64,19 @@ const MAX_MEDIA = `${Number(env("KP_MAX_MEDIA_MB") || 2048)}mb`;
 const RELAY_KEY = env("KP_RELAY_KEY") || "";
 // A relay to offer when the relays table has none yet, e.g. wss://relay.example.org.
 const DEFAULT_RELAY = env("KP_RELAY_URL") || "";
+// Recordings' summaries: written by the API's OpenAI client (server.js) with this model; a
+// transcript longer than this (characters) is refused rather than sent.
+const SUMMARY_MODEL = env("KP_SUMMARY_MODEL") || "gpt-4.1-mini";
+const SUMMARY_MAX_CHARS = Number(env("KP_SUMMARY_MAX_CHARS") || 600000);
+// Updates: the installers (outside the project: pm2 restarts on changes inside it), the key the
+// build uploads them with (unset: no uploads), the largest installer, and this API's public
+// address up to the mount point (e.g. https://nmt.loveworldapis.com/api) for the file links.
+const RELEASES_DIR = path.resolve(env("KP_RELEASES_DIR") || path.join(os.homedir(), "kingspresenter-releases"));
+const UPLOAD_KEY = env("KP_UPDATE_UPLOAD_KEY") || "";
+const MAX_RELEASE = Number(env("KP_MAX_RELEASE_MB") || 1024) * 1024 * 1024;
+const PUBLIC_URL = (env("KP_PUBLIC_URL") || "").replace(/\/+$/, "");
+const PLATFORMS = new Set(["darwin", "win32"]);
+const ARCHES = new Set(["arm64", "x64"]);
 
 const KINDS = new Set(["services", "songs", "presentations", "media", "templates", "settings"]);
 
@@ -203,6 +218,32 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS remote_joins_session ON remote_joins (session_id, remote_id);
 
+  CREATE TABLE IF NOT EXISTS recording_summaries (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    recording_id TEXT NOT NULL,
+    language TEXT NOT NULL DEFAULT 'en',
+    transcript_sha256 TEXT NOT NULL,
+    summary JSONB NOT NULL,
+    model TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, recording_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS releases (
+    id SERIAL PRIMARY KEY,
+    version TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    arch TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    bytes BIGINT NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '',
+    active BOOLEAN NOT NULL DEFAULT true,
+    released_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (version, platform, arch)
+  );
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -300,6 +341,164 @@ async function verifyAccess(token) {
     return null;
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * Recording summaries (the AI)
+ * ------------------------------------------------------------------------- */
+
+// What the AI is told (KingsPresenter's docs/recording-ai/prompt.md, kept in step with it).
+const SUMMARY_PROMPT = `You summarise the transcript of a recording made in church: a sermon, a teaching, a meeting.
+
+The transcript is the recording's audio as live speech recognition wrote it, line by line. Each line
+has t, the seconds from the start of the recording. Expect recognition errors: misheard words
+("Mac 16 verse 15" for Mark 16:15, "the book of Divisions" for Ephesians), missing punctuation,
+repeated words. language is the language spoken (English when absent).
+
+Return one JSON object that follows the schema, and nothing else.
+
+What to produce
+- title: what the recording was about, in a few words.
+- summary.short: one sentence. summary.full: two or three short paragraphs.
+- keyPoints: the main points made, in order (at most eight), each with the time it was made and the
+  scriptures it rests on.
+- scriptures: every passage mentioned, read or quoted, once each, in the order first mentioned:
+  reference in English book names ("1 John 4:9", "Ephesians 3:17-19"); bookId as a USFM code
+  (GEN ... REV, 1JN, 2CO); chapter, verse, verseEnd (null for a single verse; verse is null for a
+  whole chapter); mentions (each time it came up: its time and the words as heard); a note when the
+  reference had to be worked out (misheard, or quoted without a reference).
+- decisions: what was agreed. actionItems: who is to do what, by when. openQuestions: what was
+  left for later. Empty lists when there were none (a sermon).
+- speakers: only names actually said; null for someone not named. themes: three to six.
+
+Rules
+1. Never invent. Every point, decision, task, name, date and scripture must come from the
+   transcript. When something is unclear, leave it out or say so in a note.
+2. A scripture counts when a reference is said, or when its words are read or quoted closely enough
+   to be sure which verse it is. Check each one against the words read nearby: "Mac 16 verse 15"
+   followed by "go ye into all the world and preach the gospel" is Mark 16:15.
+3. Times: t in seconds exactly as in the transcript line where it happened; time as m:ss (h:mm:ss
+   over an hour).
+4. Write in the recording's language; scripture references always use English book names so the
+   app can read them.
+5. Keep it short: the whole summary should take two minutes to read.`;
+
+// The shape of the answer (docs/recording-ai/response.schema.json), given to the model as its output format.
+const moment = { t: { type: "number" }, time: { type: "string" } };
+const SUMMARY_SCHEMA = {
+  type: "object", additionalProperties: false,
+  required: ["version", "language", "title", "summary", "keyPoints", "scriptures", "decisions", "actionItems", "openQuestions", "speakers", "themes"],
+  properties: {
+    version: { type: "integer" },
+    language: { type: "string" },
+    title: { type: "string" },
+    summary: { type: "object", additionalProperties: false, required: ["short", "full"], properties: { short: { type: "string" }, full: { type: "string" } } },
+    keyPoints: { type: "array", maxItems: 8, items: { type: "object", additionalProperties: false, required: ["point", "t", "time", "scriptures"], properties: { point: { type: "string" }, ...moment, scriptures: { type: "array", items: { type: "string" } } } } },
+    scriptures: { type: "array", items: { type: "object", additionalProperties: false, required: ["reference", "bookId", "chapter", "verse", "verseEnd", "mentions"],
+      properties: { reference: { type: "string" }, bookId: { type: "string" }, chapter: { type: "integer" }, verse: { type: ["integer", "null"] }, verseEnd: { type: ["integer", "null"] },
+        mentions: { type: "array", items: { type: "object", additionalProperties: false, required: ["t", "time", "said"], properties: { ...moment, said: { type: "string" } } } }, note: { type: "string" } } } },
+    decisions: { type: "array", items: { type: "object", additionalProperties: false, required: ["decision", "t", "time"], properties: { decision: { type: "string" }, ...moment } } },
+    actionItems: { type: "array", items: { type: "object", additionalProperties: false, required: ["task", "owner", "due", "t", "time"], properties: { task: { type: "string" }, owner: { type: ["string", "null"] }, due: { type: ["string", "null"] }, ...moment } } },
+    openQuestions: { type: "array", items: { type: "object", additionalProperties: false, required: ["question", "t", "time"], properties: { question: { type: "string" }, ...moment } } },
+    speakers: { type: "array", items: { type: "object", additionalProperties: false, required: ["name", "role"], properties: { name: { type: ["string", "null"] }, role: { type: "string" } } } },
+    themes: { type: "array", maxItems: 6, items: { type: "string" } },
+  },
+};
+
+/** The transcript as posted, checked: [{ t, text }] or a reason it is not one. */
+function readTranscript(body) {
+  const lines = Array.isArray(body?.transcript) ? body.transcript : null;
+  if (!lines || !lines.length) return { error: "The body needs a transcript: a list of { t, text } lines." };
+  const transcript = [];
+  let chars = 0;
+  for (const l of lines) {
+    const t = Number(l?.t);
+    const text = clean(l?.text, 20000);
+    if (!Number.isFinite(t) || t < 0) return { error: "Every transcript line needs t, its seconds from the start." };
+    if (!text) continue;
+    chars += String(l.text).length;
+    transcript.push({ t: Math.round(t * 10) / 10, text });
+  }
+  if (!transcript.length) return { error: "The transcript has no words in it." };
+  if (chars > SUMMARY_MAX_CHARS) return { tooLong: true, error: `The transcript is too long for one summary (${chars} characters; up to ${SUMMARY_MAX_CHARS}).` };
+  return { transcript, language: /^[a-z]{2}(-[A-Za-z]{2,4})?$/.test(String(body.language || "")) ? String(body.language).slice(0, 2).toLowerCase() : "en" };
+}
+
+/** The model's answer, checked and tidied into the summary's shape (missing lists become empty). */
+function shapeSummary(raw, language) {
+  const a = raw && typeof raw === "object" ? raw : {};
+  const str = (v, max = 4000) => clean(v, max);
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const intOrNull = (v) => (v == null || v === "" ? null : Number.isInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
+  const list = (v) => (Array.isArray(v) ? v : []);
+  const summary = a.summary && typeof a.summary === "object" ? a.summary : {};
+  const out = {
+    version: 1,
+    language: str(a.language, 8) || language,
+    title: str(a.title, 200),
+    summary: { short: str(summary.short, 1000), full: str(summary.full, 8000) },
+    keyPoints: list(a.keyPoints).slice(0, 8).map((p) => ({ point: str(p?.point, 600), t: num(p?.t), time: str(p?.time, 12), scriptures: list(p?.scriptures).map((x) => str(x, 60)).filter(Boolean) })).filter((p) => p.point),
+    scriptures: list(a.scriptures).map((x) => ({
+      reference: str(x?.reference, 80), bookId: str(x?.bookId, 3).toUpperCase(), chapter: Math.max(1, Math.round(num(x?.chapter)) || 1), verse: intOrNull(x?.verse), verseEnd: intOrNull(x?.verseEnd),
+      mentions: list(x?.mentions).map((m) => ({ t: num(m?.t), time: str(m?.time, 12), said: str(m?.said, 600) })),
+      ...(x?.note ? { note: str(x.note, 400) } : {}),
+    })).filter((x) => x.reference && /^[1-3A-Z][A-Z0-9]{2}$/.test(x.bookId)),
+    decisions: list(a.decisions).map((d) => ({ decision: str(d?.decision, 600), t: num(d?.t), time: str(d?.time, 12) })).filter((d) => d.decision),
+    actionItems: list(a.actionItems).map((x) => ({ task: str(x?.task, 600), owner: x?.owner == null ? null : str(x.owner, 200) || null, due: x?.due == null ? null : str(x.due, 200) || null, t: num(x?.t), time: str(x?.time, 12) })).filter((x) => x.task),
+    openQuestions: list(a.openQuestions).map((x) => ({ question: str(x?.question, 600), t: num(x?.t), time: str(x?.time, 12) })).filter((x) => x.question),
+    speakers: list(a.speakers).map((x) => ({ name: x?.name == null ? null : str(x.name, 120) || null, role: str(x?.role, 200) })).filter((x) => x.role || x.name),
+    themes: list(a.themes).slice(0, 6).map((x) => str(x, 80)).filter(Boolean),
+  };
+  if (!out.title || !out.summary.full && !out.summary.short) return null;
+  return out;
+}
+
+/** Asks the model for the summary; throws { statusCode, code } when it cannot. */
+async function writeSummary(openai, { recordingId, language, transcript }) {
+  let resp;
+  try {
+    resp = await openai.chat.completions.create({
+      model: SUMMARY_MODEL,
+      temperature: 0.2,
+      response_format: { type: "json_schema", json_schema: { name: "recording_summary", schema: SUMMARY_SCHEMA } },
+      messages: [
+        { role: "system", content: SUMMARY_PROMPT },
+        { role: "user", content: JSON.stringify({ recordingId, language, transcript }) },
+      ],
+    });
+  } catch (err) {
+    const busy = err?.status === 429 || err?.status >= 500;
+    throw Object.assign(new Error(busy ? "The AI service is busy; try again in a moment." : `The AI could not summarise this recording: ${err?.message || err}`), { statusCode: busy ? 503 : 502, code: busy ? "ai_busy" : "ai_failed" });
+  }
+  const text = resp?.choices?.[0]?.message?.content;
+  let parsed = null;
+  try { parsed = JSON.parse(String(text || "").replace(/^```(?:json)?\s*|\s*```$/g, "")); } catch { /* not JSON */ }
+  const summary = shapeSummary(parsed, language);
+  if (!summary) throw Object.assign(new Error("The AI sent back no summary."), { statusCode: 502, code: "ai_failed" });
+  return summary;
+}
+
+/* ---------------------------------------------------------------------------
+ * Updates
+ * ------------------------------------------------------------------------- */
+
+/** Version a is newer than b: "0.2.0" > "0.1.9" (a "v" in front and a "-beta" tail ignored). */
+function newer(a, b) {
+  const parts = (v) => String(v || "").replace(/^v/i, "").split("-")[0].split(".").map((n) => Number.parseInt(n, 10) || 0);
+  const x = parts(a);
+  const y = parts(b);
+  for (let i = 0; i < Math.max(x.length, y.length); i++) {
+    const d = (x[i] || 0) - (y[i] || 0);
+    if (d) return d > 0;
+  }
+  return false;
+}
+
+/** The address an app downloads a release from: KP_PUBLIC_URL, else this request's own host. */
+function releaseUrl(req, r) {
+  const base = PUBLIC_URL || `${req.protocol}://${req.get("host")}${req.baseUrl || ""}`;
+  return `${base}/kp/updates/files/${encodeURIComponent(r.version)}/${r.platform}/${r.arch}`;
+}
+const shapeRelease = (req, r) => ({ version: r.version, platform: r.platform, arch: r.arch, filename: r.filename, size: Number(r.bytes), sha256: r.sha256, notes: r.notes, releasedAt: r.released_at, url: releaseUrl(req, r) });
 
 /* ---------------------------------------------------------------------------
  * Auth
@@ -452,9 +651,10 @@ function callbackPage(payload) {
  * Routes
  * ------------------------------------------------------------------------- */
 
-module.exports = function kingsPresenterRoutes() {
+module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
   const router = Router();
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
+  fs.mkdirSync(RELEASES_DIR, { recursive: true });
 
   // Never cache an API response; the database is ready before any route runs.
   router.use("/kp", (_req, res, next) => {
@@ -678,6 +878,130 @@ module.exports = function kingsPresenterRoutes() {
   }));
 
   // This account's church computers' Remote sessions, newest first, with the phones that joined.
+  /* ---- Recordings: summaries by the AI ------------------------------- */
+
+  // A recording's transcript (KingsPresenter posts it when a recording stops): its summary,
+  // written by the AI and kept by recording id; the same transcript again costs nothing.
+  router.post("/kp/recordings/summary", ...user, asyncHandler(async (req, res) => {
+    if (!openai) return fail(res, 503, "summaries_off", "This server has no AI service for summaries (OPENAI_API_KEY is not set).");
+    const read = readTranscript(req.body || {});
+    if (read.error) return fail(res, read.tooLong ? 413 : 400, read.tooLong ? "too_long" : "bad_request", read.error);
+    const { transcript, language } = read;
+    const hash = sha256(JSON.stringify(transcript));
+    const recordingId = clean(req.body.recordingId, 80) || `t-${hash.slice(0, 32)}`;
+    const kept = await q1(`SELECT summary FROM recording_summaries WHERE user_id = $1 AND recording_id = $2 AND transcript_sha256 = $3`, [req.kpUserId, recordingId, hash]);
+    if (kept) return ok(res, { ...kept.summary, cached: true });
+    let summary;
+    try { summary = await writeSummary(openai, { recordingId, language, transcript }); } catch (err) { if (!err.code) throw err; return fail(res, err.statusCode || 502, err.code, err.message); }
+    await q(`INSERT INTO recording_summaries (user_id, recording_id, language, transcript_sha256, summary, model) VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (user_id, recording_id) DO UPDATE SET language = EXCLUDED.language, transcript_sha256 = EXCLUDED.transcript_sha256, summary = EXCLUDED.summary, model = EXCLUDED.model, created_at = now()`,
+      [req.kpUserId, recordingId, language, hash, JSON.stringify(summary), SUMMARY_MODEL]);
+    ok(res, summary);
+  }));
+
+  router.get("/kp/recordings/summary/:recordingId", ...user, asyncHandler(async (req, res) => {
+    const kept = await q1(`SELECT summary, created_at FROM recording_summaries WHERE user_id = $1 AND recording_id = $2`, [req.kpUserId, clean(req.params.recordingId, 80)]);
+    if (!kept) return fail(res, 404, "not_found", "No summary for that recording.");
+    ok(res, { ...kept.summary, createdAt: kept.created_at });
+  }));
+
+  /* ---- Updates: the installers ---------------------------------------- */
+
+  // The build sends each installer here (scripts/update-upload.js in KingsPresenter): the
+  // file as the body, its version, platform, hash and notes in headers. Streamed to disk,
+  // not held in memory; a file whose hash does not match is thrown away.
+  router.put("/kp/updates/upload", asyncHandler(async (req, res) => {
+    if (!UPLOAD_KEY) return fail(res, 503, "uploads_off", "KP_UPDATE_UPLOAD_KEY is not set on this server.");
+    const key = clean(req.header("x-upload-key"), 200);
+    if (!key || !safeEqual(key, UPLOAD_KEY)) { req.resume(); return fail(res, 401, "unauthorized_upload_key", "Invalid or missing x-upload-key."); }
+    const version = clean(req.header("x-version"), 40);
+    const platform = clean(req.header("x-platform"), 20);
+    const arch = clean(req.header("x-arch"), 20);
+    const sha = clean(req.header("x-sha256"), 64).toLowerCase();
+    const filename = clean(req.header("x-filename"), 200).replace(/[^\w .()+-]+/g, "") || `KingsPresenter-${version}-${arch}.${platform === "darwin" ? "dmg" : "exe"}`;
+    let notes = "";
+    try { notes = clean(Buffer.from(clean(req.header("x-notes"), 60000), "base64").toString("utf8"), 20000); } catch { notes = ""; }
+    const bad = !/^\d+\.\d+\.\d+/.test(version) ? "x-version must be a version, e.g. 0.1.2."
+      : !PLATFORMS.has(platform) ? "x-platform must be darwin or win32."
+      : !ARCHES.has(arch) ? "x-arch must be arm64 or x64."
+      : !/^[a-f0-9]{64}$/.test(sha) ? "x-sha256 must be the file's SHA-256." : "";
+    if (bad) { req.resume(); return fail(res, 400, "bad_request", bad); }
+    if (Number(req.header("content-length")) > MAX_RELEASE) { req.resume(); return fail(res, 413, "too_large", `An installer may be up to ${MAX_RELEASE / 1024 / 1024} MB.`); }
+    const dir = path.join(RELEASES_DIR, version);
+    await fsp.mkdir(dir, { recursive: true });
+    const storageKey = `${version}/${platform}-${arch}-${filename}`;
+    const file = path.join(RELEASES_DIR, storageKey);
+    const part = `${file}.part`;
+    const hash = crypto.createHash("sha256");
+    let bytes = 0;
+    try {
+      await new Promise((resolve, reject) => {
+        const out = fs.createWriteStream(part);
+        req.on("data", (c) => { hash.update(c); bytes += c.length; if (bytes > MAX_RELEASE) req.destroy(Object.assign(new Error("too large"), { code: "too_large" })); });
+        req.on("error", reject);
+        req.on("aborted", () => reject(new Error("The upload stopped early.")));
+        out.on("error", reject);
+        out.on("finish", resolve);
+        req.pipe(out);
+      });
+      if (!bytes) throw Object.assign(new Error("The upload was empty."), { code: "empty_upload" });
+      if (hash.digest("hex") !== sha) throw Object.assign(new Error("The file does not match its hash."), { code: "hash_mismatch" });
+    } catch (err) {
+      await fsp.rm(part, { force: true });
+      const code = err.code === "too_large" ? "too_large" : err.code === "hash_mismatch" ? "hash_mismatch" : err.code === "empty_upload" ? "empty_upload" : "upload_failed";
+      return fail(res, code === "too_large" ? 413 : 400, code, err.message);
+    }
+    await fsp.rename(part, file);
+    const row = await q1(
+      `INSERT INTO releases (version, platform, arch, filename, storage_key, bytes, sha256, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (version, platform, arch) DO UPDATE SET filename = EXCLUDED.filename, storage_key = EXCLUDED.storage_key, bytes = EXCLUDED.bytes,
+         sha256 = EXCLUDED.sha256, notes = EXCLUDED.notes, active = true, released_at = now()
+       RETURNING *`,
+      [version, platform, arch, filename, storageKey, bytes, sha, notes]);
+    // An older file this one replaced (a different name for the same version and platform) goes.
+    for (const f of await fsp.readdir(dir).catch(() => [])) if (f.startsWith(`${platform}-${arch}-`) && f !== `${platform}-${arch}-${filename}`) await fsp.rm(path.join(dir, f), { force: true });
+    res.status(201);
+    ok(res, { release: shapeRelease(req, row) });
+  }));
+
+  const latestFor = async (platform, arch) => {
+    let best = null;
+    for (const r of await q(`SELECT * FROM releases WHERE platform = $1 AND arch = $2 AND active`, [platform, arch])) if (!best || newer(r.version, best.version)) best = r;
+    return best;
+  };
+
+  // What KingsPresenter asks, a little after it starts and every few hours: the latest version
+  // for its platform, when it is newer than the one asking; 204 when there is nothing newer.
+  router.get("/kp/updates/latest", ...user, asyncHandler(async (req, res) => {
+    const platform = clean(req.query.platform, 20) || "darwin";
+    const arch = clean(req.query.arch, 20) || (platform === "darwin" ? "arm64" : "x64");
+    const version = clean(req.query.version, 40);
+    if (!PLATFORMS.has(platform) || !ARCHES.has(arch)) return fail(res, 400, "bad_request", "platform must be darwin or win32; arch arm64 or x64.");
+    const best = await latestFor(platform, arch);
+    if (!best || (version && !newer(best.version, version))) return res.status(204).end();
+    const r = shapeRelease(req, best);
+    ok(res, { version: r.version, notes: r.notes, url: r.url, size: r.size, sha256: r.sha256, releasedAt: r.releasedAt, filename: r.filename });
+  }));
+
+  router.get("/kp/updates/releases", ...user, asyncHandler(async (req, res) => {
+    const rows = await q(`SELECT * FROM releases WHERE active ORDER BY released_at DESC LIMIT 100`);
+    ok(res, { releases: rows.map((r) => shapeRelease(req, r)) });
+  }));
+
+  router.get("/kp/updates/files/:version/:platform/:arch", ...user, asyncHandler(async (req, res) => {
+    const r = await q1(`SELECT * FROM releases WHERE version = $1 AND platform = $2 AND arch = $3 AND active`, [clean(req.params.version, 40), clean(req.params.platform, 20), clean(req.params.arch, 20)]);
+    if (!r) return fail(res, 404, "not_found", "No such release.");
+    const file = path.join(RELEASES_DIR, r.storage_key);
+    let size;
+    try { size = (await fsp.stat(file)).size; } catch { return fail(res, 404, "not_found", "The installer is not on this server any more."); }
+    res.setHeader("Content-Type", "application/octet-stream");
+    res.setHeader("Content-Length", String(size));
+    res.setHeader("Content-Disposition", `attachment; filename="${r.filename.replace(/"/g, "")}"`);
+    res.setHeader("X-Sha256", r.sha256);
+    fs.createReadStream(file).on("error", () => res.destroy()).pipe(res);
+  }));
+
   router.get("/kp/remote/sessions", ...user, asyncHandler(async (req, res) => {
     const rows = await q(
       `SELECT s.id, s.name, s.opened_at, s.closed_at, s.close_reason, r.url AS relay_url,
@@ -694,3 +1018,5 @@ module.exports = function kingsPresenterRoutes() {
 module.exports.ensureSchema = ensureSchema;
 module.exports.dbConfigFrom = dbConfigFrom;
 module.exports.pool = pool;
+module.exports.newer = newer;
+module.exports.shapeSummary = shapeSummary;

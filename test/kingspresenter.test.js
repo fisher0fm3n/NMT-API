@@ -14,6 +14,12 @@ const DB_URL = process.env.KP_TEST_DATABASE_URL || "postgres://localhost/kingspr
 // Only a database on this computer: the test makes and deletes accounts, and drops the database.
 if (!["localhost", "127.0.0.1", "::1", ""].includes(new URL(DB_URL).hostname)) throw new Error("KP_TEST_DATABASE_URL must be a database on this computer");
 const MEDIA = fs.mkdtempSync(path.join(os.tmpdir(), "kp-media-"));
+const RELEASES = fs.mkdtempSync(path.join(os.tmpdir(), "kp-releases-"));
+
+// OpenAI, as far as summaries go: answers with whatever the test puts in `aiAnswer`.
+const aiCalls = [];
+let aiAnswer = null;
+const openai = { chat: { completions: { create: async (args) => { aiCalls.push(args); if (aiAnswer instanceof Error) throw aiAnswer; return { choices: [{ message: { content: typeof aiAnswer === "string" ? aiAnswer : JSON.stringify(aiAnswer) } }] }; } } } };
 
 // KingsChat, as far as sign-in goes: a code becomes a token, a token a profile.
 const kcCalls = [];
@@ -47,6 +53,7 @@ test.before(async () => {
   Object.assign(process.env, {
     KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
     KP_API_KEY: "app-key", KP_RELAY_KEY: "relay-key", KP_MEDIA_DIR: MEDIA, KP_RELAY_URL: "wss://relay.test", KP_SITE_URL: "http://localhost:3000",
+    KP_RELEASES_DIR: RELEASES, KP_UPDATE_UPLOAD_KEY: "upload-key", KP_SUMMARY_MAX_CHARS: "5000",
   });
   delete process.env.KP_TOKEN_SECRET;
   routes = require("../routes/kingspresenter");
@@ -54,7 +61,7 @@ test.before(async () => {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
   app.use(express.urlencoded({ extended: true }));
-  app.use(routes());
+  app.use(routes({ openai }));
   app.use((err, _req, res, _next) => res.status(500).json({ status: false, error: "internal_error", message: err.message }));
   server = await new Promise((r) => { const s = app.listen(0, "127.0.0.1", () => r(s)); });
   base = `http://127.0.0.1:${server.address().port}`;
@@ -69,6 +76,7 @@ test.after(async () => {
   await admin.query(`DROP DATABASE IF EXISTS ${new URL(DB_URL).pathname.slice(1)}`);
   await admin.end();
   fs.rmSync(MEDIA, { recursive: true, force: true });
+  fs.rmSync(RELEASES, { recursive: true, force: true });
 });
 
 const call = async (method, url, { body, token, key = "app-key", headers = {} } = {}) => {
@@ -91,7 +99,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "media_objects", "refresh_tokens", "relays", "remote_joins", "remote_sessions", "settings", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -189,6 +197,103 @@ test("KingsChat's redirect to this API: a phone's sign-in view is handed its tok
   const bad = await fetch(`${base}/kp/auth/kingschat/callback?code=nope`);
   assert.equal(bad.status, 502);
   assert.match(await bad.text(), /did not work/);
+});
+
+const SUMMARY = {
+  version: 1, language: "en", title: "Cell leaders' meeting", summary: { short: "Reports, outreach and prayer.", full: "The meeting opened with a word on serving.\n\nThe outreach is on Saturday." },
+  keyPoints: [{ point: "Serve fervent in spirit.", t: 25.9, time: "0:25", scriptures: ["Romans 12:11"] }],
+  scriptures: [{ reference: "Romans 12:11", bookId: "rom", chapter: 12, verse: 11, verseEnd: null, mentions: [{ t: 12.1, time: "0:12", said: "Romans chapter 12 verse 11" }] }, { reference: "Mark 16:15", bookId: "MRK", chapter: 16, verse: 15, verseEnd: null, mentions: [{ t: 164.9, time: "2:44", said: "Mac 16 verse 15" }], note: "Heard as Mac." }],
+  decisions: [{ decision: "Outreach on Saturday at 10 am.", t: 134.5, time: "2:14" }],
+  actionItems: [{ task: "Order 200 copies.", owner: "Brother James", due: "This week", t: 156.8, time: "2:36" }],
+  openQuestions: [], speakers: [{ name: null, role: "the pastor" }, { name: "Brother James", role: "reports" }], themes: ["Serving", "Outreach"],
+};
+const transcript = [{ t: 0, text: "Okay let's get started." }, { t: 12.1, text: "Turn with me to Romans chapter 12 verse 11." }, { t: 164.9, text: "Remember the great commission in Mac 16 verse 15." }];
+
+test("a recording's transcript is summarised by the AI, kept by recording, and the same transcript again costs nothing", async () => {
+  aiAnswer = SUMMARY;
+  const r = await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { recordingId: "2026-10-14-7c31d2", language: "en", transcript } });
+  assert.equal(r.status, 200, r.text);
+  assert.equal(r.json.status, true);
+  assert.equal(r.json.title, "Cell leaders' meeting");
+  assert.equal(r.json.scriptures[0].bookId, "ROM", "tidied");
+  assert.equal(r.json.scriptures[1].note, "Heard as Mac.");
+  assert.deepEqual(r.json.actionItems[0], { task: "Order 200 copies.", owner: "Brother James", due: "This week", t: 156.8, time: "2:36" });
+  assert.equal(aiCalls.length, 1);
+  const sent = JSON.parse(aiCalls[0].messages[1].content);
+  assert.deepEqual(sent.transcript[1], { t: 12.1, text: "Turn with me to Romans chapter 12 verse 11." });
+  assert.equal(aiCalls[0].response_format.type, "json_schema");
+  assert.match(aiCalls[0].messages[0].content, /Never invent/);
+  // Again: what is kept, no second call.
+  const again = await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { recordingId: "2026-10-14-7c31d2", transcript } });
+  assert.equal(again.json.cached, true);
+  assert.equal(aiCalls.length, 1);
+  assert.equal((await call("GET", "/kp/recordings/summary/2026-10-14-7c31d2", { token: auth.accessToken })).json.title, "Cell leaders' meeting");
+  // A changed transcript for the same recording: summarised afresh.
+  await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { recordingId: "2026-10-14-7c31d2", transcript: [...transcript, { t: 200, text: "Amen." }] } });
+  assert.equal(aiCalls.length, 2);
+  // What cannot be summarised.
+  assert.equal((await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { transcript: [] } })).json.error, "bad_request");
+  assert.equal((await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { transcript: [{ text: "no time" }] } })).json.error, "bad_request");
+  const long = await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { transcript: [{ t: 0, text: "word ".repeat(1200) }] } });
+  assert.deepEqual([long.status, long.json.error], [413, "too_long"]);
+  aiAnswer = Object.assign(new Error("rate limited"), { status: 429 });
+  const busy = await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { recordingId: "x", transcript } });
+  assert.deepEqual([busy.status, busy.json.error], [503, "ai_busy"]);
+  aiAnswer = "not json at all";
+  const bad = await call("POST", "/kp/recordings/summary", { token: auth.accessToken, body: { recordingId: "y", transcript } });
+  assert.deepEqual([bad.status, bad.json.error], [502, "ai_failed"]);
+  assert.equal((await call("POST", "/kp/recordings/summary", { body: { transcript } })).json.error, "no_token");
+});
+
+test("installers: uploaded by the build with the key, checked against their hash; the latest offered to an older app, and sent", async () => {
+  const dmg = crypto.randomBytes(20000);
+  const sha = crypto.createHash("sha256").update(dmg).digest("hex");
+  const headers = (over = {}) => ({ "x-upload-key": "upload-key", "x-version": "0.1.2", "x-platform": "darwin", "x-arch": "arm64", "x-filename": "KingsPresenter-0.1.2-arm64.dmg", "x-sha256": sha, "x-notes": Buffer.from("- Better\n- Faster").toString("base64"), ...over });
+  assert.equal((await call("PUT", "/kp/updates/upload", { body: dmg, key: null, headers: headers({ "x-upload-key": "wrong" }) })).json.error, "unauthorized_upload_key");
+  assert.equal((await call("PUT", "/kp/updates/upload", { body: dmg, key: null, headers: headers({ "x-platform": "linux" }) })).json.error, "bad_request");
+  assert.equal((await call("PUT", "/kp/updates/upload", { body: crypto.randomBytes(100), key: null, headers: headers() })).json.error, "hash_mismatch");
+  const up = await call("PUT", "/kp/updates/upload", { body: dmg, key: null, headers: headers() });
+  assert.equal(up.status, 201, up.text);
+  assert.deepEqual([up.json.release.version, up.json.release.platform, up.json.release.size, up.json.release.notes], ["0.1.2", "darwin", 20000, "- Better\n- Faster"]);
+  assert.deepEqual(fs.readdirSync(path.join(RELEASES, "0.1.2")), ["darwin-arm64-KingsPresenter-0.1.2-arm64.dmg"]);
+  // A Windows build too, and an older Mac one.
+  const exe = crypto.randomBytes(3000);
+  await call("PUT", "/kp/updates/upload", { body: exe, key: null, headers: headers({ "x-platform": "win32", "x-arch": "x64", "x-filename": "KingsPresenter Setup 0.1.2.exe", "x-sha256": crypto.createHash("sha256").update(exe).digest("hex") }) });
+  const old = crypto.randomBytes(1000);
+  await call("PUT", "/kp/updates/upload", { body: old, key: null, headers: headers({ "x-version": "0.1.0", "x-sha256": crypto.createHash("sha256").update(old).digest("hex") }) });
+
+  // An older app is offered the latest; the latest itself, nothing.
+  const latest = await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.1.1", { token: auth.accessToken });
+  assert.equal(latest.status, 200);
+  assert.deepEqual([latest.json.version, latest.json.size, latest.json.sha256, latest.json.notes], ["0.1.2", 20000, sha, "- Better\n- Faster"]);
+  assert.equal(latest.json.url, `${base}/kp/updates/files/0.1.2/darwin/arm64`);
+  assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.1.2", { token: auth.accessToken })).status, 204);
+  assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.2.0", { token: auth.accessToken })).status, 204);
+  assert.equal((await call("GET", "/kp/updates/latest?platform=win32&arch=x64&version=0.1.0", { token: auth.accessToken })).json.filename, "KingsPresenter Setup 0.1.2.exe");
+  assert.equal((await call("GET", "/kp/updates/latest?platform=win32&arch=arm64", { token: auth.accessToken })).status, 204, "no such build");
+  assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64")).json.error, "no_token");
+  // The installer itself, whole.
+  const file = await fetch(latest.json.url, { headers: { "x-api-key": "app-key", authorization: `Bearer ${auth.accessToken}` } });
+  assert.equal(file.status, 200);
+  assert.equal(file.headers.get("x-sha256"), sha);
+  assert.equal(Buffer.compare(Buffer.from(await file.arrayBuffer()), dmg), 0);
+  assert.equal((await call("GET", "/kp/updates/files/0.9.9/darwin/arm64", { token: auth.accessToken })).status, 404);
+  const list = (await call("GET", "/kp/updates/releases", { token: auth.accessToken })).json.releases;
+  assert.deepEqual(list.map((r) => `${r.version} ${r.platform}`).sort(), ["0.1.0 darwin", "0.1.2 darwin", "0.1.2 win32"]);
+  // The same version uploaded again replaces the file.
+  const dmg2 = crypto.randomBytes(5000);
+  await call("PUT", "/kp/updates/upload", { body: dmg2, key: null, headers: headers({ "x-filename": "KingsPresenter-0.1.2-arm64-fixed.dmg", "x-sha256": crypto.createHash("sha256").update(dmg2).digest("hex") }) });
+  assert.deepEqual(fs.readdirSync(path.join(RELEASES, "0.1.2")).sort(), ["darwin-arm64-KingsPresenter-0.1.2-arm64-fixed.dmg", "win32-x64-KingsPresenter Setup 0.1.2.exe"]);
+  assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.1.1", { token: auth.accessToken })).json.size, 5000);
+});
+
+test("versions compare as numbers", () => {
+  const { newer } = routes;
+  assert.equal(newer("0.1.2", "0.1.1"), true);
+  assert.equal(newer("0.10.0", "0.9.9"), true);
+  assert.equal(newer("v1.0.0", "1.0.0"), false);
+  assert.equal(newer("0.1.2-beta", "0.1.2"), false);
+  assert.equal(newer("0.1.1", "0.1.2"), false);
 });
 
 test("deleting the account removes it and its media", async () => {
