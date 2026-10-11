@@ -54,6 +54,9 @@ const KP_API_KEY = env("KP_API_KEY") || "";
 const KC_CLIENT_ID = env("KP_KC_CLIENT_ID", "NMM_KC_CLIENT_ID") || "";
 // Set when KingsChat's registration of the app came with a client secret (sent with the code).
 const KC_CLIENT_SECRET = env("KP_KC_CLIENT_SECRET") || "";
+// Clients used before KP_KC_CLIENT_ID (comma separated): codes from copies of the apps built
+// with one of them still sign in, until those copies are updated.
+const KC_LEGACY_CLIENT_IDS = (env("KP_KC_LEGACY_CLIENT_IDS") || "").split(",").map((s) => s.trim()).filter((s) => s && s !== KC_CLIENT_ID);
 // A sign-in finished on this API's own callback page is handed to the desktop app as a
 // one-time ticket (kingspresenter://auth?ticket=…), good for this long.
 const TICKET_SECONDS = 300;
@@ -70,6 +73,21 @@ const maxDevices = () => Math.max(0, Number(env("KP_MAX_DEVICES") || 0) || 0);
 // The administrator's key (x-admin-key) for /kp/admin/*: who may use KingsPresenter, and the
 // oldest version allowed. Unset: no admin routes. Read when asked (tests set it).
 const adminKey = () => env("KP_ADMIN_KEY") || "";
+// Cloud listening (speech recognised online) each account may use a month, in minutes, unless
+// the administrator set its own for an account. Read when asked, like the device limit.
+const cloudMinutes = () => { const v = Number(env("KP_CLOUD_MINUTES")); return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 120; };
+// The most one report of cloud listening may add: a computer that was offline reports what
+// it used since, in one go; anything more is not real use.
+const MAX_CLOUD_REPORT_SECONDS = 6 * 60 * 60;
+// The speech service behind Cloud listening (Deepgram). Its key stays on this server: the apps
+// are given a token that lasts just long enough to open one stream (POST /kp/listening/token),
+// and only while the account has time left. Read when asked (tests set them).
+const deepgramKey = () => env("KP_DEEPGRAM_API_KEY", "DEEPGRAM_API_KEY") || "";
+const deepgramUrl = () => (env("KP_DEEPGRAM_URL") || "https://api.deepgram.com").replace(/\/+$/, "");
+const deepgramTokenSeconds = () => Math.min(3600, Math.max(5, Number(env("KP_DEEPGRAM_TOKEN_SECONDS")) || 30));
+// Streams one account may open in an hour: far more than a service needs, few enough that
+// tokens cannot be farmed.
+const cloudTokensPerHour = () => Math.max(1, Number(env("KP_CLOUD_TOKENS_PER_HOUR")) || 60);
 const DISABLED_TEXT = "This copy of KingsPresenter has been disabled. Contact your KingsPresenter administrator.";
 const REFRESH_DAYS = Number(env("KP_REFRESH_DAYS") || 90);
 // Outside the project folder: pm2 restarts the API when a file in it changes.
@@ -176,6 +194,8 @@ const SCHEMA = `
 
   ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_at TIMESTAMPTZ;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS disabled_reason TEXT;
+  -- The account's own monthly cloud listening, in minutes (NULL: KP_CLOUD_MINUTES).
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS cloud_minutes INTEGER;
 
   CREATE TABLE IF NOT EXISTS installs (
     id UUID PRIMARY KEY,
@@ -267,6 +287,15 @@ const SCHEMA = `
     model TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (user_id, recording_id)
+  );
+
+  -- Cloud listening used, per account and calendar month (UTC, 'YYYY-MM'), in seconds.
+  CREATE TABLE IF NOT EXISTS cloud_usage (
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    month TEXT NOT NULL,
+    seconds INTEGER NOT NULL DEFAULT 0,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (user_id, month)
   );
 
   CREATE TABLE IF NOT EXISTS releases (
@@ -604,6 +633,31 @@ async function signedInCount(userId, { except = null } = {}) {
   return row?.n || 0;
 }
 
+/* ---------------------------------------------------------------------------
+ * Cloud listening: a monthly allowance per account
+ * ------------------------------------------------------------------------- */
+
+/** This calendar month (UTC), as stored: "2026-10". */
+const thisMonth = (d = new Date()) => d.toISOString().slice(0, 7);
+/** When the allowance starts again: the first of next month, UTC. */
+const nextMonthStarts = (d = new Date()) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1)).toISOString();
+
+/** An account's allowance from its row: { cloud_minutes, seconds } (this month's use). */
+function shapeCloud(row, month = thisMonth()) {
+  const custom = row?.cloud_minutes != null;
+  const limitSeconds = (custom ? Number(row.cloud_minutes) : cloudMinutes()) * 60;
+  const usedSeconds = Number(row?.seconds) || 0;
+  return { month, limitSeconds, usedSeconds, remainingSeconds: Math.max(0, limitSeconds - usedSeconds), custom, resetsAt: nextMonthStarts() };
+}
+
+async function cloudAllowance(userId) {
+  const month = thisMonth();
+  const row = await q1(
+    `SELECT u.cloud_minutes, COALESCE(c.seconds, 0) AS seconds FROM users u LEFT JOIN cloud_usage c ON c.user_id = u.id AND c.month = $2 WHERE u.id = $1`,
+    [userId, month]);
+  return shapeCloud(row, month);
+}
+
 async function issue(userId, { deviceId, deviceName, deviceKind, userAgent }) {
   const off = await q1(`SELECT disabled_reason FROM users WHERE id = $1 AND disabled_at IS NOT NULL`, [userId]);
   if (off) throw Object.assign(new Error(off.disabled_reason || DISABLED_TEXT), { statusCode: 403, code: "account_disabled" });
@@ -640,15 +694,19 @@ async function issue(userId, { deviceId, deviceName, deviceKind, userAgent }) {
  * KingsChat
  * ------------------------------------------------------------------------- */
 
+/** KingsChat's tokens for a sign-in code: with this app's client, else an earlier one's. */
 async function exchangeKcCode(code) {
-  const resp = await fetch(KC_TOKEN_URL, {
-    method: "POST", headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ grant_type: "code", client_id: KC_CLIENT_ID, code, ...(KC_CLIENT_SECRET ? { client_secret: KC_CLIENT_SECRET } : {}) }),
-  }).catch(() => null);
-  if (!resp || !resp.ok) return null;
-  const json = await resp.json().catch(() => null);
-  const accessToken = json?.access_token ?? json?.accessToken ?? null;
-  return accessToken ? { accessToken } : null;
+  for (const [clientId, secret] of [[KC_CLIENT_ID, KC_CLIENT_SECRET], ...KC_LEGACY_CLIENT_IDS.map((id) => [id, ""])]) {
+    const resp = await fetch(KC_TOKEN_URL, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ grant_type: "code", client_id: clientId, code, ...(secret ? { client_secret: secret } : {}) }),
+    }).catch(() => null);
+    if (!resp || !resp.ok) continue;
+    const json = await resp.json().catch(() => null);
+    const accessToken = json?.access_token ?? json?.accessToken ?? null;
+    if (accessToken) return { accessToken };
+  }
+  return null;
 }
 
 async function fetchKcProfile(accessToken) {
@@ -859,7 +917,7 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     const u = await getUserById(req.kpUserId);
     if (!u) return fail(res, 401, "invalid_token", "This account no longer exists.");
     if (req.kpDeviceId) await q(`UPDATE devices SET last_seen = now() WHERE id = $1 AND user_id = $2`, [req.kpDeviceId, u.id]);
-    ok(res, { user: u, devices: { signedIn: await signedInCount(u.id), max: maxDevices() } });
+    ok(res, { user: u, devices: { signedIn: await signedInCount(u.id), max: maxDevices() }, cloud: await cloudAllowance(u.id) });
   }));
 
   // The computers and phones signed in to this account; signing one out.
@@ -1011,6 +1069,58 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
   }));
 
   // This account's church computers' Remote sessions, newest first, with the phones that joined.
+  /* ---- Cloud listening: the monthly allowance ------------------------- */
+
+  // How much cloud listening the account has this month: its limit, what is used, what is
+  // left, and when it starts again. The desktop app asks before it listens online.
+  router.get("/kp/listening", ...user, asyncHandler(async (req, res) => {
+    ok(res, { cloud: await cloudAllowance(req.kpUserId) });
+  }));
+
+  // What a computer used ({ seconds } of sound sent to be recognised online, since its last
+  // report): added to this month's, and the allowance as it now stands sent back.
+  router.post("/kp/listening/usage", ...user, asyncHandler(async (req, res) => {
+    const seconds = Math.round(Number(req.body?.seconds));
+    if (!Number.isFinite(seconds) || seconds < 0) return fail(res, 400, "bad_request", "seconds must be a number, 0 or more.");
+    const add = Math.min(seconds, MAX_CLOUD_REPORT_SECONDS);
+    if (add > 0) {
+      await q(`INSERT INTO cloud_usage (user_id, month, seconds) VALUES ($1, $2, $3)
+               ON CONFLICT (user_id, month) DO UPDATE SET seconds = cloud_usage.seconds + EXCLUDED.seconds, updated_at = now()`,
+        [req.kpUserId, thisMonth(), add]);
+    }
+    ok(res, { cloud: await cloudAllowance(req.kpUserId) });
+  }));
+
+  // A token for one Cloud listening stream, for a signed-in account with time left this month.
+  // The token is good for a few seconds (KP_DEEPGRAM_TOKEN_SECONDS, 30): long enough to open
+  // the stream, which then runs as long as it is used. The speech service's key never leaves
+  // this server, so a copy of the app has nothing worth taking.
+  const tokensGiven = new Map(); // user id → when this last hour's tokens were given
+  router.post("/kp/listening/token", ...user, asyncHandler(async (req, res) => {
+    const key = deepgramKey();
+    if (!key) return fail(res, 503, "cloud_off", "Cloud listening is not set up on this server.");
+    const cloud = await cloudAllowance(req.kpUserId);
+    if (cloud.remainingSeconds <= 0) {
+      return res.status(403).json({ status: false, error: "cloud_used", message: cloud.limitSeconds ? "This month's Cloud listening has been used." : "Cloud listening is not available on your account.", cloud });
+    }
+    const now = Date.now();
+    const recent = (tokensGiven.get(req.kpUserId) || []).filter((t) => now - t < 3600_000);
+    if (recent.length >= cloudTokensPerHour()) return fail(res, 429, "too_many", "Cloud listening was started too many times this hour. Try again in a few minutes.");
+    const resp = await fetch(`${deepgramUrl()}/v1/auth/grant`, {
+      method: "POST",
+      headers: { Authorization: `Token ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ ttl_seconds: deepgramTokenSeconds() }),
+    }).catch(() => null);
+    const json = resp ? await resp.json().catch(() => null) : null;
+    if (!resp?.ok || !json?.access_token) {
+      console.error(`[kp] speech token refused: ${resp ? resp.status : "no answer"} ${json?.err_msg || json?.message || ""}`.trim());
+      return fail(res, 502, "cloud_unavailable", "The speech service did not answer. Try again in a moment.");
+    }
+    recent.push(now);
+    tokensGiven.set(req.kpUserId, recent);
+    ok(res, { token: json.access_token, expiresIn: Number(json.expires_in) || deepgramTokenSeconds(), cloud });
+  }));
+
   /* ---- Recordings: summaries by the AI ------------------------------- */
 
   // A recording's transcript (KingsPresenter posts it when a recording stops): its summary,
@@ -1159,16 +1269,42 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
   }));
 
   // Accounts: q a KingsChat username or name. With their copies and signed-in devices.
+  const shapeAccount = (u, month) => ({
+    id: u.id, username: u.kc_username, name: u.kc_name, createdAt: u.created_at, lastLoginAt: u.last_login_at, installs: u.installs, signedIn: u.signed_in,
+    disabled: Boolean(u.disabled_at), disabledReason: u.disabled_reason || "", cloud: shapeCloud(u, month),
+  });
+  const ACCOUNT_SELECT = `SELECT u.id, u.kc_username, u.kc_name, u.created_at, u.last_login_at, u.disabled_at, u.disabled_reason, u.cloud_minutes,
+              (SELECT count(*)::int FROM installs i WHERE i.user_id = u.id) AS installs,
+              (SELECT count(DISTINCT t.device_id)::int FROM refresh_tokens t WHERE t.user_id = u.id AND t.expires_at > now()) AS signed_in,
+              COALESCE((SELECT c.seconds FROM cloud_usage c WHERE c.user_id = u.id AND c.month = $1), 0) AS seconds
+       FROM users u`;
+  // An account by its id, or its KingsChat username (with or without the @).
+  const accountWhere = (who, n) => (isUuid(who) ? `u.id = $${n}::uuid` : `lower(u.kc_username) = lower($${n})`);
+
+  // Accounts: q a KingsChat username or name. With their copies, signed-in devices and this
+  // month's cloud listening (used, and the limit: their own or the default).
   router.get("/kp/admin/users", requireAdmin, asyncHandler(async (req, res) => {
     const term = clean(req.query.q, 80).replace(/^@/, "");
+    const month = thisMonth();
+    const limit = Math.min(500, Number(req.query.limit) || 100);
     const rows = await q(
-      `SELECT u.id, u.kc_username, u.kc_name, u.created_at, u.last_login_at, u.disabled_at, u.disabled_reason,
-              (SELECT count(*)::int FROM installs i WHERE i.user_id = u.id) AS installs,
-              (SELECT count(DISTINCT t.device_id)::int FROM refresh_tokens t WHERE t.user_id = u.id AND t.expires_at > now()) AS signed_in
-       FROM users u ${term ? `WHERE u.kc_username ILIKE $2 OR u.kc_name ILIKE $2 OR u.id::text = $3` : ""}
-       ORDER BY u.last_login_at DESC NULLS LAST LIMIT $1`,
-      term ? [Math.min(500, Number(req.query.limit) || 100), `%${term}%`, term] : [Math.min(500, Number(req.query.limit) || 100)]);
-    ok(res, { users: rows.map((u) => ({ id: u.id, username: u.kc_username, name: u.kc_name, createdAt: u.created_at, lastLoginAt: u.last_login_at, installs: u.installs, signedIn: u.signed_in, disabled: Boolean(u.disabled_at), disabledReason: u.disabled_reason || "" })) });
+      `${ACCOUNT_SELECT} ${term ? `WHERE u.kc_username ILIKE $3 OR u.kc_name ILIKE $3 OR u.id::text = $4` : ""}
+       ORDER BY u.last_login_at DESC NULLS LAST LIMIT $2`,
+      term ? [month, limit, `%${term}%`, term] : [month, limit]);
+    ok(res, { users: rows.map((u) => shapeAccount(u, month)), cloudMinutes: cloudMinutes() });
+  }));
+
+  // An account's own monthly cloud listening: { minutes } (0 stops it), or { minutes: null }
+  // for the default (KP_CLOUD_MINUTES) again. What is used this month stays.
+  router.post("/kp/admin/users/:id/cloud", requireAdmin, asyncHandler(async (req, res) => {
+    const who = clean(req.params.id, 120).replace(/^@/, "");
+    const raw = req.body?.minutes;
+    const minutes = raw === null || raw === "" || raw === undefined ? null : Math.round(Number(raw));
+    if (minutes !== null && (!Number.isFinite(minutes) || minutes < 0 || minutes > 100000)) return fail(res, 400, "bad_request", "minutes must be a whole number from 0 to 100000, or null for the default.");
+    const found = await q1(`UPDATE users u SET cloud_minutes = $2 WHERE ${accountWhere(who, 1)} RETURNING u.id`, [who, minutes]);
+    if (!found) return fail(res, 404, "not_found", "No such account.");
+    const month = thisMonth();
+    ok(res, { user: shapeAccount(await q1(`${ACCOUNT_SELECT} WHERE u.id = $2`, [month, found.id]), month) });
   }));
 
   // An account on or off (its id, or its KingsChat username): off, every copy it is signed in
@@ -1186,7 +1322,7 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
   // The oldest version allowed (everyone older must update before using KingsPresenter), and
   // what they are told. { minVersion: "" } lets every version run again.
   router.get("/kp/admin/policy", requireAdmin, asyncHandler(async (_req, res) => {
-    ok(res, { minVersion: await setting("min_version"), message: await setting("min_version_message") });
+    ok(res, { minVersion: await setting("min_version"), message: await setting("min_version_message"), cloudMinutes: cloudMinutes() });
   }));
   router.put("/kp/admin/policy", requireAdmin, asyncHandler(async (req, res) => {
     const body = req.body || {};
@@ -1196,7 +1332,7 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       await setSetting("min_version", v);
     }
     if ("message" in body) await setSetting("min_version_message", clean(body.message, 1000));
-    ok(res, { minVersion: await setting("min_version"), message: await setting("min_version_message") });
+    ok(res, { minVersion: await setting("min_version"), message: await setting("min_version_message"), cloudMinutes: cloudMinutes() });
   }));
 
   const latestFor = async (platform, arch) => {

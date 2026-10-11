@@ -78,6 +78,9 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `account_disabled` | 403 | The account was disabled by the administrator |
 | `unauthorized_admin_key` / `admin_off` | 401 / 503 | Wrong `x-admin-key`; `KP_ADMIN_KEY` unset |
 | `device_limit` | 403 | Signed in on as many devices as `KP_MAX_DEVICES` allows; sign one out first |
+| `cloud_used` | 403 | No Cloud listening left this month (the answer carries `cloud`) |
+| `cloud_off` / `cloud_unavailable` | 503 / 502 | No `KP_DEEPGRAM_API_KEY` on this server; Deepgram gave no token |
+| `too_many` | 429 | More Cloud listening streams this hour than `KP_CLOUD_TOKENS_PER_HOUR` |
 | `kc_exchange_failed` / `kc_profile_failed` / `kc_no_identity` | 502 | KingsChat refused |
 | `kc_not_configured` | 500 | `KP_KC_CLIENT_ID` (or `NMM_KC_CLIENT_ID`) unset |
 
@@ -188,15 +191,37 @@ required is let in again by itself).
 
 A disabled account also cannot sign in (`account_disabled`, 403) or use any signed-in call.
 
+### Cloud listening: a monthly allowance
+
+Speech recognised online ("Cloud" in the app) is limited per account and calendar month
+(UTC): `KP_CLOUD_MINUTES` (120) unless the administrator set the account's own. The desktop
+app asks before it listens online, reports the seconds of sound it sent as it goes, and
+stops when nothing is left. Computers signed in to one account share its allowance.
+
+| Call | |
+| --- | --- |
+| `GET /kp/listening` | `{ cloud: { month, limitSeconds, usedSeconds, remainingSeconds, custom, resetsAt } }` (`custom`: the account's own limit) |
+| `POST /kp/listening/usage` | `{ "seconds": 30 }` used since the last report (whole seconds, at most 6 hours a report); answers `{ cloud }` as it now stands |
+| `POST /kp/listening/token` | A token for one stream: `{ token, expiresIn, cloud }`. The app opens Deepgram's `/v1/listen` with `Authorization: Bearer <token>` within `expiresIn` seconds; the stream then runs until it is closed |
+
+`/kp/me` carries `cloud` too.
+
+The speech service's key (`KP_DEEPGRAM_API_KEY`) never leaves this server: the token is made
+from it by Deepgram's `/v1/auth/grant` and lasts 30 seconds, so a copy of the app carries
+nothing worth taking. A token is only given while the account has time left this month
+(`cloud_used`, 403, with `cloud`), and an account may open at most `KP_CLOUD_TOKENS_PER_HOUR`
+streams an hour (`too_many`, 429).
+
 ### The administrator (`x-admin-key: KP_ADMIN_KEY`)
 
 | Call | |
 | --- | --- |
 | `GET /kp/admin/installs?q=` | Copies, newest first (q: computer name, version, account name or id) |
 | `POST /kp/admin/installs/:id` | `{ "disabled": true, "reason": "Licence ended." }` — one copy off (`false`: on again) |
-| `GET /kp/admin/users?q=` | Accounts, with their copies and signed-in devices |
+| `GET /kp/admin/users?q=` | Accounts, with their copies, signed-in devices and this month's `cloud` listening; `cloudMinutes`: the default |
 | `POST /kp/admin/users/:id` | `{ "disabled": true, "reason" }` — `:id` is the account id or its KingsChat username |
-| `GET /kp/admin/policy` | `{ minVersion, message }` |
+| `POST /kp/admin/users/:id/cloud` | `{ "minutes": 600 }` — the account's own monthly cloud listening (`0` stops it; `null`: the default again). What is used this month stays |
+| `GET /kp/admin/policy` | `{ minVersion, message, cloudMinutes }` (`cloudMinutes` is read only: `KP_CLOUD_MINUTES`) |
 | `PUT /kp/admin/policy` | `{ "minVersion": "0.2.0", "message": "Please update before Sunday." }` — `""` lets every version run |
 
 An installer uploaded with `x-required: 1` becomes the oldest version allowed by itself.
@@ -205,6 +230,7 @@ An installer uploaded with `x-required: 1` becomes the oldest version allowed by
 curl -H "x-admin-key: $KEY" "https://nmt.loveworldapis.com/api/kp/admin/installs?q=Main%20Hall"
 curl -X POST -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"disabled":true,"reason":"Licence ended."}' https://nmt.loveworldapis.com/api/kp/admin/installs/<id>
 curl -X PUT -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"minVersion":"0.2.0"}' https://nmt.loveworldapis.com/api/kp/admin/policy
+curl -X POST -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"minutes":600}' https://nmt.loveworldapis.com/api/kp/admin/users/@pastor_ade/cloud
 ```
 
 ## Configuration
@@ -213,6 +239,7 @@ curl -X PUT -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"min
 | --- | --- | --- |
 | `KP_KC_CLIENT_ID` | `NMM_KC_CLIENT_ID` | KingsChat client id (KingsPresenter's Web application) |
 | `KP_KC_CLIENT_SECRET` | none | Its client secret, when KingsChat issued one (sent with the code) |
+| `KP_KC_LEGACY_CLIENT_IDS` | none | Earlier client ids, comma separated: codes from app builds that still use one are exchanged with it (tried after `KP_KC_CLIENT_ID`) |
 | `KP_SITE_URL` | `NMM_SITE_URL` | The site KingsChat sends people back to: `https://nmt.loveworldapis.com/api/kp` (this API's own callback) |
 | `KP_KC_API_KEY` | `NMM_KC_API_KEY` | Optional KingsChat `api-key` header |
 | `KP_API_KEY` | none | App key; unset, none is asked for |
@@ -228,6 +255,9 @@ curl -X PUT -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"min
 | `KP_SUMMARY_MAX_CHARS` | 600000 | The longest transcript summarised |
 | `KP_ADMIN_KEY` | none | The administrator's key for `/kp/admin/*`; unset: no admin routes |
 | `KP_MAX_DEVICES` | 0 (no limit) | How many devices one account may be signed in on at once; a new device beyond it is refused (`device_limit`, 403). `/kp/me` and `/kp/devices` report `signedIn` and `max`. Read on each sign-in, so it can change without a restart |
+| `KP_DEEPGRAM_API_KEY` | none | Deepgram's key for Cloud listening (Member rights or more): it stays here and makes the apps' 30-second tokens. Unset: `cloud_off` |
+| `KP_DEEPGRAM_TOKEN_SECONDS` / `KP_CLOUD_TOKENS_PER_HOUR` | 30 / 60 | How long a token lasts (5–3600); how many streams one account may open an hour |
+| `KP_CLOUD_MINUTES` | 120 | Cloud listening each account may use a month, in minutes, unless the administrator set its own (`/kp/admin/users/:id/cloud`). Read when asked: a change applies without a restart |
 | `KP_UPDATE_UPLOAD_KEY` | none | Lets the build upload installers (the GitHub secret of the same name) |
 | `KP_RELEASES_DIR` | `~/kingspresenter-releases` | The installers (outside the project, as the media) |
 | `KP_MAX_RELEASE_MB` | 1024 | Largest installer |

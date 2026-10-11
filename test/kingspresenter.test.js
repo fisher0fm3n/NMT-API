@@ -30,8 +30,9 @@ const kingschat = http.createServer((req, res) => {
     kcCalls.push({ url: req.url, body: body ? JSON.parse(body) : null, auth: req.headers.authorization });
     res.setHeader("content-type", "application/json");
     if (req.url === "/token") {
-      const { code } = JSON.parse(body);
-      if (code !== "good-code" && code !== "second-code") { res.statusCode = 400; return res.end("{}"); }
+      const { code, client_id } = JSON.parse(body);
+      // "old-code": a code KingsChat gave an app still built with the earlier client.
+      if (code === "old-code" ? client_id !== "old-client" : code !== "good-code" && code !== "second-code") { res.statusCode = 400; return res.end("{}"); }
       return res.end(JSON.stringify({ access_token: `kc-${code}`, refresh_token: "kc-refresh", expires_in_millis: 3600000 }));
     }
     if (req.url === "/profile") {
@@ -51,7 +52,7 @@ test.before(async () => {
   const kc = `http://127.0.0.1:${kingschat.address().port}`;
   // The API's .env is not read (KP_SKIP_ENV_FILE), and the database is set outright.
   Object.assign(process.env, {
-    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_CLIENT_SECRET: "shh", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
+    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_CLIENT_SECRET: "shh", KP_KC_LEGACY_CLIENT_IDS: "old-client", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
     KP_API_KEY: "app-key", KP_RELAY_KEY: "relay-key", KP_MEDIA_DIR: MEDIA, KP_RELAY_URL: "wss://relay.test", KP_SITE_URL: "http://localhost:3000",
     KP_RELEASES_DIR: RELEASES, KP_UPDATE_UPLOAD_KEY: "upload-key", KP_SUMMARY_MAX_CHARS: "5000",
   });
@@ -99,7 +100,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["devices", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["cloud_usage", "devices", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -394,6 +395,119 @@ test("may this copy run: an oldest version allowed, a copy or an account disable
     assert.equal((await check("0.2.9")).json.reason, "update");
     await call("PUT", "/kp/admin/policy", { headers: admin, body: { minVersion: "" } });
   } finally { delete process.env.KP_ADMIN_KEY; }
+});
+
+test("cloud listening: 2 hours a month by default, reported as it is used, and an account's own limit set by the administrator", async () => {
+  // Signed in only.
+  assert.equal((await call("GET", "/kp/listening")).status, 401);
+  assert.equal((await call("POST", "/kp/listening/usage", { body: { seconds: 60 } })).status, 401);
+
+  const fresh = (await call("GET", "/kp/listening", { token: auth.accessToken })).json.cloud;
+  const month = new Date().toISOString().slice(0, 7);
+  assert.deepEqual([fresh.month, fresh.limitSeconds, fresh.custom], [month, 7200, false], "the default: 120 minutes");
+  assert.equal(fresh.remainingSeconds, fresh.limitSeconds - fresh.usedSeconds);
+  const next = new Date(fresh.resetsAt);
+  assert.deepEqual([next.getUTCDate(), next.getUTCHours()], [1, 0], "it starts again on the first of next month");
+  assert.ok(next > new Date());
+
+  // Reports add up; nonsense is refused; one report adds at most 6 hours.
+  const used = fresh.usedSeconds;
+  assert.equal((await call("POST", "/kp/listening/usage", { token: auth.accessToken, body: { seconds: 90 } })).json.cloud.usedSeconds, used + 90);
+  assert.equal((await call("POST", "/kp/listening/usage", { token: auth.accessToken, body: { seconds: 30.4 } })).json.cloud.usedSeconds, used + 120);
+  assert.equal((await call("POST", "/kp/listening/usage", { token: auth.accessToken, body: { seconds: -5 } })).json.error, "bad_request");
+  assert.equal((await call("POST", "/kp/listening/usage", { token: auth.accessToken, body: { seconds: "lots" } })).json.error, "bad_request");
+  assert.equal((await call("POST", "/kp/listening/usage", { token: auth.accessToken, body: { seconds: 0 } })).json.cloud.usedSeconds, used + 120);
+  const me = (await call("GET", "/kp/me", { token: auth.accessToken })).json;
+  assert.equal(me.cloud.usedSeconds, used + 120, "/kp/me carries it too");
+
+  // The default follows KP_CLOUD_MINUTES.
+  process.env.KP_CLOUD_MINUTES = "30";
+  try { assert.equal((await call("GET", "/kp/listening", { token: auth.accessToken })).json.cloud.limitSeconds, 1800); }
+  finally { delete process.env.KP_CLOUD_MINUTES; }
+
+  // The administrator sees each account's use and limit, and sets one account's own.
+  const admin = { "x-admin-key": "admin-key" };
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    const list = (await call("GET", "/kp/admin/users?q=pastor", { headers: admin })).json;
+    assert.equal(list.cloudMinutes, 120);
+    assert.deepEqual([list.users[0].cloud.usedSeconds, list.users[0].cloud.limitSeconds, list.users[0].cloud.custom], [used + 120, 7200, false]);
+    assert.equal((await call("GET", "/kp/admin/policy", { headers: admin })).json.cloudMinutes, 120);
+
+    assert.equal((await call("POST", "/kp/admin/users/@pastor_ade/cloud", { headers: { "x-admin-key": "wrong" }, body: { minutes: 600 } })).status, 401);
+    assert.equal((await call("POST", "/kp/admin/users/@pastor_ade/cloud", { headers: admin, body: { minutes: -1 } })).json.error, "bad_request");
+    assert.equal((await call("POST", "/kp/admin/users/@nobody_here/cloud", { headers: admin, body: { minutes: 600 } })).status, 404);
+    const set = (await call("POST", "/kp/admin/users/@pastor_ade/cloud", { headers: admin, body: { minutes: 600 } })).json.user;
+    assert.deepEqual([set.username, set.cloud.limitSeconds, set.cloud.custom, set.cloud.usedSeconds], ["pastor_ade", 36000, true, used + 120]);
+    const mine = (await call("GET", "/kp/listening", { token: auth.accessToken })).json.cloud;
+    assert.deepEqual([mine.limitSeconds, mine.remainingSeconds, mine.custom], [36000, 36000 - used - 120, true], "the account sees its own limit");
+
+    // 0 stops it; null is the default again (by id this time).
+    assert.equal((await call("POST", `/kp/admin/users/${set.id}/cloud`, { headers: admin, body: { minutes: 0 } })).json.user.cloud.remainingSeconds, 0);
+    const back = (await call("POST", `/kp/admin/users/${set.id}/cloud`, { headers: admin, body: { minutes: null } })).json.user;
+    assert.deepEqual([back.cloud.limitSeconds, back.cloud.custom], [7200, false]);
+  } finally { delete process.env.KP_ADMIN_KEY; }
+});
+
+test("a speech token for one Cloud stream: signed in, with time left, from the speech service's key kept here", async () => {
+  // Deepgram, as far as tokens go: its key in, a short-lived token out (or a refusal).
+  const grants = [];
+  let grantStatus = 200;
+  const deepgram = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (c) => { body += c; });
+    req.on("end", () => {
+      grants.push({ url: req.url, auth: req.headers.authorization, body: body ? JSON.parse(body) : null });
+      res.setHeader("content-type", "application/json");
+      res.statusCode = grantStatus;
+      res.end(JSON.stringify(grantStatus === 200 ? { access_token: `dg-token-${grants.length}`, expires_in: 30 } : { err_msg: "Insufficient permissions." }));
+    });
+  });
+  await new Promise((r) => deepgram.listen(0, "127.0.0.1", r));
+  const token = () => call("POST", "/kp/listening/token", { token: auth.accessToken, body: {} });
+  const admin = { "x-admin-key": "admin-key" };
+  try {
+    assert.equal((await call("POST", "/kp/listening/token", { body: {} })).status, 401, "signed in only");
+    const off = await token();
+    assert.deepEqual([off.status, off.json.error], [503, "cloud_off"], "no speech key on this server");
+
+    Object.assign(process.env, { KP_DEEPGRAM_API_KEY: "dg-server-key", KP_DEEPGRAM_URL: `http://127.0.0.1:${deepgram.address().port}`, KP_ADMIN_KEY: "admin-key" });
+    const given = await token();
+    assert.equal(given.status, 200);
+    assert.deepEqual([given.json.token, given.json.expiresIn, given.json.cloud.limitSeconds], ["dg-token-1", 30, 7200]);
+    assert.deepEqual(grants[0], { url: "/v1/auth/grant", auth: "Token dg-server-key", body: { ttl_seconds: 30 } }, "the key goes to the speech service only");
+    assert.ok(!JSON.stringify(given.json).includes("dg-server-key"), "and never to the app");
+
+    // Nothing left this month: no token (the account's own limit of 0, from the administrator).
+    await call("POST", "/kp/admin/users/@pastor_ade/cloud", { headers: admin, body: { minutes: 0 } });
+    const used = await token();
+    assert.deepEqual([used.status, used.json.error, used.json.cloud.remainingSeconds], [403, "cloud_used", 0]);
+    assert.equal(grants.length, 1, "the speech service is not asked");
+    await call("POST", "/kp/admin/users/@pastor_ade/cloud", { headers: admin, body: { minutes: null } });
+
+    // The speech service refusing: said plainly, its key not shown.
+    grantStatus = 403;
+    const refused = await token();
+    assert.deepEqual([refused.status, refused.json.error], [502, "cloud_unavailable"]);
+    grantStatus = 200;
+
+    // Only so many streams an hour.
+    process.env.KP_CLOUD_TOKENS_PER_HOUR = "2";
+    assert.equal((await token()).status, 200);
+    const many = await token();
+    assert.deepEqual([many.status, many.json.error], [429, "too_many"]);
+  } finally {
+    for (const k of ["KP_DEEPGRAM_API_KEY", "KP_DEEPGRAM_URL", "KP_ADMIN_KEY", "KP_CLOUD_TOKENS_PER_HOUR"]) delete process.env[k];
+    deepgram.close();
+  }
+});
+
+test("a code from an app built with the earlier KingsChat client still signs in (KP_KC_LEGACY_CLIENT_IDS)", async () => {
+  const before = kcCalls.length;
+  const r = await call("POST", "/kp/auth/kingschat", { body: { code: "old-code", deviceName: "An older phone build", deviceKind: "phone" } });
+  assert.equal(r.status, 200, r.text);
+  assert.deepEqual(kcCalls.slice(before).filter((c) => c.url === "/token").map((c) => c.body.client_id), ["test-client", "old-client"], "this app's client first, then the earlier one");
+  assert.equal((await call("POST", "/kp/auth/kingschat", { body: { code: "nope" } })).json.error, "kc_exchange_failed");
 });
 
 test("versions compare as numbers", () => {
