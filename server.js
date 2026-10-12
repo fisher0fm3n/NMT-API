@@ -116,6 +116,10 @@ res.setHeader(
 });
 
 const server = http.createServer(app);
+// KingsPresenter's installers arrive for its updates as one upload of a few hundred MB (PUT
+// /api/kp/updates/upload), minutes long from GitHub's builders; Node's default cuts any request
+// off after 5 minutes, which threw every installer away part way.
+server.requestTimeout = 60 * 60 * 1000;
 
 const io = new Server(server, {
   cors: {

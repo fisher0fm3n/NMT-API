@@ -1176,6 +1176,8 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     const file = path.join(RELEASES_DIR, storageKey);
     const part = `${file}.part`;
     const hash = crypto.createHash("sha256");
+    const started = Date.now();
+    const took = () => `${Math.round((Date.now() - started) / 1000)} s`;
     let bytes = 0;
     try {
       await new Promise((resolve, reject) => {
@@ -1191,10 +1193,13 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       if (hash.digest("hex") !== sha) throw Object.assign(new Error("The file does not match its hash."), { code: "hash_mismatch" });
     } catch (err) {
       await fsp.rm(part, { force: true });
+      // Said in the server's log too: the build that sent it may not show why.
+      console.error(`[kp] update upload ${storageKey} failed after ${bytes} of ${req.header("content-length") || "?"} bytes, ${took()}: ${err.message}`);
       const code = err.code === "too_large" ? "too_large" : err.code === "hash_mismatch" ? "hash_mismatch" : err.code === "empty_upload" ? "empty_upload" : "upload_failed";
       return fail(res, code === "too_large" ? 413 : 400, code, err.message);
     }
     await fsp.rename(part, file);
+    console.log(`[kp] update upload ${storageKey}: ${bytes} bytes in ${took()}`);
     const row = await q1(
       `INSERT INTO releases (version, platform, arch, filename, storage_key, bytes, sha256, notes)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
