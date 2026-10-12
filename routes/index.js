@@ -14,6 +14,7 @@ const nmtRoutes = require("./nmt");
 const nmmRoutes = require("./nmm");
 const pcdlAffiliateRoutes = require("./pcdl_affiliate");
 const kingsPresenterRoutes = require("./kingspresenter");
+const espeesTutorialsRoutes = require("./espees_tutorials");
 
 module.exports = function buildRoutes(deps) {
   const router = Router();
@@ -34,6 +35,7 @@ module.exports = function buildRoutes(deps) {
   router.use(nmmRoutes(deps));
   router.use(pcdlAffiliateRoutes(deps));
   router.use(kingsPresenterRoutes(deps));
+  router.use(espeesTutorialsRoutes(deps));
 
   return router;
 };
