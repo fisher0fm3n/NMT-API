@@ -60,6 +60,8 @@ const KC_LEGACY_CLIENT_IDS = (env("KP_KC_LEGACY_CLIENT_IDS") || "").split(",").m
 // A sign-in finished on this API's own callback page is handed to the desktop app as a
 // one-time ticket (kingspresenter://auth?ticket=…), good for this long.
 const TICKET_SECONDS = 300;
+// The api-key of the KingsChat project KC_CLIENT_ID belongs to: KingsChat asks for it to read
+// a profile, and refuses anyone who signed in through another project's client.
 const KC_API_KEY = env("KP_KC_API_KEY", "NMM_KC_API_KEY") || "";
 const KC_TOKEN_URL = env("KP_KC_TOKEN_URL") || "https://connect.kingsch.at/developer/api/oauth2/token";
 const KC_PROFILE_URL = env("KP_KC_PROFILE_URL") || "https://connect.kingsch.at/developer/api/user/profile";
@@ -601,8 +603,11 @@ const requireUser = asyncHandler(async (req, res, next) => {
   if (!token) return fail(res, 401, "no_token", "Sign in to continue.");
   const payload = await verifyAccess(token);
   if (!payload) return fail(res, 401, "invalid_token", "Your session has expired. Sign in again.");
-  const off = await q1(`SELECT disabled_reason FROM users WHERE id = $1 AND disabled_at IS NOT NULL`, [payload.sub]);
-  if (off) return fail(res, 403, "account_disabled", off.disabled_reason || DISABLED_TEXT);
+  // A deleted account's sign-in is over at once (its copies refresh, fail, and sign out), not
+  // when its access token runs out.
+  const account = await q1(`SELECT disabled_at, disabled_reason FROM users WHERE id = $1`, [payload.sub]);
+  if (!account) return fail(res, 401, "account_deleted", "This account no longer exists. Sign in again.");
+  if (account.disabled_at) return fail(res, 403, "account_disabled", account.disabled_reason || DISABLED_TEXT);
   req.kpUserId = payload.sub;
   req.kpDeviceId = payload.dev || null;
   next();
@@ -709,28 +714,27 @@ async function exchangeKcCode(code) {
   return null;
 }
 
+/** The signed-in person's KingsChat profile: GET /developer/api/user/profile with the project's
+ *  api-key and their token, answered with { profile: { id, name, username, email, phone_number,
+ *  avatar, … } }. A key from another project than KC_CLIENT_ID's is refused for anyone who
+ *  signed in through this one (403 user_not_authorized). */
 async function fetchKcProfile(accessToken) {
-  const headers = { Accept: "application/json", Authorization: `Bearer ${accessToken}` };
-  if (KC_API_KEY) headers["api-key"] = KC_API_KEY;
+  const headers = { Accept: "application/json", "api-key": KC_API_KEY, Authorization: `Bearer ${accessToken}` };
   const resp = await fetch(KC_PROFILE_URL, { headers }).catch((err) => { console.error(`[kp] KingsChat profile: no answer: ${err.message}`); return null; });
   if (!resp) return null;
   const json = await resp.json().catch(() => null);
-  if (!resp.ok || !json) {
-    console.error(`[kp] KingsChat profile refused: ${resp.status} ${json?.error || ""} ${json?.message || ""} (api-key ${KC_API_KEY ? "sent" : "not set"})`.replace(/\s+/g, " "));
+  const p = json?.profile;
+  if (!resp.ok || !p) {
+    console.error(`[kp] KingsChat profile refused: ${resp.status} ${json?.error || ""} ${json?.message || ""}`.replace(/\s+/g, " ").trim());
     return null;
   }
-  const p = json.profile ?? json.user ?? json ?? {};
-  const user = p.user ?? p;
-  const phone = p.phoneNumber ?? p.phone_number ?? p.phone ?? user.phoneNumber ?? user.phone_number ?? null;
-  const name = p.name || [p.firstName ?? user.firstName, p.lastName ?? user.lastName].filter(Boolean).join(" ") || null;
-  const kcId = p.kcID ?? user.kcID ?? p.id ?? user.id ?? p.userID ?? user.userID ?? null;
   return {
-    kcId: kcId != null ? String(kcId) : null,
-    username: (user.username ?? p.username ?? null)?.replace(/^@/, "") ?? null,
-    name,
-    email: p.emailAddress ?? p.email ?? user.emailAddress ?? user.email ?? null,
-    phone: phone ? String(phone) : null,
-    avatar: p.profilePicture ?? p.avatar ?? p.displayPicture ?? user.profilePicture ?? null,
+    kcId: p.id != null ? String(p.id) : null,
+    username: p.username ? String(p.username).replace(/^@/, "") : null,
+    name: p.name || null,
+    email: p.email || null,
+    phone: p.phone_number ? String(p.phone_number) : null,
+    avatar: p.avatar || null,
   };
 }
 
@@ -759,6 +763,7 @@ async function upsertKcUser(profile) {
 
 /** A KingsChat code (or access token) → a KingsPresenter user, or an error to send. */
 async function kingsChatUser({ code, accessToken }) {
+  if (!KC_API_KEY) return { error: [500, "kc_not_configured", "KingsChat sign-in is not set up on this server (KP_KC_API_KEY)."] };
   if (!accessToken) {
     if (!KC_CLIENT_ID) return { error: [500, "kc_not_configured", "KingsChat sign-in is not set up on this server (KP_KC_CLIENT_ID)."] };
     const tokens = await exchangeKcCode(code);
@@ -940,14 +945,23 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     ok(res, { deleted: true });
   }));
 
-  // Deletes the account and everything in it (library, media records, devices).
-  router.delete("/kp/account", ...user, asyncHandler(async (req, res) => {
-    const media = await q(`SELECT storage_key FROM media_objects WHERE user_id = $1`, [req.kpUserId]);
-    await q(`DELETE FROM users WHERE id = $1`, [req.kpUserId]);
+  /**
+   * Deletes an account and everything in it: its library, media (and their files, unless another
+   * account has the same one), recording summaries, cloud listening, devices and sign-ins. Its
+   * copies and remote sessions stay, no longer linked to it.
+   */
+  async function deleteAccount(userId) {
+    const media = await q(`SELECT storage_key FROM media_objects WHERE user_id = $1`, [userId]);
+    await q(`DELETE FROM users WHERE id = $1`, [userId]);
     for (const m of media) {
       const still = await q1(`SELECT 1 FROM media_objects WHERE storage_key = $1`, [m.storage_key]);
       if (!still) await fsp.rm(path.join(MEDIA_DIR, m.storage_key), { force: true }).catch(() => {});
     }
+  }
+
+  // The signed-in account deletes itself.
+  router.delete("/kp/account", ...user, asyncHandler(async (req, res) => {
+    await deleteAccount(req.kpUserId);
     ok(res, { deleted: true });
   }));
 
@@ -1325,6 +1339,27 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       [who, off ? clean(req.body?.reason, 500) || null : null]);
     if (!row) return fail(res, 404, "not_found", "No such account.");
     ok(res, { user: { id: row.id, username: row.kc_username, name: row.kc_name, disabled: Boolean(row.disabled_at), disabledReason: row.disabled_reason || "" } });
+  }));
+
+  // An account deleted (its id, or its KingsChat username), with everything in it (deleteAccount);
+  // says what went. Signing in with KingsChat again makes a new, empty account: to keep someone
+  // out, switch the account off instead.
+  router.delete("/kp/admin/users/:id", requireAdmin, asyncHandler(async (req, res) => {
+    const who = clean(req.params.id, 120).replace(/^@/, "");
+    const row = await q1(
+      `SELECT u.id, u.kc_username, u.kc_name,
+         (SELECT count(*) FROM documents d WHERE d.user_id = u.id AND d.deleted_at IS NULL)::int AS documents,
+         (SELECT count(*) FROM media_objects m WHERE m.user_id = u.id)::int AS media,
+         (SELECT count(*) FROM recording_summaries r WHERE r.user_id = u.id)::int AS summaries,
+         (SELECT count(*) FROM devices v WHERE v.user_id = u.id)::int AS devices
+       FROM users u WHERE ${accountWhere(who, 1)}`, [who]);
+    if (!row) return fail(res, 404, "not_found", "No such account.");
+    await deleteAccount(row.id);
+    ok(res, {
+      deleted: true,
+      user: { id: row.id, username: row.kc_username, name: row.kc_name },
+      removed: { documents: row.documents, media: row.media, summaries: row.summaries, devices: row.devices },
+    });
   }));
 
   // The oldest version allowed (everyone older must update before using KingsPresenter), and

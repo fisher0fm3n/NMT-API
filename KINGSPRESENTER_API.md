@@ -81,8 +81,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `cloud_used` | 403 | No Cloud listening left this month (the answer carries `cloud`) |
 | `cloud_off` / `cloud_unavailable` | 503 / 502 | No `KP_DEEPGRAM_API_KEY` on this server; Deepgram gave no token |
 | `too_many` | 429 | More Cloud listening streams this hour than `KP_CLOUD_TOKENS_PER_HOUR` |
-| `kc_exchange_failed` / `kc_profile_failed` / `kc_no_identity` | 502 | KingsChat refused |
-| `kc_not_configured` | 500 | `KP_KC_CLIENT_ID` (or `NMM_KC_CLIENT_ID`) unset |
+| `kc_exchange_failed` / `kc_profile_failed` / `kc_no_identity` | 502 | KingsChat refused (the server log says why; `user_not_authorized` on the profile: `KP_KC_API_KEY` is another project's than `KP_KC_CLIENT_ID`) |
+| `kc_not_configured` | 500 | `KP_KC_CLIENT_ID` or `KP_KC_API_KEY` (or their `NMM_*`) unset |
 
 ## Endpoints
 
@@ -221,6 +221,7 @@ streams an hour (`too_many`, 429).
 | `GET /kp/admin/users?q=` | Accounts, with their copies, signed-in devices and this month's `cloud` listening; `cloudMinutes`: the default |
 | `POST /kp/admin/users/:id` | `{ "disabled": true, "reason" }` — `:id` is the account id or its KingsChat username |
 | `POST /kp/admin/users/:id/cloud` | `{ "minutes": 600 }` — the account's own monthly cloud listening (`0` stops it; `null`: the default again). What is used this month stays |
+| `DELETE /kp/admin/users/:id` | The account deleted for good, with its library, media, recording summaries, cloud listening, devices and sign-ins (its copies stay, not signed in). Says what went: `{ "deleted": true, "user", "removed": { "documents", "media", "summaries", "devices" } }`. Its copies are signed out at once. Signing in with KingsChat again makes a new, empty account; to keep someone out, disable the account instead |
 | `GET /kp/admin/policy` | `{ minVersion, message, cloudMinutes }` (`cloudMinutes` is read only: `KP_CLOUD_MINUTES`) |
 | `PUT /kp/admin/policy` | `{ "minVersion": "0.2.0", "message": "Please update before Sunday." }` — `""` lets every version run |
 
@@ -241,7 +242,7 @@ curl -X POST -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"mi
 | `KP_KC_CLIENT_SECRET` | none | Its client secret, when KingsChat issued one (sent with the code) |
 | `KP_KC_LEGACY_CLIENT_IDS` | none | Earlier client ids, comma separated: codes from app builds that still use one are exchanged with it (tried after `KP_KC_CLIENT_ID`) |
 | `KP_SITE_URL` | `NMM_SITE_URL` | The site KingsChat sends people back to: `https://nmt.loveworldapis.com/api/kp` (this API's own callback) |
-| `KP_KC_API_KEY` | `NMM_KC_API_KEY` | Optional KingsChat `api-key` header |
+| `KP_KC_API_KEY` | `NMM_KC_API_KEY` | The KingsChat project's `api-key`, needed to read a profile: the project `KP_KC_CLIENT_ID` belongs to |
 | `KP_API_KEY` | none | App key; unset, none is asked for |
 | `KP_TOKEN_SECRET` | made once, kept in `settings` | Signs access tokens |
 | `KP_ACCESS_TTL_SECONDS` / `KP_REFRESH_DAYS` | 3600 / 90 | Token lifetimes |

@@ -32,12 +32,15 @@ const kingschat = http.createServer((req, res) => {
     if (req.url === "/token") {
       const { code, client_id } = JSON.parse(body);
       // "old-code": a code KingsChat gave an app still built with the earlier client.
-      if (code === "old-code" ? client_id !== "old-client" : code !== "good-code" && code !== "second-code") { res.statusCode = 400; return res.end("{}"); }
+      // "stranger-code": someone the project's api-key may not read (another project's sign-in).
+      if (code === "old-code" ? client_id !== "old-client" : !["good-code", "second-code", "stranger-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
       return res.end(JSON.stringify({ access_token: `kc-${code}`, refresh_token: "kc-refresh", expires_in_millis: 3600000 }));
     }
     if (req.url === "/profile") {
+      if (req.headers["api-key"] !== "kc-project-key") { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid_api_key", message: "The api-key header is missing or does not belong to an approved project." })); }
       if (!/^Bearer kc-/.test(req.headers.authorization || "")) { res.statusCode = 401; return res.end("{}"); }
-      return res.end(JSON.stringify({ profile: { user: { id: "kc-123", username: "@pastor_ade", firstName: "Ade", lastName: "Bello", profilePicture: "https://kc/ade.jpg" }, email: "ade@church.org" } }));
+      if (req.headers.authorization === "Bearer kc-stranger-code") { res.statusCode = 403; return res.end(JSON.stringify({ error: "user_not_authorized", message: "Your project is not allowed to read the profile of this user." })); }
+      return res.end(JSON.stringify({ profile: { id: "kc-123", name: "Ade Bello", username: "pastor_ade", email: "ade@church.org", phone_number: "+2348000000000", avatar: "https://kc/ade.jpg", is_email_verified: true } }));
     }
     res.statusCode = 404; res.end("{}");
   });
@@ -52,7 +55,7 @@ test.before(async () => {
   const kc = `http://127.0.0.1:${kingschat.address().port}`;
   // The API's .env is not read (KP_SKIP_ENV_FILE), and the database is set outright.
   Object.assign(process.env, {
-    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_CLIENT_SECRET: "shh", KP_KC_LEGACY_CLIENT_IDS: "old-client", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
+    KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_CLIENT_SECRET: "shh", KP_KC_LEGACY_CLIENT_IDS: "old-client", KP_KC_API_KEY: "kc-project-key", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
     KP_API_KEY: "app-key", KP_RELAY_KEY: "relay-key", KP_MEDIA_DIR: MEDIA, KP_RELAY_URL: "wss://relay.test", KP_SITE_URL: "http://localhost:3000",
     KP_RELEASES_DIR: RELEASES, KP_UPDATE_UPLOAD_KEY: "upload-key", KP_SUMMARY_MAX_CHARS: "5000",
   });
@@ -116,6 +119,8 @@ test("signing in with KingsChat: the code is exchanged, the profile read, the ac
   const bad = await call("POST", "/kp/auth/kingschat", { body: { code: "nope" } });
   assert.deepEqual([bad.status, bad.json.error], [502, "kc_exchange_failed"]);
   assert.equal((await call("POST", "/kp/auth/kingschat", { body: {} })).json.error, "missing_code");
+  const stranger = await call("POST", "/kp/auth/kingschat", { body: { code: "stranger-code" } });
+  assert.deepEqual([stranger.status, stranger.json.error], [502, "kc_profile_failed"]);
 
   const r = await call("POST", "/kp/auth/kingschat", { body: { code: "good-code", deviceName: "Main Hall Mac", deviceKind: "desktop" } });
   assert.equal(r.status, 200);
@@ -521,8 +526,34 @@ test("versions compare as numbers", () => {
 
 test("deleting the account removes it and its media", async () => {
   assert.equal((await call("DELETE", "/kp/account", { token: auth.accessToken })).json.deleted, true);
-  assert.equal((await call("GET", "/kp/me", { token: auth.accessToken })).json.error, "invalid_token");
+  assert.equal((await call("GET", "/kp/me", { token: auth.accessToken })).json.error, "account_deleted");
   assert.deepEqual(fs.readdirSync(MEDIA).flatMap((d) => fs.readdirSync(path.join(MEDIA, d))), []);
+});
+
+test("the administrator deletes an account (by KingsChat username or id) with everything in it; its copies are signed out at once", async () => {
+  // The same KingsChat person signs in again: a new, empty account, given a song and a picture.
+  const fresh = (await call("POST", "/kp/auth/kingschat", { body: { code: "good-code", deviceName: "Main Hall Mac", deviceKind: "desktop" } })).json;
+  const t = fresh.accessToken;
+  await call("POST", "/kp/sync/push", { token: t, body: { docs: [{ kind: "songs", id: "s9", doc: { id: "s9", title: "Way Maker", updatedAt: "2026-10-14T10:00:00.000Z", rev: 1 } }] } });
+  const bytes = Buffer.from("a church photo");
+  const sha = crypto.createHash("sha256").update(bytes).digest("hex");
+  assert.equal((await call("PUT", `/kp/media/${sha}`, { token: t, body: bytes, headers: { "content-type": "image/jpeg" } })).status, 201);
+  const admin = { "x-admin-key": "admin-key" };
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    assert.equal((await call("DELETE", "/kp/admin/users/@pastor_ade", { headers: { "x-admin-key": "wrong" } })).status, 401);
+    assert.equal((await call("DELETE", "/kp/admin/users/@nobody_here", { headers: admin })).json.error, "not_found");
+    assert.equal((await call("GET", "/kp/me", { token: t })).status, 200, "untouched until then");
+    const gone = (await call("DELETE", "/kp/admin/users/@Pastor_Ade", { headers: admin })).json;
+    assert.deepEqual([gone.deleted, gone.user.id, gone.user.username], [true, fresh.user.id, "pastor_ade"]);
+    assert.deepEqual(gone.removed, { documents: 1, media: 1, summaries: 0, devices: 1 });
+    // Its sign-in ends now, not when the access token runs out: refused, and the refresh too.
+    assert.equal((await call("POST", "/kp/sync/push", { token: t, body: { docs: [] } })).json.error, "account_deleted");
+    assert.equal((await call("POST", "/kp/auth/refresh", { body: { refreshToken: fresh.refreshToken } })).status, 401);
+    assert.deepEqual(fs.readdirSync(MEDIA).flatMap((d) => fs.readdirSync(path.join(MEDIA, d))), [], "its picture's file too");
+    assert.ok(!(await call("GET", "/kp/admin/users?q=pastor", { headers: admin })).json.users.length);
+    assert.equal((await call("DELETE", `/kp/admin/users/${fresh.user.id}`, { headers: admin })).json.error, "not_found", "by id: gone");
+  } finally { delete process.env.KP_ADMIN_KEY; }
 });
 
 test("the database is found from KINGSPRESENTER_DATABASE_URL, else NMM reporting's server, else PCO_FN's", () => {
