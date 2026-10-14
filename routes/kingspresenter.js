@@ -723,25 +723,38 @@ async function fetchKcProfile(accessToken) {
   const resp = await fetch(KC_PROFILE_URL, { headers }).catch((err) => { console.error(`[kp] KingsChat profile: no answer: ${err.message}`); return null; });
   if (!resp) return null;
   const json = await resp.json().catch(() => null);
-  const p = json?.profile;
+  const p = json?.profile ?? json?.user ?? null;
   if (!resp.ok || !p) {
     console.error(`[kp] KingsChat profile refused: ${resp.status} ${json?.error || ""} ${json?.message || ""}`.replace(/\s+/g, " ").trim());
     return null;
   }
+  // The person's fields at the profile's top or in a nested `user`, under the names KingsChat
+  // has used (kcID/id, profilePicture/avatar, phoneNumber/phone_number, emailAddress/email).
+  const u = p.user && typeof p.user === "object" ? p.user : p;
+  const pick = (...keys) => { for (const k of keys) { const v = p[k] ?? u[k]; if (v != null && v !== "") return v; } return null; };
+  // Accounts have been keyed by kcID when KingsChat gives it, else id: every one is kept, so an
+  // account made under any of them is found again (upsertKcUser).
+  const kcIds = [...new Set([p.kcID, u.kcID, p.id, u.id, p.userID, u.userID].filter((v) => v != null && v !== "").map(String))];
+  const username = pick("username");
+  const phone = pick("phoneNumber", "phone_number", "phone");
   return {
-    kcId: p.id != null ? String(p.id) : null,
-    username: p.username ? String(p.username).replace(/^@/, "") : null,
-    name: p.name || null,
-    email: p.email || null,
-    phone: p.phone_number ? String(p.phone_number) : null,
-    avatar: p.avatar || null,
+    kcId: kcIds[0] || null,
+    kcIds,
+    username: username ? String(username).replace(/^@/, "") : null,
+    name: pick("name") || [pick("firstName"), pick("lastName")].filter(Boolean).join(" ") || null,
+    email: pick("emailAddress", "email"),
+    phone: phone ? String(phone) : null,
+    avatar: pick("profilePicture", "avatar", "displayPicture", "avatarUrl", "avatar_url", "picture"),
   };
 }
 
 async function upsertKcUser(profile) {
   const username = profile.username || null;
+  // The account under any of the person's KingsChat ids: the one keyed by the first (kcID) when
+  // there are two, else the oldest (an account made since under another id is not the person's own).
+  const ids = profile.kcIds?.length ? profile.kcIds : profile.kcId ? [profile.kcId] : [];
   let row =
-    (profile.kcId ? await q1(`SELECT id FROM users WHERE kc_id = $1`, [profile.kcId]) : null) ||
+    (ids.length ? await q1(`SELECT id FROM users WHERE kc_id = ANY($1::text[]) ORDER BY (kc_id = $2) DESC, created_at ASC LIMIT 1`, [ids, profile.kcId]) : null) ||
     (username ? await q1(`SELECT id FROM users WHERE kc_id IS NULL AND lower(kc_username) = lower($1)`, [username]) : null);
   if (row) {
     await q(

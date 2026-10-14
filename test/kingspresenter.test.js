@@ -33,12 +33,15 @@ const kingschat = http.createServer((req, res) => {
       const { code, client_id } = JSON.parse(body);
       // "old-code": a code KingsChat gave an app still built with the earlier client.
       // "stranger-code": someone the project's api-key may not read (another project's sign-in).
-      if (code === "old-code" ? client_id !== "old-client" : !["good-code", "second-code", "stranger-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
+      if (code === "old-code" ? client_id !== "old-client" : !["good-code", "second-code", "stranger-code", "nested-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
       return res.end(JSON.stringify({ access_token: `kc-${code}`, refresh_token: "kc-refresh", expires_in_millis: 3600000 }));
     }
     if (req.url === "/profile") {
       if (req.headers["api-key"] !== "kc-project-key") { res.statusCode = 401; return res.end(JSON.stringify({ error: "invalid_api_key", message: "The api-key header is missing or does not belong to an approved project." })); }
       if (!/^Bearer kc-/.test(req.headers.authorization || "")) { res.statusCode = 401; return res.end("{}"); }
+      // The shape KingsChat has also answered with: the person in a nested `user`, keyed by
+      // kcID beside the profile's own id, the picture as profilePicture.
+      if (req.headers.authorization === "Bearer kc-nested-code") return res.end(JSON.stringify({ profile: { id: "6a0f00000000000000000001", name: "Grace Okafor", username: "grace_o", user: { kcID: "kc-777", profilePicture: "https://kc/grace.jpg", phoneNumber: "+2348111111111", emailAddress: "grace@church.org" } } }));
       if (req.headers.authorization === "Bearer kc-stranger-code") { res.statusCode = 403; return res.end(JSON.stringify({ error: "user_not_authorized", message: "Your project is not allowed to read the profile of this user." })); }
       return res.end(JSON.stringify({ profile: { id: "kc-123", name: "Ade Bello", username: "pastor_ade", email: "ade@church.org", phone_number: "+2348000000000", avatar: "https://kc/ade.jpg", is_email_verified: true } }));
     }
@@ -135,6 +138,16 @@ test("signing in with KingsChat: the code is exchanged, the profile read, the ac
   const again = await call("POST", "/kp/auth/kingschat", { body: { code: "second-code", deviceName: "Pastor's phone", deviceKind: "phone" } });
   assert.equal(again.json.user.id, auth.user.id);
   assert.notEqual(again.json.deviceId, auth.deviceId);
+});
+
+test("a KingsChat profile with the person in a nested user (kcID, profilePicture): read in full, and their account found again though one was made under the profile's other id", async () => {
+  const first = (await call("POST", "/kp/auth/kingschat", { body: { code: "nested-code", deviceName: "Grace's Mac" } })).json;
+  assert.deepEqual([first.user.kcId, first.user.username, first.user.avatar, first.user.phone, first.user.email], ["kc-777", "grace_o", "https://kc/grace.jpg", "+2348111111111", "grace@church.org"]);
+  // An account made since under the profile's own id (as sign-ins did for a while): not theirs.
+  await routes.pool.query(`INSERT INTO users (id, kc_id, kc_username, kc_name, created_at) VALUES ($1, '6a0f00000000000000000001', 'grace_o', 'Grace Okafor', now() + interval '1 hour')`, [crypto.randomUUID()]);
+  const again = (await call("POST", "/kp/auth/kingschat", { body: { code: "nested-code", deviceName: "Grace's Mac" } })).json;
+  assert.equal(again.user.id, first.user.id, "the account with their picture and library");
+  assert.equal(again.user.avatar, "https://kc/grace.jpg");
 });
 
 test("the access token works; a refresh token is used once and replaced; signing out ends it", async () => {
