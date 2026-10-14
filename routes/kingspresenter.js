@@ -712,10 +712,13 @@ async function exchangeKcCode(code) {
 async function fetchKcProfile(accessToken) {
   const headers = { Accept: "application/json", Authorization: `Bearer ${accessToken}` };
   if (KC_API_KEY) headers["api-key"] = KC_API_KEY;
-  const resp = await fetch(KC_PROFILE_URL, { headers }).catch(() => null);
+  const resp = await fetch(KC_PROFILE_URL, { headers }).catch((err) => { console.error(`[kp] KingsChat profile: no answer: ${err.message}`); return null; });
   if (!resp) return null;
   const json = await resp.json().catch(() => null);
-  if (!resp.ok || !json) return null;
+  if (!resp.ok || !json) {
+    console.error(`[kp] KingsChat profile refused: ${resp.status} ${json?.error || ""} ${json?.message || ""} (api-key ${KC_API_KEY ? "sent" : "not set"})`.replace(/\s+/g, " "));
+    return null;
+  }
   const p = json.profile ?? json.user ?? json ?? {};
   const user = p.user ?? p;
   const phone = p.phoneNumber ?? p.phone_number ?? p.phone ?? user.phoneNumber ?? user.phone_number ?? null;
