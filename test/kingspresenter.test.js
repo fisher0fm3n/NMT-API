@@ -318,12 +318,21 @@ test("installers: uploaded by the build with the key, checked against their hash
   assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.2.0", { token: auth.accessToken })).status, 204);
   assert.equal((await call("GET", "/kp/updates/latest?platform=win32&arch=x64&version=0.1.0", { token: auth.accessToken })).json.filename, "KingsPresenter Setup 0.1.2.exe");
   assert.equal((await call("GET", "/kp/updates/latest?platform=win32&arch=arm64", { token: auth.accessToken })).status, 204, "no such build");
-  assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64")).json.error, "no_token");
+  // Signed out: offered too (the app key only), as a copy that never signed in asks.
+  const signedOut = await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.1.1");
+  assert.equal(signedOut.status, 200);
+  assert.equal(signedOut.json.version, "0.1.2");
+  assert.equal((await call("GET", "/kp/updates/latest?platform=darwin&arch=arm64&version=0.1.1", { key: null })).json.error, "unauthorized_api_key");
   // The installer itself, whole.
   const file = await fetch(latest.json.url, { headers: { "x-api-key": "app-key", authorization: `Bearer ${auth.accessToken}` } });
   assert.equal(file.status, 200);
   assert.equal(file.headers.get("x-sha256"), sha);
   assert.equal(Buffer.compare(Buffer.from(await file.arrayBuffer()), dmg), 0);
+  // Signed out, the app sends "Bearer undefined": downloaded all the same; never without the app key.
+  const plain = await fetch(latest.json.url, { headers: { "x-api-key": "app-key", authorization: "Bearer undefined" } });
+  assert.equal(plain.status, 200);
+  assert.equal(Buffer.compare(Buffer.from(await plain.arrayBuffer()), dmg), 0);
+  assert.equal((await fetch(latest.json.url)).status, 401);
   assert.equal((await call("GET", "/kp/updates/files/0.9.9/darwin/arm64", { token: auth.accessToken })).status, 404);
   const list = (await call("GET", "/kp/updates/releases", { token: auth.accessToken })).json.releases;
   assert.deepEqual(list.map((r) => `${r.version} ${r.platform}`).sort(), ["0.1.0 darwin", "0.1.2 darwin", "0.1.2 win32"]);

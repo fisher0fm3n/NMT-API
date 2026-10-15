@@ -104,8 +104,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /kp/remote/sessions` | The account's church computers' Remote sessions, newest first, with how many phones joined |
 | `POST /kp/recordings/summary` | A recording's transcript → its summary by the AI (below) |
 | `GET /kp/recordings/summary/:recordingId` | The summary kept for a recording |
-| `GET /kp/updates/latest?platform=&arch=&version=` | The latest KingsPresenter for that computer, when newer than `version`; 204 when not (below) |
-| `GET /kp/updates/files/:version/:platform/:arch` | The installer |
+| `GET /kp/updates/latest?platform=&arch=&version=` | The latest KingsPresenter for that computer, when newer than `version`; 204 when not (below). No sign-in: the app key only |
+| `GET /kp/updates/files/:version/:platform/:arch` | The installer. No sign-in: the app key only |
 | `GET /kp/updates/releases` | Every release, newest first |
 | `PUT /kp/updates/upload` | For the build (`x-upload-key: KP_UPDATE_UPLOAD_KEY`): an installer (below) |
 
@@ -155,8 +155,9 @@ GET /kp/updates/latest?platform=darwin&arch=arm64&version=0.1.1
   "url": "https://nmt.loveworldapis.com/api/kp/updates/files/0.1.2/darwin/arm64", "size": 183562240, "sha256": "9f2c…", "filename": "KingsPresenter-0.1.2-arm64.dmg" }
 ```
 
-`204` when there is nothing newer. `url` is `GET /kp/updates/files/:version/:platform/:arch`
-(signed in): the installer, with `Content-Length` and `X-Sha256`. `url` starts with
+`204` when there is nothing newer. Neither needs a sign-in, only the app key (`x-api-key`, when
+KP_API_KEY is set), so every copy can update, signed in or not. `url` is
+`GET /kp/updates/files/:version/:platform/:arch`: the installer, with `Content-Length` and `X-Sha256`. `url` starts with
 `KP_PUBLIC_URL` (the API's public address up to its mount point, e.g.
 `https://nmt.loveworldapis.com/api`), else this request's own host.
 

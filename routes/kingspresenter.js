@@ -20,7 +20,8 @@
 //
 // Auth: POST /kp/auth/kingschat exchanges a KingsChat authCode for an access token
 // (a short-lived HS256 JWT the relay can check) and a refresh token. Every other call
-// sends `Authorization: Bearer <accessToken>`, plus `x-api-key` when KP_API_KEY is set.
+// sends `Authorization: Bearer <accessToken>`, plus `x-api-key` when KP_API_KEY is set;
+// checking for updates and downloading them needs the app key only (no sign-in).
 //
 // The database (default name `kingspresenter`) and its tables are created on first use.
 
@@ -1399,7 +1400,8 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
 
   // What KingsPresenter asks, a little after it starts and every few hours: the latest version
   // for its platform, when it is newer than the one asking; 204 when there is nothing newer.
-  router.get("/kp/updates/latest", ...user, asyncHandler(async (req, res) => {
+  // Updates need no sign-in (the app key only): every copy can update, signed in or not.
+  router.get("/kp/updates/latest", ...app, asyncHandler(async (req, res) => {
     const platform = clean(req.query.platform, 20) || "darwin";
     const arch = clean(req.query.arch, 20) || (platform === "darwin" ? "arm64" : "x64");
     const version = clean(req.query.version, 40);
@@ -1415,7 +1417,7 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     ok(res, { releases: rows.map((r) => shapeRelease(req, r)) });
   }));
 
-  router.get("/kp/updates/files/:version/:platform/:arch", ...user, asyncHandler(async (req, res) => {
+  router.get("/kp/updates/files/:version/:platform/:arch", ...app, asyncHandler(async (req, res) => {
     const r = await q1(`SELECT * FROM releases WHERE version = $1 AND platform = $2 AND arch = $3 AND active`, [clean(req.params.version, 40), clean(req.params.platform, 20), clean(req.params.arch, 20)]);
     if (!r) return fail(res, 404, "not_found", "No such release.");
     const file = path.join(RELEASES_DIR, r.storage_key);
