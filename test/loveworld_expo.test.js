@@ -311,3 +311,26 @@ test("an exhibitor's team: the admin adds an account, which then runs the exhibi
   assert.equal(removed.json.user.exhibitor, null);
   assert.equal((await api("GET", "/expo/exhibitor", { token })).status, 403);
 });
+
+test("admins: the flag on the account, granted by an admin, never taken from the last one", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  assert.equal((await api("GET", "/expo/me", { token })).json.user.admin, false);
+  const granted = await api("POST", `/expo/admin/users/${user.id}`, { headers: admin, body: { admin: true } });
+  assert.equal(granted.status, 200, JSON.stringify(granted.json));
+  assert.equal(granted.json.admin, true);
+  assert.equal(granted.json.user.admin, true);
+  assert.equal((await api("GET", "/expo/me", { token })).json.user.admin, true);
+  assert.equal((await api("GET", "/expo/admin/users", { headers: admin })).json.users.find((u) => u.id === user.id).admin, true);
+  const last = await api("POST", `/expo/admin/users/${user.id}`, { headers: admin, body: { admin: false } });
+  assert.equal(last.status, 409);
+  assert.equal(last.json.error, "last_admin");
+  const other = await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } });
+  await api("POST", `/expo/admin/users/${other.json.user.id}`, { headers: admin, body: { admin: true } });
+  const taken = await api("POST", `/expo/admin/users/${user.id}`, { headers: admin, body: { admin: false } });
+  assert.equal(taken.json.admin, false);
+  // Disabling still works on its own, and leaves the flag alone.
+  const off = await api("POST", `/expo/admin/users/${other.json.user.id}`, { headers: admin, body: { disabled: true } });
+  assert.equal(off.json.disabled, true);
+  assert.equal(off.json.admin, true);
+  assert.equal((await api("POST", `/expo/admin/users/${other.json.user.id}`, { headers: admin, body: { disabled: false } })).json.disabled, false);
+});

@@ -43,7 +43,7 @@ is accepted instead, for apps that let this service do the exchange.
 
 ```json
 { "status": true, "accessToken": "<JWT, 1 h>", "refreshToken": "<opaque, 90 days>", "expiresIn": 3600, "deviceId": "<id>",
-  "user": { "id", "kcId", "username", "name", "avatar", "email", "phone", "organisation", "role", "country", "zone", "createdAt", "lastLoginAt" } }
+  "user": { "id", "kcId", "username", "name", "avatar", "email", "phone", "organisation", "role", "country", "zone", "exhibitorId", "admin", "createdAt", "lastLoginAt" } }
 ```
 
 `POST /expo/auth/refresh { refreshToken }` returns a new pair (each refresh token works once);
@@ -62,6 +62,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `slot_taken` / `double_booked` / `day_full` | 409 | Someone got there first; you have a meeting then; `EXPO_MAX_BOOKINGS_PER_DAY` reached |
 | `missing_fields` / `invalid_email` / `missing_topic` / `bad_program` / `bad_status` | 400 | Forms |
 | `not_exhibitor` | 403 | `/expo/exhibitor/*`: the account is not on an exhibitor's team |
+| `last_admin` | 409 | Taking admin away from the only admin account |
 | `not_found` | 404 | |
 
 ## Endpoints
@@ -100,7 +101,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | Call | |
 | --- | --- |
 | `GET /expo/admin/stats` | Counts of users, exhibitors, bookings, registrations, enquiries, applications |
-| `GET /expo/admin/users?q=&exhibitor=&limit=` | Accounts, each with `exhibitor: { id, name } \| null`; `exhibitor=` is one exhibitor's team. `POST /expo/admin/users/:id { disabled, reason? }` disables (signs out) or restores one |
+| `GET /expo/admin/users?q=&exhibitor=&limit=` | Accounts, each with `exhibitor: { id, name } \| null` and `admin`; `exhibitor=` is one exhibitor's team |
+| `POST /expo/admin/users/:id { disabled?, reason?, admin? }` | `disabled` disables (signs out) or restores the account; `admin` grants or takes away the website's admin area (the last admin cannot be taken away: `last_admin`). `{ user, disabled, admin }` |
 | `POST /expo/admin/users/:id/exhibitor { exhibitorId }` | Puts the account on that exhibitor's team (it then runs the exhibitor at `/expo/exhibitor`); `exhibitorId: null` takes it off. `{ user }` |
 | `GET /expo/admin/exhibitors` | Every exhibitor, with `availability`, `sort`, `active` and `team` (how many accounts run it) |
 | `POST /expo/admin/exhibitors { id?, name, category, zone, stand, tagline, description, smartMeet, featured, meetingTopics, availability, logo, website, sort, active }` | Makes one (`id` from the name when not given; an existing id is updated) |
@@ -112,6 +114,19 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `POST /expo/admin/enquiries/:id { status: new\|contacted\|closed }`, `POST /expo/admin/applications/:id { status: submitted\|shortlisted\|accepted\|declined }` | Moves one along |
 
 `availability` on an exhibitor (all optional): `{ "dayStart": 10, "dayEnd": 17, "slotMinutes": 20, "closedDates": ["2026-11-09"], "blocked": ["2026-11-10T11:00:00"] }`.
+
+## Who runs the admin area
+
+The website's `/admin` is for KingsChat accounts with `admin: true` (`users.is_admin`). An
+admin grants it to another account from the website's Users page; the first one is set in the
+database, once that person has signed in to the website at least once:
+
+```sql
+UPDATE users SET is_admin = true WHERE lower(kc_username) = 'their_username';
+```
+
+The website still calls `/expo/admin/*` with its own `EXPO_ADMIN_KEY`; the flag decides who may
+make it do so.
 
 ## The website
 

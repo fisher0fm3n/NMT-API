@@ -3,7 +3,8 @@
 //
 // Model (database `loveworld_expo`, Postgres, made with its tables on first use)
 //   users               KingsChat identity, plus what the person tells the Expo about themselves;
-//                       exhibitor_id when the admin has made the account part of an exhibitor's team
+//                       exhibitor_id when the admin has made the account part of an exhibitor's team;
+//                       is_admin for the accounts that may run the website's admin area
 //   refresh_tokens      one per signed-in browser (hashed; used once, then replaced)
 //   exhibitors          who is on the show floor, and whether they take SmartMeet bookings
 //   bookings            SmartMeet one-on-one meetings (a person, an exhibitor, a slot)
@@ -240,6 +241,9 @@ const SCHEMA = `
   -- Added after the first release: the exhibitor an account runs (its team), set by the admin.
   ALTER TABLE users ADD COLUMN IF NOT EXISTS exhibitor_id TEXT REFERENCES exhibitors(id) ON DELETE SET NULL;
   CREATE INDEX IF NOT EXISTS users_exhibitor ON users (exhibitor_id);
+  -- Who may run the website's admin area: set by another admin, or straight in the database
+  -- (UPDATE users SET is_admin = true WHERE lower(kc_username) = '<username>').
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
 `;
 
 let schemaReady = null;
@@ -391,13 +395,13 @@ function bearerToken(req) {
   return m ? m[1].trim() : (req.header("x-user-token") || "").trim() || null;
 }
 
-const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, exhibitor_id, created_at, last_login_at FROM users`;
+const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, exhibitor_id, is_admin, created_at, last_login_at FROM users`;
 function shapeUser(r) {
   if (!r) return null;
   return {
     id: r.id, kcId: r.kc_id, username: r.kc_username, name: r.kc_name, avatar: r.kc_avatar,
     email: r.email, phone: r.phone, organisation: r.organisation, role: r.role, country: r.country, zone: r.zone,
-    exhibitorId: r.exhibitor_id || null, createdAt: r.created_at, lastLoginAt: r.last_login_at,
+    exhibitorId: r.exhibitor_id || null, admin: !!r.is_admin, createdAt: r.created_at, lastLoginAt: r.last_login_at,
   };
 }
 const getUserById = async (id) => shapeUser(await q1(`${USER_SELECT} WHERE id = $1`, [id]));
@@ -894,15 +898,15 @@ module.exports = function loveworldExpoRoutes() {
 
   const limit = (req, max = 500) => Math.min(max, Math.max(1, Number(req.query.limit) || 200));
 
+  const shapeAdminUser = (r) => ({ ...shapeUser(r), disabled: !!r.disabled_at, disabledReason: r.disabled_reason || "", exhibitor: r.exhibitor_id ? { id: r.exhibitor_id, name: r.exhibitor_name } : null });
+  const ADMIN_USER_SELECT = `SELECT u.*, e.name AS exhibitor_name FROM users u LEFT JOIN exhibitors e ON e.id = u.exhibitor_id`;
+
   router.get("/expo/admin/stats", requireAdmin, asyncHandler(async (_req, res) => {
     const row = await q1(`SELECT (SELECT count(*)::int FROM users) AS users, (SELECT count(*)::int FROM exhibitors) AS exhibitors,
       (SELECT count(*)::int FROM bookings WHERE status = 'confirmed') AS bookings, (SELECT count(*)::int FROM registrations) AS registrations,
       (SELECT count(*)::int FROM sponsor_enquiries) AS enquiries, (SELECT count(*)::int FROM program_applications) AS applications`);
     ok(res, { stats: row });
   }));
-
-  const shapeAdminUser = (r) => ({ ...shapeUser(r), disabled: !!r.disabled_at, disabledReason: r.disabled_reason || "", exhibitor: r.exhibitor_id ? { id: r.exhibitor_id, name: r.exhibitor_name } : null });
-  const ADMIN_USER_SELECT = `SELECT u.*, e.name AS exhibitor_name FROM users u LEFT JOIN exhibitors e ON e.id = u.exhibitor_id`;
 
   // ?q= searches name, username and email; ?exhibitor= is one exhibitor's team.
   router.get("/expo/admin/users", requireAdmin, asyncHandler(async (req, res) => {
@@ -923,13 +927,28 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { user: shapeAdminUser(await q1(`${ADMIN_USER_SELECT} WHERE u.id = $1`, [row.id])) });
   }));
 
+  // `disabled` (with `reason`) disables or restores the account; `admin` grants or takes away the
+  // admin area. Each is applied only when given. The last admin cannot be taken away.
   router.post("/expo/admin/users/:id", requireAdmin, asyncHandler(async (req, res) => {
     if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such account.");
-    const disabled = !!req.body?.disabled;
-    const row = await q1(`UPDATE users SET disabled_at = CASE WHEN $2 THEN coalesce(disabled_at, now()) ELSE NULL END, disabled_reason = CASE WHEN $2 THEN $3 ELSE NULL END, updated_at = now() WHERE id = $1 RETURNING id`, [req.params.id, disabled, clean(req.body?.reason, 300) || null]);
-    if (!row) return fail(res, 404, "not_found", "No such account.");
-    if (disabled) await q(`DELETE FROM refresh_tokens WHERE user_id = $1`, [row.id]);
-    ok(res, { user: await getUserById(row.id), disabled });
+    const b = req.body || {};
+    if (!(await q1(`SELECT 1 FROM users WHERE id = $1`, [req.params.id]))) return fail(res, 404, "not_found", "No such account.");
+    if (b.disabled !== undefined) {
+      const disabled = !!b.disabled;
+      await q(`UPDATE users SET disabled_at = CASE WHEN $2 THEN coalesce(disabled_at, now()) ELSE NULL END, disabled_reason = CASE WHEN $2 THEN $3 ELSE NULL END, updated_at = now() WHERE id = $1`, [req.params.id, disabled, clean(b.reason, 300) || null]);
+      if (disabled) await q(`DELETE FROM refresh_tokens WHERE user_id = $1`, [req.params.id]);
+    }
+    if (b.admin !== undefined) {
+      const admin = !!b.admin;
+      if (!admin) {
+        const others = await q1(`SELECT 1 FROM users WHERE is_admin AND disabled_at IS NULL AND id <> $1 LIMIT 1`, [req.params.id]);
+        const isAdmin = await q1(`SELECT 1 FROM users WHERE id = $1 AND is_admin`, [req.params.id]);
+        if (isAdmin && !others) return fail(res, 409, "last_admin", "This is the only admin account. Make another account an admin first.");
+      }
+      await q(`UPDATE users SET is_admin = $2, updated_at = now() WHERE id = $1`, [req.params.id, admin]);
+    }
+    const user = await q1(`${ADMIN_USER_SELECT} WHERE u.id = $1`, [req.params.id]);
+    ok(res, { user: shapeAdminUser(user), disabled: !!user.disabled_at, admin: !!user.is_admin });
   }));
 
   // With `team`: how many accounts run each exhibitor.
