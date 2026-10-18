@@ -61,6 +61,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `not_available` / `bad_date` / `bad_slot` | 404 / 400 / 400 | SmartMeet: exhibitor not taking bookings; not an Expo day; not one of its slots |
 | `slot_taken` / `double_booked` / `day_full` | 409 | Someone got there first; you have a meeting then; `EXPO_MAX_BOOKINGS_PER_DAY` reached |
 | `missing_fields` / `invalid_email` / `missing_topic` / `bad_program` / `bad_status` | 400 | Forms |
+| `not_exhibitor` | 403 | `/expo/exhibitor/*`: the account is not on an exhibitor's team |
 | `not_found` | 404 | |
 
 ## Endpoints
@@ -70,7 +71,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /expo/ping` | Alive; the number of accounts and exhibitors (no app key) |
 | `GET /expo/config` | `{ kingschat: { clientId, loginUrl, redirectUri }, event: { start, end, days, utcOffset, meetingMinutes, dayStart, dayEnd, lunchHour, maxBookingsPerDay } }` |
 | `POST /expo/auth/kingschat`, `/expo/auth/refresh`, `/expo/auth/logout` | Above |
-| `GET /expo/me` | `{ user, counts: { bookings, registrations, applications } }` |
+| `GET /expo/me` | `{ user, counts: { bookings, registrations, applications }, exhibitor: { id, name, stand, smartMeet } \| null }` (`exhibitor`: the one the account runs, when the admin has put it on a team) |
 | `PATCH /expo/me { email?, phone?, organisation?, role?, country?, zone? }` | `{ user }` |
 | `DELETE /expo/account` | The account and its bookings, for good |
 | `GET /expo/exhibitors?q=&category=&zone=&smartmeet=1` | `{ exhibitors: [{ id, name, category, zone, stand, tagline, description, smartMeet, featured, meetingTopics, logo, website }] }` (active ones, by `sort` then name) |
@@ -86,13 +87,22 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `POST /expo/programs/applications { program: eagles-nest\|qubators\|content-creative, name, email, organisation?, summary?, data?: {} }` | 201 `{ reference "EN-…" / "QB-…" / "CC-…", id, createdAt }` |
 | `GET /expo/programs/applications` | The signed-in person's applications |
 
+### An exhibitor's team (signed in; the account is on the team, see admin below)
+
+| Call | |
+| --- | --- |
+| `GET /expo/exhibitor` | `{ exhibitor (with availability, sort, active), counts: { bookings, cancelled }, days: [{ date, bookings, slots }], team: [{ id, username, name, avatar, email }] }`: the overview; `slots` is how many a day still has before bookings |
+| `PATCH /expo/exhibitor { tagline?, description?, meetingTopics?, logo?, website?, smartMeet?, availability? }` | `{ exhibitor }`: how the stand reads and its SmartMeet settings. The name, stand, zone, category, featured, active and sort are the admin's and are ignored here |
+| `GET /expo/exhibitor/bookings?date=` | Every meeting booked with the exhibitor, soonest first, each with the booker's `username` and `avatar` besides the booking's name, email and organisation; `date` keeps one day |
+
 ### Admin (`x-admin-key`)
 
 | Call | |
 | --- | --- |
 | `GET /expo/admin/stats` | Counts of users, exhibitors, bookings, registrations, enquiries, applications |
-| `GET /expo/admin/users?q=&limit=` | Accounts; `POST /expo/admin/users/:id { disabled, reason? }` disables (signs out) or restores one |
-| `GET /expo/admin/exhibitors` | Every exhibitor, with `availability`, `sort`, `active` |
+| `GET /expo/admin/users?q=&exhibitor=&limit=` | Accounts, each with `exhibitor: { id, name } \| null`; `exhibitor=` is one exhibitor's team. `POST /expo/admin/users/:id { disabled, reason? }` disables (signs out) or restores one |
+| `POST /expo/admin/users/:id/exhibitor { exhibitorId }` | Puts the account on that exhibitor's team (it then runs the exhibitor at `/expo/exhibitor`); `exhibitorId: null` takes it off. `{ user }` |
+| `GET /expo/admin/exhibitors` | Every exhibitor, with `availability`, `sort`, `active` and `team` (how many accounts run it) |
 | `POST /expo/admin/exhibitors { id?, name, category, zone, stand, tagline, description, smartMeet, featured, meetingTopics, availability, logo, website, sort, active }` | Makes one (`id` from the name when not given; an existing id is updated) |
 | `POST /expo/admin/exhibitors/import { exhibitors: [...] }` | Several at once, each made or updated by `id` (the shape of `scripts/expo-seed.json`) |
 | `PUT /expo/admin/exhibitors/:id { …fields }` | Changes the fields given |

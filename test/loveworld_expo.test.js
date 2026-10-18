@@ -251,3 +251,63 @@ test("a disabled account is signed out at once", async () => {
   assert.equal(back.json.disabled, false);
   assert.equal((await api("GET", "/expo/me", { token })).status, 200);
 });
+
+test("an exhibitor's team: the admin adds an account, which then runs the exhibitor", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const other = await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } });
+  const notYet = await api("GET", "/expo/exhibitor", { token });
+  assert.equal(notYet.status, 403);
+  assert.equal(notYet.json.error, "not_exhibitor");
+  assert.equal((await api("POST", `/expo/admin/users/${user.id}/exhibitor`, { headers: admin, body: { exhibitorId: "nope" } })).status, 404);
+  const added = await api("POST", `/expo/admin/users/${user.id}/exhibitor`, { headers: admin, body: { exhibitorId: "kingschat" } });
+  assert.equal(added.status, 200, JSON.stringify(added.json));
+  assert.deepEqual(added.json.user.exhibitor, { id: "kingschat", name: "KingsChat" });
+  assert.equal((await api("GET", "/expo/me", { token })).json.exhibitor.name, "KingsChat");
+  assert.equal((await api("GET", "/expo/me", { token: other.json.accessToken })).json.exhibitor, null);
+  const team = await api("GET", "/expo/admin/users?exhibitor=kingschat", { headers: admin });
+  assert.deepEqual(team.json.users.map((u) => u.id), [user.id]);
+  assert.equal((await api("GET", "/expo/admin/exhibitors", { headers: admin })).json.exhibitors.find((e) => e.id === "kingschat").team, 1);
+
+  // The overview: the exhibitor with its availability, its meetings by day, the team.
+  const overview = await api("GET", "/expo/exhibitor", { token });
+  assert.equal(overview.status, 200, JSON.stringify(overview.json));
+  assert.equal(overview.json.exhibitor.id, "kingschat");
+  assert.deepEqual(overview.json.exhibitor.availability, {});
+  assert.equal(overview.json.counts.bookings, 0); // Ade cancelled his
+  assert.equal(overview.json.counts.cancelled, 1);
+  assert.equal(overview.json.days.length, 7);
+  assert.ok(overview.json.days[1].slots > 0);
+  assert.deepEqual(overview.json.team.map((m) => m.username), ["pastor_ade"]);
+  assert.equal((await api("GET", "/expo/exhibitor", { token: other.json.accessToken })).status, 403);
+
+  // The team changes the stand's copy and SmartMeet; the name, stand and flags stay the admin's.
+  const changed = await api("PATCH", "/expo/exhibitor", { token, body: { tagline: "Messaging for the kingdom", meetingTopics: ["SDK", "Communities"], availability: { dayStart: 11 }, name: "Hacked", stand: "Z99", active: false, featured: false } });
+  assert.equal(changed.status, 200, JSON.stringify(changed.json));
+  assert.equal(changed.json.exhibitor.tagline, "Messaging for the kingdom");
+  assert.deepEqual(changed.json.exhibitor.meetingTopics, ["SDK", "Communities"]);
+  assert.equal(changed.json.exhibitor.availability.dayStart, 11);
+  assert.equal(changed.json.exhibitor.name, "KingsChat");
+  assert.equal(changed.json.exhibitor.stand, "T01");
+  assert.equal(changed.json.exhibitor.active, true);
+  assert.equal(changed.json.exhibitor.featured, true);
+  const av = await api("GET", "/expo/smartmeet/availability?exhibitor=kingschat&date=2026-11-10");
+  assert.equal(av.json.slots[0].start, "2026-11-10T11:00:00");
+
+  // Its bookings, with who booked; one day of them with ?date=.
+  const booked = await api("POST", "/expo/smartmeet/bookings", { token: other.json.accessToken, body: { exhibitorId: "kingschat", start: "2026-11-11T11:00", topic: "Communities" } });
+  assert.equal(booked.status, 201, JSON.stringify(booked.json));
+  const all = await api("GET", "/expo/exhibitor/bookings", { token });
+  assert.equal(all.status, 200);
+  assert.deepEqual(all.json.bookings.map((b) => b.status), ["cancelled", "confirmed"]);
+  assert.equal(all.json.bookings[1].username, "grace_o");
+  assert.equal(all.json.bookings[1].name, "Grace Okafor");
+  const day = await api("GET", "/expo/exhibitor/bookings?date=2026-11-11", { token });
+  assert.equal(day.json.bookings.length, 1);
+  assert.equal((await api("GET", "/expo/exhibitor/bookings?date=2026-12-01", { token })).status, 400);
+  assert.equal((await api("GET", "/expo/exhibitor", { token })).json.counts.bookings, 1);
+
+  // Off the team again.
+  const removed = await api("POST", `/expo/admin/users/${user.id}/exhibitor`, { headers: admin, body: { exhibitorId: null } });
+  assert.equal(removed.json.user.exhibitor, null);
+  assert.equal((await api("GET", "/expo/exhibitor", { token })).status, 403);
+});

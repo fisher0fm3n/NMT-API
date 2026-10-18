@@ -2,7 +2,8 @@
 // LoveWorld Expo (loveworldexpo.com): the account and booking service behind the Expo website.
 //
 // Model (database `loveworld_expo`, Postgres, made with its tables on first use)
-//   users               KingsChat identity, plus what the person tells the Expo about themselves
+//   users               KingsChat identity, plus what the person tells the Expo about themselves;
+//                       exhibitor_id when the admin has made the account part of an exhibitor's team
 //   refresh_tokens      one per signed-in browser (hashed; used once, then replaced)
 //   exhibitors          who is on the show floor, and whether they take SmartMeet bookings
 //   bookings            SmartMeet one-on-one meetings (a person, an exhibitor, a slot)
@@ -15,6 +16,8 @@
 // access token (HS256 JWT, 1 h) and a refresh token. Signed-in calls send
 // `Authorization: Bearer <accessToken>`, plus `x-api-key` when EXPO_API_KEY is set.
 // Admin calls (/expo/admin/*) send `x-admin-key: EXPO_ADMIN_KEY`.
+// An account on an exhibitor's team (users.exhibitor_id, set by the admin) runs that exhibitor
+// at /expo/exhibitor: its overview, its details and its bookings.
 //
 // Same shape as routes/kingspresenter.js, so the two read alike.
 
@@ -232,6 +235,10 @@ const SCHEMA = `
     value TEXT NOT NULL,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
   );
+
+  -- Added after the first release: the exhibitor an account runs (its team), set by the admin.
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS exhibitor_id TEXT REFERENCES exhibitors(id) ON DELETE SET NULL;
+  CREATE INDEX IF NOT EXISTS users_exhibitor ON users (exhibitor_id);
 `;
 
 let schemaReady = null;
@@ -383,16 +390,21 @@ function bearerToken(req) {
   return m ? m[1].trim() : (req.header("x-user-token") || "").trim() || null;
 }
 
-const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, created_at, last_login_at FROM users`;
+const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, exhibitor_id, created_at, last_login_at FROM users`;
 function shapeUser(r) {
   if (!r) return null;
   return {
     id: r.id, kcId: r.kc_id, username: r.kc_username, name: r.kc_name, avatar: r.kc_avatar,
     email: r.email, phone: r.phone, organisation: r.organisation, role: r.role, country: r.country, zone: r.zone,
-    createdAt: r.created_at, lastLoginAt: r.last_login_at,
+    exhibitorId: r.exhibitor_id || null, createdAt: r.created_at, lastLoginAt: r.last_login_at,
   };
 }
 const getUserById = async (id) => shapeUser(await q1(`${USER_SELECT} WHERE id = $1`, [id]));
+/** The exhibitor an account runs, as the site shows it next to the person: `{ id, name, stand, smartMeet }`, or null. */
+async function exhibitorOf(userId) {
+  const r = await q1(`SELECT e.id, e.name, e.stand, e.smartmeet FROM users u JOIN exhibitors e ON e.id = u.exhibitor_id WHERE u.id = $1`, [userId]);
+  return r ? { id: r.id, name: r.name, stand: r.stand, smartMeet: r.smartmeet } : null;
+}
 
 /** The signed-in person on req.expoUserId, or 401. */
 const requireUser = asyncHandler(async (req, res, next) => {
@@ -413,6 +425,14 @@ const optionalUser = asyncHandler(async (req, _res, next) => {
   const token = bearerToken(req);
   const payload = token ? await verifyAccess(token) : null;
   req.expoUserId = payload?.sub && (await q1(`SELECT 1 FROM users WHERE id = $1 AND disabled_at IS NULL`, [payload.sub])) ? payload.sub : null;
+  next();
+});
+
+/** After requireUser: the exhibitor the signed-in account runs on req.expoExhibitor (a database row), or 403. */
+const requireExhibitor = asyncHandler(async (req, res, next) => {
+  const row = await q1(`${EXHIBITOR_SELECT} WHERE id = (SELECT exhibitor_id FROM users WHERE id = $1)`, [req.expoUserId]);
+  if (!row) return fail(res, 403, "not_exhibitor", "This account is not on an exhibitor's team. Ask the Expo team to add it to one.");
+  req.expoExhibitor = row;
   next();
 });
 
@@ -525,8 +545,14 @@ const EXHIBITOR_SELECT = `SELECT id, name, category, zone, stand, tagline, descr
 const shapeExhibitor = (r, { admin = false } = {}) => r && ({
   id: r.id, name: r.name, category: r.category, zone: r.zone, stand: r.stand, tagline: r.tagline, description: r.description,
   smartMeet: r.smartmeet, featured: r.featured, meetingTopics: r.meeting_topics || [], logo: r.logo, website: r.website,
-  ...(admin ? { availability: r.availability || {}, sort: r.sort, active: r.active } : {}),
+  ...(admin ? { availability: r.availability || {}, sort: r.sort, active: r.active, ...(r.team !== undefined ? { team: r.team } : {}) } : {}),
 });
+/** The members of an exhibitor's team, as shown to each other and to the admin. */
+const TEAM_SELECT = `SELECT id, kc_username, kc_name, kc_avatar, email FROM users WHERE exhibitor_id = $1 AND disabled_at IS NULL ORDER BY kc_name, kc_username`;
+const shapeMember = (r) => ({ id: r.id, username: r.kc_username, name: r.kc_name, avatar: r.kc_avatar, email: r.email });
+
+/** The fields an exhibitor's own team may change: how the stand reads, and SmartMeet. The rest (name, stand, zone, flags, order) is the admin's. */
+const EXHIBITOR_OWN_FIELDS = ["tagline", "description", "meeting_topics", "availability", "logo", "website", "smartmeet"];
 
 const BOOKING_SELECT = `SELECT b.id, b.reference, b.user_id, b.exhibitor_id, e.name AS exhibitor_name, e.stand, b.starts_at, b.ends_at, b.name, b.email, b.organisation, b.topic, b.notes, b.location, b.status, b.created_at, b.cancelled_at
   FROM bookings b JOIN exhibitors e ON e.id = b.exhibitor_id`;
@@ -589,6 +615,7 @@ module.exports = function loveworldExpoRoutes() {
   const app = [requireAppKey];
   const user = [requireAppKey, requireUser];
   const maybeUser = [requireAppKey, optionalUser];
+  const exhibitorUser = [requireAppKey, requireUser, requireExhibitor];
 
   router.get("/expo/ping", asyncHandler(async (_req, res) => {
     const row = await q1(`SELECT (SELECT count(*)::int FROM users) AS users, (SELECT count(*)::int FROM exhibitors WHERE active) AS exhibitors`);
@@ -640,7 +667,7 @@ module.exports = function loveworldExpoRoutes() {
       `SELECT (SELECT count(*)::int FROM bookings WHERE user_id = $1 AND status = 'confirmed') AS bookings,
               (SELECT count(*)::int FROM registrations WHERE user_id = $1) AS registrations,
               (SELECT count(*)::int FROM program_applications WHERE user_id = $1) AS applications`, [u.id]);
-    ok(res, { user: u, counts });
+    ok(res, { user: u, counts, exhibitor: await exhibitorOf(u.id) });
   }));
 
   router.patch("/expo/me", ...user, asyncHandler(async (req, res) => {
@@ -759,6 +786,43 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { booking: shapeBooking(await q1(`${BOOKING_SELECT} WHERE b.id = $1`, [row.id])) });
   }));
 
+  /* ---- the exhibitor's own area ---------------------------------------- */
+  // For accounts the admin has put on an exhibitor's team (POST /expo/admin/users/:id/exhibitor).
+
+  const dayBounds = (date) => [atEvent(`${date}T00:00:00`), atEvent(`${date}T23:59:59`)];
+
+  // The overview: the exhibitor as the admin sees it, its meetings by day, and who else is on the team.
+  router.get("/expo/exhibitor", ...exhibitorUser, asyncHandler(async (req, res) => {
+    const ex = req.expoExhibitor;
+    const counts = await q1(`SELECT count(*) FILTER (WHERE status = 'confirmed')::int AS bookings, count(*) FILTER (WHERE status = 'cancelled')::int AS cancelled FROM bookings WHERE exhibitor_id = $1`, [ex.id]);
+    const byDay = {};
+    for (const r of await q(`SELECT starts_at FROM bookings WHERE exhibitor_id = $1 AND status = 'confirmed'`, [ex.id])) {
+      const d = localTime(r.starts_at).slice(0, 10);
+      byDay[d] = (byDay[d] || 0) + 1;
+    }
+    const days = eventDays().map((date) => ({ date, bookings: byDay[date] || 0, slots: slotsFor(ex, date).filter((s) => s.available).length }));
+    const team = (await q(TEAM_SELECT, [ex.id])).map(shapeMember);
+    ok(res, { exhibitor: shapeExhibitor(ex, { admin: true }), counts, days, team });
+  }));
+
+  // The team changes how the stand reads and its SmartMeet settings; the admin keeps the rest.
+  router.patch("/expo/exhibitor", ...exhibitorUser, asyncHandler(async (req, res) => {
+    const given = exhibitorFields(req.body || {});
+    const f = Object.fromEntries(Object.entries(given).filter(([k]) => EXHIBITOR_OWN_FIELDS.includes(k)));
+    const row = await upsertExhibitor(req.expoExhibitor.id, f);
+    ok(res, { exhibitor: shapeExhibitor(row, { admin: true }) });
+  }));
+
+  // Every meeting booked with the exhibitor (one day of them with ?date=), with who booked it.
+  router.get("/expo/exhibitor/bookings", ...exhibitorUser, asyncHandler(async (req, res) => {
+    const date = clean(req.query.date, 10);
+    if (date && !isEventDay(date)) return fail(res, 400, "bad_date", `Pick a day of the Expo (${EVENT.start} to ${EVENT.end}).`);
+    const [from, to] = date ? dayBounds(date) : [null, null];
+    const rows = await q(`${BOOKING_SELECT.replace("FROM bookings b", ", u.kc_username AS username, u.kc_avatar AS avatar FROM bookings b LEFT JOIN users u ON u.id = b.user_id")}
+       WHERE b.exhibitor_id = $1 AND ($2::timestamptz IS NULL OR b.starts_at >= $2 AND b.starts_at < $3) ORDER BY b.starts_at`, [req.expoExhibitor.id, from, to]);
+    ok(res, { bookings: rows.map((r) => ({ ...shapeBooking(r), username: r.username || null, avatar: r.avatar || null })) });
+  }));
+
   /* ---- forms ----------------------------------------------------------- */
 
   router.post("/expo/registrations", ...maybeUser, asyncHandler(async (req, res) => {
@@ -836,10 +900,26 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { stats: row });
   }));
 
+  const shapeAdminUser = (r) => ({ ...shapeUser(r), disabled: !!r.disabled_at, disabledReason: r.disabled_reason || "", exhibitor: r.exhibitor_id ? { id: r.exhibitor_id, name: r.exhibitor_name } : null });
+  const ADMIN_USER_SELECT = `SELECT u.*, e.name AS exhibitor_name FROM users u LEFT JOIN exhibitors e ON e.id = u.exhibitor_id`;
+
+  // ?q= searches name, username and email; ?exhibitor= is one exhibitor's team.
   router.get("/expo/admin/users", requireAdmin, asyncHandler(async (req, res) => {
     const needle = clean(req.query.q, 100).toLowerCase();
-    const rows = await q(`${USER_SELECT.replace("FROM users", ", disabled_at, disabled_reason FROM users")} WHERE $1 = '' OR lower(coalesce(kc_username,'') || ' ' || coalesce(kc_name,'') || ' ' || coalesce(email,'')) LIKE '%' || $1 || '%' ORDER BY created_at DESC LIMIT $2`, [needle, limit(req)]);
-    ok(res, { users: rows.map((r) => ({ ...shapeUser(r), disabled: !!r.disabled_at, disabledReason: r.disabled_reason || "" })) });
+    const exhibitor = clean(req.query.exhibitor, 80);
+    const rows = await q(`${ADMIN_USER_SELECT} WHERE ($1 = '' OR lower(coalesce(u.kc_username,'') || ' ' || coalesce(u.kc_name,'') || ' ' || coalesce(u.email,'')) LIKE '%' || $1 || '%')
+       AND ($2 = '' OR u.exhibitor_id = $2) ORDER BY u.created_at DESC LIMIT $3`, [needle, exhibitor, limit(req)]);
+    ok(res, { users: rows.map(shapeAdminUser) });
+  }));
+
+  // Puts an account on an exhibitor's team (it then runs that exhibitor at /expo/exhibitor), or takes it off (exhibitorId null or "").
+  router.post("/expo/admin/users/:id/exhibitor", requireAdmin, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such account.");
+    const exhibitorId = slug(req.body?.exhibitorId || "");
+    if (exhibitorId && !(await q1(`SELECT 1 FROM exhibitors WHERE id = $1`, [exhibitorId]))) return fail(res, 404, "not_found", "No such exhibitor.");
+    const row = await q1(`UPDATE users SET exhibitor_id = $2, updated_at = now() WHERE id = $1 RETURNING id`, [req.params.id, exhibitorId || null]);
+    if (!row) return fail(res, 404, "not_found", "No such account.");
+    ok(res, { user: shapeAdminUser(await q1(`${ADMIN_USER_SELECT} WHERE u.id = $1`, [row.id])) });
   }));
 
   router.post("/expo/admin/users/:id", requireAdmin, asyncHandler(async (req, res) => {
@@ -851,8 +931,9 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { user: await getUserById(row.id), disabled });
   }));
 
+  // With `team`: how many accounts run each exhibitor.
   router.get("/expo/admin/exhibitors", requireAdmin, asyncHandler(async (req, res) => {
-    const rows = await q(`${EXHIBITOR_SELECT} ORDER BY sort, name LIMIT $1`, [limit(req, 2000)]);
+    const rows = await q(`${EXHIBITOR_SELECT.replace(" FROM exhibitors", ", (SELECT count(*)::int FROM users u WHERE u.exhibitor_id = exhibitors.id AND u.disabled_at IS NULL) AS team FROM exhibitors")} ORDER BY sort, name LIMIT $1`, [limit(req, 2000)]);
     ok(res, { exhibitors: rows.map((r) => shapeExhibitor(r, { admin: true })) });
   }));
 
