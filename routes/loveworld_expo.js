@@ -45,7 +45,8 @@ const KC_CLIENT_ID = env("EXPO_KC_CLIENT_ID") || "630166b6-6431-4239-8036-c40b1b
 const KC_CLIENT_SECRET = env("EXPO_KC_CLIENT_SECRET") || "";
 // The api-key of the KingsChat project the client belongs to, sent when reading a profile
 // (KingsChat asks for it on some projects; without one the profile is read with the token alone).
-const KC_API_KEY = env("EXPO_KC_API_KEY") || "";
+// KINGSCHAT_API_KEY is the name the Expo website uses for the same value.
+const KC_API_KEY = env("EXPO_KC_API_KEY", "KINGSCHAT_API_KEY") || "";
 const KC_TOKEN_URL = env("EXPO_KC_TOKEN_URL") || "https://connect.kingsch.at/developer/api/oauth2/token";
 const KC_PROFILE_URL = env("EXPO_KC_PROFILE_URL") || "https://connect.kingsch.at/developer/api/user/profile";
 const KC_LOGIN_URL = "https://accounts.kingschat.online/log-in";

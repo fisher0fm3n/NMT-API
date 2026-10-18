@@ -15,7 +15,7 @@ exhibitors yet; `--seed` loads it again). Tests: `node --test test/loveworld_exp
 | --- | --- |
 | `LOVEWORLD_EXPO_DATABASE_URL` | `postgres://user:password@host:5432/loveworld_expo`. Unset: the KingsPresenter / NMM server (`KINGSPRESENTER_DATABASE_URL`, `KP_DATABASE_URL`, `NMM_DATABASE_URL`) with the database `loveworld_expo`, else `EXPO_DB_HOST/USER/PASSWORD/PORT/NAME` (then `KP_DB_*`, `NMM_DB_*`, `PCO_FN_DB_*`) |
 | `EXPO_KC_CLIENT_ID` | The website's KingsChat client (default `630166b6-6431-4239-8036-c40b1b0f2652`); `EXPO_KC_CLIENT_SECRET` when its registration came with one |
-| `EXPO_KC_API_KEY` | The api-key of that KingsChat project, sent when reading profiles (optional: without it the profile is read with the person's token alone) |
+| `EXPO_KC_API_KEY` (or `KINGSCHAT_API_KEY`, the website's name for it) | The api-key of that KingsChat project, sent when reading profiles. Without it KingsChat may refuse the profile (`kc_profile_failed`, "Could not read your KingsChat profile"); the server log then has the status KingsChat answered with |
 | `EXPO_SITE_URL` | The website, e.g. `https://www.loveworldexpo.com` (for `/expo/config`'s redirectUri) |
 | `EXPO_API_KEY` | When set, every `/expo/*` call but `/expo/ping` must send `x-api-key` |
 | `EXPO_ADMIN_KEY` | The `x-admin-key` for `/expo/admin/*` (unset: no admin routes) |
