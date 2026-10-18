@@ -15,6 +15,7 @@ const nmmRoutes = require("./nmm");
 const pcdlAffiliateRoutes = require("./pcdl_affiliate");
 const kingsPresenterRoutes = require("./kingspresenter");
 const espeesTutorialsRoutes = require("./espees_tutorials");
+const loveworldExpoRoutes = require("./loveworld_expo");
 
 module.exports = function buildRoutes(deps) {
   const router = Router();
@@ -36,6 +37,7 @@ module.exports = function buildRoutes(deps) {
   router.use(pcdlAffiliateRoutes(deps));
   router.use(kingsPresenterRoutes(deps));
   router.use(espeesTutorialsRoutes(deps));
+  router.use(loveworldExpoRoutes(deps));
 
   return router;
 };
