@@ -8,10 +8,11 @@
 //   refresh_tokens      one per signed-in browser (hashed; used once, then replaced)
 //   exhibitors          who is on the show floor, and whether they take SmartMeet bookings
 //   bookings            SmartMeet one-on-one meetings (a person, an exhibitor, a slot)
-//   registrations       "register interest" / attend-the-Expo forms
+//   registrations       attend-the-Expo forms: the pass chosen (its day and price as quoted) and its status
 //   sponsor_enquiries   the sponsor page's enquiry form
 //   program_applications  Eagles Nest, Qubators and Content Creative applications
 //   settings            this service's own values (the token signing key when none is set)
+//   notifications       KingsChat messages sent about bookings (to the visitor and the exhibitor's team), and how each went
 //
 // Auth: POST /expo/auth/kingschat exchanges a KingsChat accessToken (or authCode) for an
 // access token (HS256 JWT, 1 h) and a refresh token. Signed-in calls send
@@ -52,6 +53,10 @@ const KC_TOKEN_URL = env("EXPO_KC_TOKEN_URL") || "https://connect.kingsch.at/dev
 const KC_PROFILE_URL = env("EXPO_KC_PROFILE_URL") || "https://connect.kingsch.at/developer/api/user/profile";
 const KC_LOGIN_URL = "https://accounts.kingschat.online/log-in";
 const SITE_URL = (env("EXPO_SITE_URL") || "").replace(/\/+$/, "");
+// KingsChat messages about SmartMeet bookings, sent as the project's own KingsChat profile
+// (scope messages_on_behalf_of_project) with KC_API_KEY. EXPO_KC_MESSAGES=off stops them.
+const KC_MESSAGES_URL = env("EXPO_KC_MESSAGES_URL") || "https://connect.kingsch.at/developer/api/messages";
+const messagesOn = () => (env("EXPO_KC_MESSAGES") || "on").toLowerCase() !== "off" && !!KC_API_KEY;
 
 const ACCESS_TTL = Number(env("EXPO_ACCESS_TTL_SECONDS") || 3600);
 const REFRESH_DAYS = Number(env("EXPO_REFRESH_DAYS") || 90);
@@ -244,6 +249,35 @@ const SCHEMA = `
   -- Who may run the website's admin area: set by another admin, or straight in the database
   -- (UPDATE users SET is_admin = true WHERE lower(kc_username) = '<username>').
   ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false;
+  -- A registration's pass as quoted when it was made (the website sets the price from its own
+  -- list), and where it stands: pending (to pay), confirmed, cancelled.
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS pass_day TEXT NOT NULL DEFAULT '';
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS pass_price NUMERIC(12,2) NOT NULL DEFAULT 0;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS pass_currency TEXT NOT NULL DEFAULT '';
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+  CREATE INDEX IF NOT EXISTS registrations_user ON registrations (user_id, created_at DESC);
+
+  -- The KingsChat user id messages are addressed to: the profile's own id (profile.id), which
+  -- kc_id (an account's key, kcID when KingsChat gives one) need not be. Filled in at sign-in.
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS kc_user_id TEXT;
+  -- Who cancelled a booking (visitor, exhibitor or admin) and the reason they gave.
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_by TEXT;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id BIGSERIAL PRIMARY KEY,
+    booking_id UUID REFERENCES bookings(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    recipient_kc_id TEXT,
+    body TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    kc_message_id TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    sent_at TIMESTAMPTZ
+  );
+  CREATE INDEX IF NOT EXISTS notifications_booking ON notifications (booking_id, created_at);
 `;
 
 let schemaReady = null;
@@ -495,9 +529,12 @@ async function fetchKcProfile(accessToken) {
   const kcIds = [...new Set([p.kcID, u.kcID, p.id, u.id, p.userID, u.userID].filter((v) => v != null && v !== "").map(String))];
   const username = pick("username");
   const phone = pick("phoneNumber", "phone_number", "phone");
+  // profile.id: the id KingsChat's messages API addresses a person by.
+  const kcUserId = p.id != null && p.id !== "" ? String(p.id) : u.id != null && u.id !== "" ? String(u.id) : null;
   return {
     kcId: kcIds[0] || null,
     kcIds,
+    kcUserId,
     username: username ? String(username).replace(/^@/, "") : null,
     name: pick("name") || [pick("firstName"), pick("lastName")].filter(Boolean).join(" ") || null,
     email: pick("emailAddress", "email"),
@@ -515,15 +552,16 @@ async function upsertKcUser(profile) {
   if (row) {
     await q(
       `UPDATE users SET kc_id = COALESCE($2, kc_id), kc_username = COALESCE($3, kc_username), kc_name = COALESCE($4, kc_name),
-              kc_avatar = COALESCE($5, kc_avatar), email = COALESCE(email, $6), phone = COALESCE(phone, $7), updated_at = now(), last_login_at = now()
+              kc_avatar = COALESCE($5, kc_avatar), email = COALESCE(email, $6), phone = COALESCE(phone, $7), kc_user_id = COALESCE($8, kc_user_id),
+              updated_at = now(), last_login_at = now()
        WHERE id = $1`,
-      [row.id, profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone],
+      [row.id, profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null],
     );
   } else {
     row = await q1(
-      `INSERT INTO users (id, kc_id, kc_username, kc_name, kc_avatar, email, phone, last_login_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, now()) RETURNING id`,
-      [crypto.randomUUID(), profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone],
+      `INSERT INTO users (id, kc_id, kc_username, kc_name, kc_avatar, email, phone, kc_user_id, last_login_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) RETURNING id`,
+      [crypto.randomUUID(), profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null],
     );
   }
   return row.id;
@@ -559,13 +597,14 @@ const shapeMember = (r) => ({ id: r.id, username: r.kc_username, name: r.kc_name
 /** The fields an exhibitor's own team may change: how the stand reads, and SmartMeet. The rest (name, stand, zone, flags, order) is the admin's. */
 const EXHIBITOR_OWN_FIELDS = ["tagline", "description", "meeting_topics", "availability", "logo", "website", "smartmeet"];
 
-const BOOKING_SELECT = `SELECT b.id, b.reference, b.user_id, b.exhibitor_id, e.name AS exhibitor_name, e.stand, b.starts_at, b.ends_at, b.name, b.email, b.organisation, b.topic, b.notes, b.location, b.status, b.created_at, b.cancelled_at
+const BOOKING_SELECT = `SELECT b.id, b.reference, b.user_id, b.exhibitor_id, e.name AS exhibitor_name, e.stand, b.starts_at, b.ends_at, b.name, b.email, b.organisation, b.topic, b.notes, b.location, b.status, b.created_at, b.cancelled_at, b.cancelled_by, b.cancel_reason
   FROM bookings b JOIN exhibitors e ON e.id = b.exhibitor_id`;
 const shapeBooking = (r) => r && ({
   id: r.id, reference: r.reference, exhibitorId: r.exhibitor_id, exhibitor: { id: r.exhibitor_id, name: r.exhibitor_name, stand: r.stand },
   start: localTime(r.starts_at), end: localTime(r.ends_at), startsAt: r.starts_at, endsAt: r.ends_at,
   name: r.name, email: r.email, organisation: r.organisation, topic: r.topic, notes: r.notes, location: r.location,
-  status: r.status, createdAt: r.created_at, cancelledAt: r.cancelled_at, ...(r.user_id ? { userId: r.user_id } : {}),
+  status: r.status, createdAt: r.created_at, cancelledAt: r.cancelled_at, cancelledBy: r.cancelled_by || null, cancelReason: r.cancel_reason || "",
+  ...(r.user_id ? { userId: r.user_id } : {}),
 });
 
 /** Exhibitor fields from a request body (admin create/update, import). */
@@ -603,6 +642,179 @@ async function upsertExhibitor(id, f) {
   if (!f.name) throw Object.assign(new Error("An exhibitor needs a name."), { statusCode: 400 });
   return q1(`INSERT INTO exhibitors (id, ${cols.join(", ")}) VALUES ($1, ${cols.map((_, i) => `$${i + 2}`).join(", ")}) ${EXHIBITOR_RETURNING}`, [id, ...vals]);
 }
+
+/* ---------------------------------------------------------------------------
+ * KingsChat messages about bookings
+ *
+ * When a meeting is booked or cancelled, the visitor and everyone on the exhibitor's team get a
+ * KingsChat message from the project's profile (POST /developer/api/messages, api-key, no
+ * sender_id: scope messages_on_behalf_of_project). People who signed in here have authorized
+ * the project, so they can be reached. Each send is kept in `notifications` with how it went;
+ * a failed send never fails the booking or the cancellation.
+ * ------------------------------------------------------------------------- */
+
+const KC_TEXT_LIMIT = 1000; // bytes: KingsChat turns a text over 1024 bytes into a file
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "Tue 10 Nov, 11:20–11:40 (GMT+1)" from the booking's times on the event's clock. */
+function whenLabel(startsAt, endsAt) {
+  const a = localTime(new Date(startsAt));
+  const b = localTime(new Date(endsAt));
+  const d = new Date(`${a.slice(0, 10)}T00:00:00Z`);
+  const off = EVENT.offset.replace(/^([+-])0?(\d+):00$/, "$1$2").replace(/^([+-]\d+):(\d+)$/, "$1$2");
+  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}, ${a.slice(11, 16)}–${b.slice(11, 16)} (GMT${off})`;
+}
+
+const site = (path) => (SITE_URL ? `${SITE_URL}${path}` : "");
+const short = (v, n) => { const t = String(v || "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
+
+/** Lines into one message, trimmed to KingsChat's inline limit (the longest optional line goes first). */
+function compose(lines) {
+  let list = lines.filter((l) => l != null && l !== false && l !== "");
+  let text = list.join("\n");
+  while (Buffer.byteLength(text, "utf8") > KC_TEXT_LIMIT) {
+    const i = list.reduce((m, l, k) => (l.length > list[m].length ? k : m), 0);
+    list[i] = short(list[i], Math.max(20, Math.floor(list[i].length * 0.7)));
+    text = list.join("\n");
+  }
+  return text;
+}
+
+/** The booking with the visitor and the exhibitor, as the messages need them. */
+async function bookingForMessages(bookingId) {
+  return q1(
+    `SELECT b.id, b.reference, b.exhibitor_id, b.starts_at, b.ends_at, b.name, b.email, b.organisation, b.topic, b.notes, b.location,
+            b.status, b.cancelled_by, b.cancel_reason, e.name AS exhibitor_name, e.stand,
+            u.id AS visitor_id, u.kc_user_id AS visitor_kc_user_id, u.kc_id AS visitor_kc_id, u.kc_username AS visitor_username, u.kc_name AS visitor_name
+       FROM bookings b JOIN exhibitors e ON e.id = b.exhibitor_id LEFT JOIN users u ON u.id = b.user_id WHERE b.id = $1`, [bookingId]);
+}
+
+/** The texts for one event: what the visitor reads, and what the exhibitor's team reads. */
+function bookingMessages(kind, b, { byName } = {}) {
+  const who = b.name || b.visitor_name || (b.visitor_username ? `@${b.visitor_username}` : "A visitor");
+  const handle = b.visitor_username ? ` (@${b.visitor_username})` : "";
+  const when = whenLabel(b.starts_at, b.ends_at);
+  const stand = b.stand ? ` · Stand ${b.stand}` : "";
+  const reason = b.cancel_reason ? `Reason: ${short(b.cancel_reason, 300)}` : "";
+  if (kind === "booked") {
+    return {
+      visitor: compose([
+        "✅ SmartMeet confirmed · LoveWorld Expo 2026",
+        "",
+        `With: ${b.exhibitor_name}${stand}`,
+        `When: ${when}`,
+        `Where: ${b.location}`,
+        `Topic: ${short(b.topic, 200)}`,
+        `Reference: ${b.reference}`,
+        "",
+        site("/my-expo") && `See or cancel your meetings: ${site("/my-expo")}`,
+      ]),
+      exhibitor: compose([
+        `📅 New SmartMeet booking · ${b.exhibitor_name}`,
+        "",
+        `Visitor: ${who}${handle}`,
+        b.organisation && `Organisation: ${short(b.organisation, 120)}`,
+        `When: ${when}`,
+        `Where: ${b.location}`,
+        `Topic: ${short(b.topic, 200)}`,
+        b.notes && `Notes: ${short(b.notes, 400)}`,
+        `Reference: ${b.reference}`,
+        "",
+        site("/exhibitor/bookings") && `All your meetings: ${site("/exhibitor/bookings")}`,
+      ]),
+    };
+  }
+  // cancelled
+  const byExhibitor = b.cancelled_by === "exhibitor";
+  const by = byExhibitor ? `${b.exhibitor_name}${byName ? ` (${byName})` : ""}` : b.cancelled_by === "admin" ? "the Expo team" : who;
+  return {
+    visitor: compose([
+      "❌ SmartMeet cancelled · LoveWorld Expo 2026",
+      "",
+      byExhibitor ? `${b.exhibitor_name} cancelled your meeting.` : b.cancelled_by === "admin" ? "The Expo team cancelled your meeting." : "You cancelled your meeting.",
+      `With: ${b.exhibitor_name}${stand}`,
+      `When: ${when}`,
+      reason,
+      `Reference: ${b.reference}`,
+      "",
+      site(`/smartmeet?exhibitor=${encodeURIComponent(b.exhibitor_id)}`) && `Book another time: ${site(`/smartmeet?exhibitor=${encodeURIComponent(b.exhibitor_id)}`)}`,
+    ]),
+    exhibitor: compose([
+      `❌ SmartMeet cancelled · ${b.exhibitor_name}`,
+      "",
+      `Cancelled by: ${by}`,
+      `Visitor: ${who}${handle}`,
+      `When: ${when}`,
+      `Topic: ${short(b.topic, 200)}`,
+      reason,
+      `Reference: ${b.reference}`,
+      "",
+      "The slot is open for booking again.",
+    ]),
+  };
+}
+
+/** One KingsChat message: { ok, messageId } or { ok: false, error }. */
+async function sendKcMessage(recipientId, text) {
+  let resp;
+  try {
+    resp = await fetch(KC_MESSAGES_URL, {
+      method: "POST",
+      headers: { "api-key": KC_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ recipient_id: recipientId, message: { body: { text: { body: text } } } }),
+      signal: AbortSignal.timeout(15000),
+    });
+  } catch (err) {
+    return { ok: false, error: `unreachable: ${err.message}` };
+  }
+  const json = await resp.json().catch(() => null);
+  if (!resp.ok || json?.status !== "ok") return { ok: false, error: `${resp.status} ${json?.error || ""} ${json?.message || ""}`.replace(/\s+/g, " ").trim() };
+  return { ok: true, messageId: json?.message?.id || null };
+}
+
+/**
+ * Tell the visitor and the exhibitor's team about a booking event ("booked" or "cancelled").
+ * Returns the notifications rows' outcomes; never throws.
+ */
+async function notifyBooking(bookingId, kind, { byName } = {}) {
+  try {
+    const b = await bookingForMessages(bookingId);
+    if (!b) return [];
+    const texts = bookingMessages(kind, b, { byName });
+    const team = await q(`SELECT id, kc_user_id, kc_id FROM users WHERE exhibitor_id = $1 AND disabled_at IS NULL`, [b.exhibitor_id]);
+    const recipients = [
+      ...(b.visitor_id ? [{ userId: b.visitor_id, kc: b.visitor_kc_user_id || b.visitor_kc_id, text: texts.visitor, kind: `${kind}:visitor` }] : []),
+      ...team.map((m) => ({ userId: m.id, kc: m.kc_user_id || m.kc_id, text: texts.exhibitor, kind: `${kind}:exhibitor` })),
+    ];
+    // One message per KingsChat account, even when the visitor is also on the team.
+    const seen = new Set();
+    const out = [];
+    for (const r of recipients) {
+      const key = r.kc || r.userId;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let result;
+      if (!messagesOn()) result = { ok: false, skipped: true, error: KC_API_KEY ? "messages turned off (EXPO_KC_MESSAGES=off)" : "no KingsChat api-key (EXPO_KC_API_KEY)" };
+      else if (!r.kc) result = { ok: false, skipped: true, error: "no KingsChat id on the account" };
+      else result = await sendKcMessage(r.kc, r.text);
+      const status = result.ok ? "sent" : result.skipped ? "skipped" : "failed";
+      if (status === "failed") console.error(`[expo] KingsChat message (${r.kind}, booking ${b.reference}) failed: ${result.error}`);
+      await q(
+        `INSERT INTO notifications (booking_id, user_id, kind, recipient_kc_id, body, status, error, kc_message_id, sent_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $6 = 'sent' THEN now() END)`,
+        [b.id, r.userId, r.kind, r.kc || null, r.text, status, result.error || null, result.messageId || null]);
+      out.push({ userId: r.userId, kind: r.kind, status, error: result.error || null });
+    }
+    return out;
+  } catch (err) {
+    console.error(`[expo] booking messages (${kind}, ${bookingId}) failed:`, err.message);
+    return [];
+  }
+}
+
+/** Send in the background: the answer to the person does not wait for KingsChat. */
+const notifyLater = (bookingId, kind, opts) => { setImmediate(() => { notifyBooking(bookingId, kind, opts); }); };
 
 /* ---------------------------------------------------------------------------
  * Routes
@@ -773,6 +985,7 @@ module.exports = function loveworldExpoRoutes() {
       if (err.code === "23505") return fail(res, 409, "slot_taken", "That slot has just been taken. Pick another time.");
       throw err;
     }
+    notifyLater(row.id, "booked");
     res.status(201);
     ok(res, { booking: shapeBooking(await q1(`${BOOKING_SELECT} WHERE b.id = $1`, [row.id])) });
   }));
@@ -784,10 +997,14 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { booking: shapeBooking(row) });
   }));
 
+  // The visitor cancels their own meeting ({ reason }, optional). Both sides get a KingsChat message.
   router.delete("/expo/smartmeet/bookings/:id", ...user, asyncHandler(async (req, res) => {
     if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such booking.");
-    const row = await q1(`UPDATE bookings SET status = 'cancelled', cancelled_at = now() WHERE id = $1 AND user_id = $2 AND status = 'confirmed' RETURNING id`, [req.params.id, req.expoUserId]);
+    const row = await q1(
+      `UPDATE bookings SET status = 'cancelled', cancelled_at = now(), cancelled_by = 'visitor', cancel_reason = NULLIF($3, '')
+        WHERE id = $1 AND user_id = $2 AND status = 'confirmed' RETURNING id`, [req.params.id, req.expoUserId, clean(req.body?.reason, 500)]);
     if (!row) return fail(res, 404, "not_found", "No such booking, or it is already cancelled.");
+    notifyLater(row.id, "cancelled");
     ok(res, { booking: shapeBooking(await q1(`${BOOKING_SELECT} WHERE b.id = $1`, [row.id])) });
   }));
 
@@ -828,8 +1045,31 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { bookings: rows.map((r) => ({ ...shapeBooking(r), username: r.username || null, avatar: r.avatar || null })) });
   }));
 
+  // Someone on the exhibitor's team cancels a meeting with it ({ reason }, optional): the slot is
+  // free again, and the visitor and the team get a KingsChat message.
+  router.delete("/expo/exhibitor/bookings/:id", ...exhibitorUser, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such booking.");
+    const row = await q1(
+      `UPDATE bookings SET status = 'cancelled', cancelled_at = now(), cancelled_by = 'exhibitor', cancel_reason = NULLIF($3, '')
+        WHERE id = $1 AND exhibitor_id = $2 AND status = 'confirmed' RETURNING id`, [req.params.id, req.expoExhibitor.id, clean(req.body?.reason, 500)]);
+    if (!row) return fail(res, 404, "not_found", "No such booking with this exhibitor, or it is already cancelled.");
+    const me = await getUserById(req.expoUserId);
+    notifyLater(row.id, "cancelled", { byName: me?.name || (me?.username ? `@${me.username}` : "") });
+    const out = await q1(`${BOOKING_SELECT.replace("FROM bookings b", ", u.kc_username AS username, u.kc_avatar AS avatar FROM bookings b LEFT JOIN users u ON u.id = b.user_id")} WHERE b.id = $1`, [row.id]);
+    ok(res, { booking: { ...shapeBooking(out), username: out.username || null, avatar: out.avatar || null } });
+  }));
+
   /* ---- forms ----------------------------------------------------------- */
 
+  /** A registration as the person and the admin see it. */
+  const shapeRegistration = (r) => ({
+    id: r.id, reference: r.reference, userId: r.user_id, firstName: r.first_name, lastName: r.last_name, email: r.email, phone: r.phone,
+    organisation: r.organisation, role: r.role, country: r.country, zone: r.zone, interests: r.interests, pass: r.pass, passDay: r.pass_day || "",
+    passPrice: Number(r.pass_price) || 0, passCurrency: r.pass_currency || "", status: r.status, createdAt: r.created_at,
+  });
+
+  // passDay: the day of a one-day pass; passPrice / passCurrency: the price the website quoted.
+  // A free pass is confirmed at once; one with a price waits as pending until the Expo team confirms it.
   router.post("/expo/registrations", ...maybeUser, asyncHandler(async (req, res) => {
     const b = req.body || {};
     const email = clean(b.email, 200);
@@ -837,11 +1077,15 @@ module.exports = function loveworldExpoRoutes() {
     const last = clean(b.lastName, 80);
     if (!email || !isEmail(email)) return fail(res, 400, "invalid_email", "Enter a valid email address.");
     if (!first || !last) return fail(res, 400, "missing_fields", "Enter your first and last name.");
+    const passDay = clean(b.passDay, 10);
+    if (passDay && !isEventDay(passDay)) return fail(res, 400, "bad_date", `Pick a day of the Expo (${EVENT.start} to ${EVENT.end}).`);
+    const price = Math.max(0, Math.round((Number(b.passPrice) || 0) * 100) / 100);
     const ref = reference("REG");
     const row = await q1(
-      `INSERT INTO registrations (id, reference, user_id, first_name, last_name, email, phone, organisation, role, country, zone, interests, pass)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING id, created_at`,
-      [crypto.randomUUID(), ref, req.expoUserId, first, last, email, clean(b.phone, 40), clean(b.organisation, 200), clean(b.role, 80), clean(b.country, 80), clean(b.zone, 120), JSON.stringify(list(b.interests)), clean(b.pass, 40)],
+      `INSERT INTO registrations (id, reference, user_id, first_name, last_name, email, phone, organisation, role, country, zone, interests, pass, pass_day, pass_price, pass_currency, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING *`,
+      [crypto.randomUUID(), ref, req.expoUserId, first, last, email, clean(b.phone, 40), clean(b.organisation, 200), clean(b.role, 80), clean(b.country, 80), clean(b.zone, 120),
+        JSON.stringify(list(b.interests)), clean(b.pass, 40), passDay, price, clean(b.passCurrency, 8).toUpperCase(), price > 0 ? "pending" : "confirmed"],
     );
     if (req.expoUserId) {
       await q(`UPDATE users SET email = COALESCE(email, $2), phone = CASE WHEN $3 <> '' THEN $3 ELSE phone END, organisation = CASE WHEN $4 <> '' THEN $4 ELSE organisation END,
@@ -849,7 +1093,13 @@ module.exports = function loveworldExpoRoutes() {
         [req.expoUserId, email, clean(b.phone, 40), clean(b.organisation, 200), clean(b.role, 80), clean(b.country, 80), clean(b.zone, 120)]);
     }
     res.status(201);
-    ok(res, { reference: ref, id: row.id, createdAt: row.created_at });
+    ok(res, { reference: ref, id: row.id, createdAt: row.created_at, registration: shapeRegistration(row) });
+  }));
+
+  // The signed-in person's registrations, newest first.
+  router.get("/expo/registrations", ...user, asyncHandler(async (req, res) => {
+    const rows = await q(`SELECT * FROM registrations WHERE user_id = $1 ORDER BY created_at DESC`, [req.expoUserId]);
+    ok(res, { registrations: rows.map(shapeRegistration) });
   }));
 
   router.post("/expo/sponsor/enquiries", ...maybeUser, asyncHandler(async (req, res) => {
@@ -1002,9 +1252,22 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { bookings: rows.map(shapeBooking) });
   }));
 
+  // ?pass= and ?status= narrow the list.
+  // The KingsChat messages sent about bookings, newest first (?booking=<id> for one booking's).
+  router.get("/expo/admin/notifications", requireAdmin, asyncHandler(async (req, res) => {
+    const booking = isUuid(req.query.booking) ? req.query.booking : null;
+    const rows = await q(
+      `SELECT n.*, b.reference, u.kc_username, u.kc_name FROM notifications n LEFT JOIN bookings b ON b.id = n.booking_id LEFT JOIN users u ON u.id = n.user_id
+        WHERE $1::uuid IS NULL OR n.booking_id = $1 ORDER BY n.created_at DESC, n.id DESC LIMIT $2`, [booking, limit(req, 2000)]);
+    ok(res, { notifications: rows.map((r) => ({ id: Number(r.id), bookingId: r.booking_id, reference: r.reference, kind: r.kind, user: r.user_id ? { id: r.user_id, username: r.kc_username, name: r.kc_name } : null,
+      recipientKcId: r.recipient_kc_id, status: r.status, error: r.error, kcMessageId: r.kc_message_id, body: r.body, createdAt: r.created_at, sentAt: r.sent_at })) });
+  }));
+
   router.get("/expo/admin/registrations", requireAdmin, asyncHandler(async (req, res) => {
-    const rows = await q(`SELECT * FROM registrations ORDER BY created_at DESC LIMIT $1`, [limit(req, 5000)]);
-    ok(res, { registrations: rows.map((r) => ({ id: r.id, reference: r.reference, userId: r.user_id, firstName: r.first_name, lastName: r.last_name, email: r.email, phone: r.phone, organisation: r.organisation, role: r.role, country: r.country, zone: r.zone, interests: r.interests, pass: r.pass, createdAt: r.created_at })) });
+    const pass = clean(req.query.pass, 40);
+    const status = clean(req.query.status, 20);
+    const rows = await q(`SELECT * FROM registrations WHERE ($1 = '' OR pass = $1) AND ($2 = '' OR status = $2) ORDER BY created_at DESC LIMIT $3`, [pass, status, limit(req, 5000)]);
+    ok(res, { registrations: rows.map(shapeRegistration) });
   }));
 
   router.get("/expo/admin/enquiries", requireAdmin, asyncHandler(async (req, res) => {
@@ -1012,19 +1275,22 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { enquiries: rows.map((r) => ({ id: r.id, reference: r.reference, userId: r.user_id, name: r.name, email: r.email, organisation: r.organisation, role: r.role, interest: r.interest, programs: r.programs, message: r.message, status: r.status, createdAt: r.created_at })) });
   }));
 
+  // ?program= and ?status= narrow the list.
   router.get("/expo/admin/applications", requireAdmin, asyncHandler(async (req, res) => {
     const program = slug(req.query.program || "");
-    const rows = await q(`SELECT * FROM program_applications WHERE $1 = '' OR program = $1 ORDER BY created_at DESC LIMIT $2`, [program, limit(req, 5000)]);
+    const status = clean(req.query.status, 20);
+    const rows = await q(`SELECT * FROM program_applications WHERE ($1 = '' OR program = $1) AND ($2 = '' OR status = $2) ORDER BY created_at DESC LIMIT $3`, [program, status, limit(req, 5000)]);
     ok(res, { applications: rows.map((r) => ({ id: r.id, reference: r.reference, userId: r.user_id, program: r.program, name: r.name, email: r.email, organisation: r.organisation, summary: r.summary, data: r.data, status: r.status, createdAt: r.created_at })) });
   }));
 
-  const STATUSES = { enquiries: ["new", "contacted", "closed"], applications: ["submitted", "shortlisted", "accepted", "declined"] };
+  const STATUSES = { enquiries: ["new", "contacted", "closed"], applications: ["submitted", "shortlisted", "accepted", "declined"], registrations: ["pending", "confirmed", "cancelled"] };
+  const STATUS_TABLES = { enquiries: "sponsor_enquiries", applications: "program_applications", registrations: "registrations" };
   router.post("/expo/admin/:kind/:id", requireAdmin, asyncHandler(async (req, res, next) => {
     if (!STATUSES[req.params.kind]) return next();
     if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such record.");
     const status = clean(req.body?.status, 20);
     if (!STATUSES[req.params.kind].includes(status)) return fail(res, 400, "bad_status", `status must be one of ${STATUSES[req.params.kind].join(", ")}.`);
-    const table = req.params.kind === "enquiries" ? "sponsor_enquiries" : "program_applications";
+    const table = STATUS_TABLES[req.params.kind];
     const row = await q1(`UPDATE ${table} SET status = $2 WHERE id = $1 RETURNING id, status`, [req.params.id, status]);
     if (!row) return fail(res, 404, "not_found", "No such record.");
     ok(res, row);
@@ -1034,6 +1300,7 @@ module.exports = function loveworldExpoRoutes() {
 };
 
 module.exports.ensureSchema = ensureSchema;
+module.exports.notifyBooking = notifyBooking;
 module.exports.pool = pool;
 module.exports.upsertExhibitor = upsertExhibitor;
 module.exports.exhibitorFields = exhibitorFields;

@@ -9,7 +9,10 @@ const { Client } = require("pg");
 const DB_URL = process.env.EXPO_TEST_DATABASE_URL || "postgres://localhost/loveworld_expo_test";
 if (!["localhost", "127.0.0.1", "::1", ""].includes(new URL(DB_URL).hostname)) throw new Error("EXPO_TEST_DATABASE_URL must be a database on this computer");
 
-// KingsChat, as far as sign-in goes: a code becomes a token, a token a profile.
+// KingsChat, as far as sign-in goes: a code becomes a token, a token a profile. And its messages
+// API: what is sent is kept in kcMessages; kcRefuse makes it refuse as KingsChat does.
+const kcMessages = [];
+let kcRefuse = false;
 const kingschat = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => { body += c; });
@@ -26,9 +29,21 @@ const kingschat = http.createServer((req, res) => {
       if (auth === "Bearer kc-second-code") return res.end(JSON.stringify({ profile: { id: "kc-456", name: "Grace Okafor", username: "grace_o", user: { kcID: "kc-777", profilePicture: "https://kc/grace.jpg", emailAddress: "grace@church.org" } } }));
       return res.end(JSON.stringify({ profile: { id: "kc-123", name: "Ade Bello", username: "pastor_ade", email: "ade@church.org", phone_number: "+2348000000000", avatar: "https://kc/ade.jpg" } }));
     }
+    if (req.url === "/messages" && req.method === "POST") {
+      const msg = JSON.parse(body);
+      kcMessages.push({ apiKey: req.headers["api-key"], ...msg });
+      if (kcRefuse) { res.statusCode = 403; return res.end(JSON.stringify({ error: "recipient_not_authorized", message: "The recipient has not authorized your project." })); }
+      return res.end(JSON.stringify({ status: "ok", conversation: { identifier: `conv-${msg.recipient_id}` }, message: { id: `msg-${kcMessages.length}`, sent_at_millis: Date.now() } }));
+    }
     res.statusCode = 404; res.end("{}");
   });
 });
+
+/** Waits until the stand-in KingsChat has been sent `n` messages in all (they go in the background). */
+async function messagesSoFar(n) {
+  for (let i = 0; i < 100 && kcMessages.length < n; i++) await new Promise((r) => setTimeout(r, 30));
+  return kcMessages;
+}
 
 let base, server, routes;
 const api = async (method, path, { body, token, headers = {} } = {}) => {
@@ -45,6 +60,7 @@ test.before(async () => {
   Object.assign(process.env, {
     EXPO_SKIP_ENV_FILE: "1", LOVEWORLD_EXPO_DATABASE_URL: DB_URL, EXPO_KC_CLIENT_ID: "test-client", EXPO_KC_TOKEN_URL: `${kc}/token`, EXPO_KC_PROFILE_URL: `${kc}/profile`,
     EXPO_API_KEY: "app-key", EXPO_ADMIN_KEY: "admin-key", EXPO_SITE_URL: "http://localhost:3000", EXPO_MAX_BOOKINGS_PER_DAY: "2",
+    EXPO_KC_API_KEY: "kc-project-key", EXPO_KC_MESSAGES_URL: `${kc}/messages`,
   });
   delete process.env.EXPO_TOKEN_SECRET;
   routes = require("../routes/loveworld_expo");
@@ -333,4 +349,122 @@ test("admins: the flag on the account, granted by an admin, never taken from the
   assert.equal(off.json.disabled, true);
   assert.equal(off.json.admin, true);
   assert.equal((await api("POST", `/expo/admin/users/${other.json.user.id}`, { headers: admin, body: { disabled: false } })).json.disabled, false);
+});
+
+test("registrations: the pass as quoted, pending until confirmed, the person's own list", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const badDay = await api("POST", "/expo/registrations", { token, body: { firstName: "Ade", lastName: "Bello", email: "ade@church.org", pass: "day", passDay: "2026-12-01", passPrice: 5000, passCurrency: "ngn" } });
+  assert.equal(badDay.status, 400);
+  assert.equal(badDay.json.error, "bad_date");
+  const paid = await api("POST", "/expo/registrations", { token, body: { firstName: "Ade", lastName: "Bello", email: "ade@church.org", pass: "day", passDay: "2026-11-10", passPrice: 5000, passCurrency: "ngn" } });
+  assert.equal(paid.status, 201, JSON.stringify(paid.json));
+  assert.equal(paid.json.registration.status, "pending");
+  assert.equal(paid.json.registration.passPrice, 5000);
+  assert.equal(paid.json.registration.passCurrency, "NGN");
+  assert.equal(paid.json.registration.passDay, "2026-11-10");
+  const free = await api("POST", "/expo/registrations", { body: { firstName: "Ngozi", lastName: "Eze", email: "ngozi@example.com", pass: "delegate", passPrice: 0 } });
+  assert.equal(free.json.registration.status, "confirmed");
+  assert.equal((await api("GET", "/expo/registrations")).status, 401);
+  const mine = await api("GET", "/expo/registrations", { token });
+  assert.equal(mine.json.registrations[0].reference, paid.json.reference);
+  assert.ok(mine.json.registrations.every((r) => r.userId === user.id));
+  const pending = await api("GET", "/expo/admin/registrations?status=pending&pass=day", { headers: admin });
+  assert.deepEqual(pending.json.registrations.map((r) => r.reference), [paid.json.reference]);
+  const confirmed = await api("POST", `/expo/admin/registrations/${paid.json.id}`, { headers: admin, body: { status: "confirmed" } });
+  assert.equal(confirmed.json.status, "confirmed");
+  assert.equal((await api("POST", `/expo/admin/registrations/${paid.json.id}`, { headers: admin, body: { status: "paid" } })).status, 400);
+  const apps = await api("GET", "/expo/admin/applications?program=eagles-nest&status=shortlisted", { headers: admin });
+  assert.equal(apps.json.applications.length, 1);
+});
+
+test("KingsChat messages: both sides hear about a booking, and about a cancellation by either side", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const ade = (await api("POST", "/expo/auth/kingschat", { body: { code: "good-code" } })).json;
+  const grace = (await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } })).json;
+  // Grace runs LoveWorld TV. Her KingsChat profile.id (kc-456) is what messages go to, not her kcID (kc-777).
+  assert.equal((await api("POST", `/expo/admin/users/${grace.user.id}/exhibitor`, { headers: admin, body: { exhibitorId: "loveworld-tv" } })).status, 200);
+  await messagesSoFar(0);
+  const start = kcMessages.length;
+  const sent = () => kcMessages.slice(start);
+  const to = (id) => sent().filter((m) => m.recipient_id === id);
+
+  // Booked: a confirmation to the visitor, the details to the team.
+  const booked = await api("POST", "/expo/smartmeet/bookings", { token: ade.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-12T10:00", topic: "Syndication", notes: "Two shows a week" } });
+  assert.equal(booked.status, 201, JSON.stringify(booked.json));
+  const ref = booked.json.booking.reference;
+  await messagesSoFar(start + 2);
+  assert.equal(sent().length, 2);
+  for (const m of sent()) {
+    assert.equal(m.apiKey, "kc-project-key");
+    assert.equal(m.sender_id, undefined, "sent as the project, so no sender_id");
+    assert.ok(Buffer.byteLength(m.message.body.text.body) <= 1024);
+  }
+  const confirm = to("kc-123")[0].message.body.text.body;
+  assert.match(confirm, /SmartMeet confirmed/);
+  assert.match(confirm, /With: LoveWorld TV · Stand M01/);
+  assert.match(confirm, /When: Thu 12 Nov, 10:00–10:20 \(GMT\+1\)/);
+  assert.match(confirm, /Where: SmartMeet Lounge · Table \d+/);
+  assert.ok(confirm.includes(`Reference: ${ref}`));
+  assert.ok(confirm.includes("http://localhost:3000/my-expo"));
+  assert.equal(to("kc-777").length, 0);
+  const news = to("kc-456")[0].message.body.text.body;
+  assert.match(news, /New SmartMeet booking · LoveWorld TV/);
+  assert.match(news, /Visitor: Ade Bello \(@pastor_ade\)/);
+  assert.match(news, /Topic: Syndication/);
+  assert.match(news, /Notes: Two shows a week/);
+
+  // The visitor cancels, with a reason: both are told.
+  const n1 = kcMessages.length;
+  const cancelled = await api("DELETE", `/expo/smartmeet/bookings/${booked.json.booking.id}`, { token: ade.accessToken, body: { reason: "Flight moved" } });
+  assert.equal(cancelled.json.booking.cancelledBy, "visitor");
+  assert.equal(cancelled.json.booking.cancelReason, "Flight moved");
+  await messagesSoFar(n1 + 2);
+  const [c1, c2] = [kcMessages.slice(n1).find((m) => m.recipient_id === "kc-123"), kcMessages.slice(n1).find((m) => m.recipient_id === "kc-456")];
+  assert.match(c1.message.body.text.body, /You cancelled your meeting\./);
+  assert.match(c1.message.body.text.body, /Reason: Flight moved/);
+  assert.match(c2.message.body.text.body, /Cancelled by: Ade Bello/);
+  assert.match(c2.message.body.text.body, /The slot is open for booking again\./);
+
+  // The exhibitor cancels: only someone on its team may, and both are told.
+  const again = await api("POST", "/expo/smartmeet/bookings", { token: ade.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-12T10:20", topic: "Syndication" } });
+  assert.equal(again.status, 201);
+  await messagesSoFar(kcMessages.length + 2);
+  const notTeam = await api("DELETE", `/expo/exhibitor/bookings/${again.json.booking.id}`, { token: ade.accessToken });
+  assert.equal(notTeam.status, 403);
+  const n2 = kcMessages.length;
+  const byTeam = await api("DELETE", `/expo/exhibitor/bookings/${again.json.booking.id}`, { token: grace.accessToken, body: { reason: "Our studio lead is ill" } });
+  assert.equal(byTeam.status, 200, JSON.stringify(byTeam.json));
+  assert.equal(byTeam.json.booking.status, "cancelled");
+  assert.equal(byTeam.json.booking.cancelledBy, "exhibitor");
+  assert.equal(byTeam.json.booking.username, "pastor_ade");
+  await messagesSoFar(n2 + 2);
+  const v = kcMessages.slice(n2).find((m) => m.recipient_id === "kc-123").message.body.text.body;
+  const t = kcMessages.slice(n2).find((m) => m.recipient_id === "kc-456").message.body.text.body;
+  assert.match(v, /LoveWorld TV cancelled your meeting\./);
+  assert.match(v, /Reason: Our studio lead is ill/);
+  assert.ok(v.includes("http://localhost:3000/smartmeet?exhibitor=loveworld-tv"));
+  assert.match(t, /Cancelled by: LoveWorld TV \(Grace Okafor\)/);
+  assert.equal((await api("DELETE", `/expo/exhibitor/bookings/${again.json.booking.id}`, { token: grace.accessToken })).status, 404);
+  const free = await api("GET", "/expo/smartmeet/availability?exhibitor=loveworld-tv&date=2026-11-12");
+  assert.equal(free.json.slots.find((s) => s.start === "2026-11-12T10:20:00").available, true);
+
+  // KingsChat refusing does not undo the booking; the refusal is kept for the admin.
+  kcRefuse = true;
+  const long = "x".repeat(1900);
+  const refused = await api("POST", "/expo/smartmeet/bookings", { token: ade.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-13T10:00", topic: "Syndication", notes: long } });
+  assert.equal(refused.status, 201);
+  await messagesSoFar(kcMessages.length + 2);
+  kcRefuse = false;
+  assert.ok(kcMessages.slice(-2).every((m) => Buffer.byteLength(m.message.body.text.body) <= 1024), "long notes are cut to KingsChat's inline limit");
+  let log;
+  for (let i = 0; i < 50; i++) {
+    log = await api("GET", `/expo/admin/notifications?booking=${refused.json.booking.id}`, { headers: admin });
+    if (log.json.notifications.length === 2) break;
+    await new Promise((r) => setTimeout(r, 30));
+  }
+  assert.deepEqual(log.json.notifications.map((n) => n.status), ["failed", "failed"]);
+  assert.match(log.json.notifications[0].error, /recipient_not_authorized/);
+  const first = await api("GET", `/expo/admin/notifications?booking=${booked.json.booking.id}`, { headers: admin });
+  assert.deepEqual(first.json.notifications.map((n) => n.status).sort(), ["sent", "sent", "sent", "sent"]);
+  assert.ok(first.json.notifications.every((n) => n.kcMessageId));
 });

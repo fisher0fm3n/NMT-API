@@ -16,7 +16,9 @@ exhibitors yet; `--seed` loads it again). Tests: `node --test test/loveworld_exp
 | `LOVEWORLD_EXPO_DATABASE_URL` | `postgres://user:password@host:5432/loveworld_expo`. Unset: the KingsPresenter / NMM server (`KINGSPRESENTER_DATABASE_URL`, `KP_DATABASE_URL`, `NMM_DATABASE_URL`) with the database `loveworld_expo`, else `EXPO_DB_HOST/USER/PASSWORD/PORT/NAME` (then `KP_DB_*`, `NMM_DB_*`, `PCO_FN_DB_*`) |
 | `EXPO_KC_CLIENT_ID` | The website's KingsChat client (default `630166b6-6431-4239-8036-c40b1b0f2652`); `EXPO_KC_CLIENT_SECRET` when its registration came with one |
 | `EXPO_KC_API_KEY` (or `KINGSCHAT_API_KEY`, the website's name for it) | The api-key of that KingsChat project, sent when reading profiles. Without it KingsChat may refuse the profile (`kc_profile_failed`, "Could not read your KingsChat profile"); the server log then has the status KingsChat answered with |
-| `EXPO_SITE_URL` | The website, e.g. `https://www.loveworldexpo.com` (for `/expo/config`'s redirectUri) |
+| `EXPO_SITE_URL` | The website, e.g. `https://www.loveworldexpo.com` (for `/expo/config`'s redirectUri, and the links in KingsChat messages) |
+| `EXPO_KC_MESSAGES` (on) | `off` stops the KingsChat messages about bookings (below). They also need `EXPO_KC_API_KEY` |
+| `EXPO_KC_MESSAGES_URL` | KingsChat's messages API (default `https://connect.kingsch.at/developer/api/messages`); tests point it at a stand-in |
 | `EXPO_API_KEY` | When set, every `/expo/*` call but `/expo/ping` must send `x-api-key` |
 | `EXPO_ADMIN_KEY` | The `x-admin-key` for `/expo/admin/*` (unset: no admin routes) |
 | `EXPO_TOKEN_SECRET` | Access-token signing key (unset: one is made once and kept in `settings`) |
@@ -82,8 +84,9 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /expo/smartmeet/bookings` | The signed-in person's bookings, soonest first (cancelled ones too, with `status`) |
 | `POST /expo/smartmeet/bookings { exhibitorId, start: "2026-11-10T10:00", topic, notes?, name?, email?, organisation? }` | 201 `{ booking: { id, reference "SM-…", exhibitor: { id, name, stand }, start, end, startsAt, endsAt, name, email, organisation, topic, notes, location "SmartMeet Lounge · Table n", status, createdAt } }`; name/email/organisation default to the account's |
 | `GET /expo/smartmeet/bookings/:id` | One booking of theirs |
-| `DELETE /expo/smartmeet/bookings/:id` | Cancels it (`status: "cancelled"`); the slot is free again |
-| `POST /expo/registrations { firstName, lastName, email, phone?, organisation?, role?, country?, zone?, interests?: [], pass? }` | 201 `{ reference "REG-…", id, createdAt }`; signed in or not (signed in: the profile fields are kept on the account) |
+| `DELETE /expo/smartmeet/bookings/:id { reason? }` | Cancels it (`status: "cancelled"`, `cancelledBy: "visitor"`, `cancelReason`); the slot is free again, and both sides get a KingsChat message |
+| `POST /expo/registrations { firstName, lastName, email, phone?, organisation?, role?, country?, zone?, interests?: [], pass?, passDay?, passPrice?, passCurrency? }` | 201 `{ reference "REG-…", id, createdAt, registration }`; signed in or not (signed in: the profile fields are kept on the account). `passDay` is the day of a one-day pass (an Expo day, else `bad_date`); `passPrice` / `passCurrency` are the price the website quoted from its own list. A free pass is `status: "confirmed"` at once, one with a price `"pending"` until the Expo team confirms it |
+| `GET /expo/registrations` | The signed-in person's registrations, newest first: `{ registrations: [{ id, reference, firstName, lastName, email, …, pass, passDay, passPrice, passCurrency, status, createdAt }] }` |
 | `POST /expo/sponsor/enquiries { name, email, organisation, role?, interest?, programs?, message? }` | 201 `{ reference "SP-…", id, createdAt }` |
 | `POST /expo/programs/applications { program: eagles-nest\|qubators\|content-creative, name, email, organisation?, summary?, data?: {} }` | 201 `{ reference "EN-…" / "QB-…" / "CC-…", id, createdAt }` |
 | `GET /expo/programs/applications` | The signed-in person's applications |
@@ -95,6 +98,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /expo/exhibitor` | `{ exhibitor (with availability, sort, active), counts: { bookings, cancelled }, days: [{ date, bookings, slots }], team: [{ id, username, name, avatar, email }] }`: the overview; `slots` is how many a day still has before bookings |
 | `PATCH /expo/exhibitor { tagline?, description?, meetingTopics?, logo?, website?, smartMeet?, availability? }` | `{ exhibitor }`: how the stand reads and its SmartMeet settings. The name, stand, zone, category, featured, active and sort are the admin's and are ignored here |
 | `GET /expo/exhibitor/bookings?date=` | Every meeting booked with the exhibitor, soonest first, each with the booker's `username` and `avatar` besides the booking's name, email and organisation; `date` keeps one day |
+| `DELETE /expo/exhibitor/bookings/:id { reason? }` | Someone on the team cancels a meeting with the exhibitor (`cancelledBy: "exhibitor"`); the slot is free again, and both sides get a KingsChat message. 404 when it is not this exhibitor's or is already cancelled |
 
 ### Admin (`x-admin-key`)
 
@@ -110,10 +114,32 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `PUT /expo/admin/exhibitors/:id { …fields }` | Changes the fields given |
 | `DELETE /expo/admin/exhibitors/:id` | Removes it (and its bookings) |
 | `GET /expo/admin/bookings?exhibitor=&date=&limit=` | Every booking |
-| `GET /expo/admin/registrations`, `/expo/admin/enquiries`, `/expo/admin/applications?program=` | The forms, newest first |
-| `POST /expo/admin/enquiries/:id { status: new\|contacted\|closed }`, `POST /expo/admin/applications/:id { status: submitted\|shortlisted\|accepted\|declined }` | Moves one along |
+| `GET /expo/admin/notifications?booking=&limit=` | The KingsChat messages sent about bookings, newest first: `{ id, bookingId, reference, kind, user, recipientKcId, status: sent\|failed\|skipped, error, kcMessageId, body, createdAt, sentAt }` |
+| `GET /expo/admin/registrations?pass=&status=`, `/expo/admin/enquiries`, `/expo/admin/applications?program=&status=` | The forms, newest first |
+| `POST /expo/admin/registrations/:id { status: pending\|confirmed\|cancelled }`, `POST /expo/admin/enquiries/:id { status: new\|contacted\|closed }`, `POST /expo/admin/applications/:id { status: submitted\|shortlisted\|accepted\|declined }` | Moves one along |
 
 `availability` on an exhibitor (all optional): `{ "dayStart": 10, "dayEnd": 17, "slotMinutes": 20, "closedDates": ["2026-11-09"], "blocked": ["2026-11-10T11:00:00"] }`.
+
+## KingsChat messages about bookings
+
+When a SmartMeet meeting is booked, and when it is cancelled by the visitor or by the exhibitor's
+team, the visitor and everyone on the exhibitor's team (accounts with `exhibitor_id` set) get a
+KingsChat message with the details: who, when (on the event's clock), where, the topic, the
+reference, the reason when one was given, and a link back to the website.
+
+They follow KingsChat's *Send a Message* API: `POST https://connect.kingsch.at/developer/api/messages`
+with the project's `api-key` (`EXPO_KC_API_KEY`) and no `sender_id`, so they come from the
+project's own KingsChat profile. That needs the **messages_on_behalf_of_project** scope enabled
+for the project in the KingsChat developer console; without it every send fails with
+`project_cannot_send_messages`. People who signed in to the website have authorized the project,
+so they can be reached; a send to anyone else fails with `recipient_not_authorized`.
+
+Messages go to the person's KingsChat `profile.id` (`users.kc_user_id`, saved at sign-in; accounts
+that have not signed in since this was added fall back to `kc_id`). Each text is kept under the
+1024 bytes KingsChat shows inline (long notes are shortened). Sending happens after the answer
+to the booking or cancellation, so KingsChat being slow or refusing never fails either; every send
+is recorded in `notifications` with its status and KingsChat's error, at
+`GET /expo/admin/notifications`.
 
 ## Who runs the admin area
 
