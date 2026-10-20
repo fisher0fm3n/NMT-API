@@ -759,9 +759,10 @@ function bookingMessages(kind, b, { byName } = {}) {
 
 /** One KingsChat message: { ok, messageId } or { ok: false, error }. `label` names it in the log. */
 async function sendKcMessage(recipientId, text, label = "") {
+  // Sent as the project's own KingsChat profile: no sender_id (scope messages_on_behalf_of_project).
   const payload = { recipient_id: recipientId, message: { body: { text: { body: text } } } };
   const tag = `[expo] KingsChat message${label ? ` ${label}` : ""}`;
-  console.log(`${tag} → POST ${KC_MESSAGES_URL} recipient_id=${recipientId} (${Buffer.byteLength(text, "utf8")} bytes, api-key …${KC_API_KEY.slice(-4)})`);
+  console.log(`${tag} → POST ${KC_MESSAGES_URL} (as the project) recipient_id=${recipientId} (${Buffer.byteLength(text, "utf8")} bytes, api-key …${KC_API_KEY.slice(-4)})`);
   if (kcDebug()) console.log(`${tag} request body: ${JSON.stringify(payload)}`);
   let resp;
   try {
@@ -779,7 +780,9 @@ async function sendKcMessage(recipientId, text, label = "") {
   console.log(`${tag} ← ${resp.status} ${resp.statusText} ${raw.slice(0, 1000)}`);
   let json = null;
   try { json = JSON.parse(raw); } catch { /* not JSON: the gateway's HTML, say */ }
-  if (!resp.ok || json?.status !== "ok") return { ok: false, error: `${resp.status} ${json?.error || ""} ${json?.message || (json ? "" : raw.slice(0, 200))}`.replace(/\s+/g, " ").trim() };
+  if (!resp.ok || json?.status !== "ok") {
+    return { ok: false, code: json?.error || "", error: `${resp.status} ${json?.error || ""} ${json?.message || (json ? "" : raw.slice(0, 200))}`.replace(/\s+/g, " ").trim() };
+  }
   return { ok: true, messageId: json?.message?.id || null };
 }
 
@@ -808,7 +811,11 @@ async function notifyBooking(bookingId, kind, { byName } = {}) {
       let result;
       if (!messagesOn()) result = { ok: false, skipped: true, error: KC_API_KEY ? "messages turned off (EXPO_KC_MESSAGES=off)" : "no KingsChat api-key (EXPO_KC_API_KEY)" };
       else if (!r.kc) result = { ok: false, skipped: true, error: "no KingsChat id on the account" };
-      else result = await sendKcMessage(r.kc, r.text, `(${r.kind}, ${b.reference})`);
+      else {
+        result = await sendKcMessage(r.kc, r.text, `(${r.kind}, ${b.reference})`);
+        // The recipient is the project's own KingsChat profile: not an outage, just no one to tell.
+        if (result.code === "cannot_send_to_self") result = { ok: false, skipped: true, error: "the recipient is the project's own KingsChat profile itself (cannot_send_to_self)" };
+      }
       const status = result.ok ? "sent" : result.skipped ? "skipped" : "failed";
       if (status === "skipped") console.log(`[expo] KingsChat message (${r.kind}, ${b.reference}) not sent: ${result.error}`);
       if (status === "failed") console.error(`[expo] KingsChat message (${r.kind}, ${b.reference}) failed: ${result.error}`);

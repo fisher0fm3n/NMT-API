@@ -13,6 +13,8 @@ if (!["localhost", "127.0.0.1", "::1", ""].includes(new URL(DB_URL).hostname)) t
 // API: what is sent is kept in kcMessages; kcRefuse makes it refuse as KingsChat does.
 const kcMessages = [];
 let kcRefuse = false;
+// The project's own KingsChat profile: messages sent as the project cannot go to it.
+let kcProjectProfile = null;
 const kingschat = http.createServer((req, res) => {
   let body = "";
   req.on("data", (c) => { body += c; });
@@ -33,6 +35,7 @@ const kingschat = http.createServer((req, res) => {
       const msg = JSON.parse(body);
       kcMessages.push({ apiKey: req.headers["api-key"], ...msg });
       if (kcRefuse) { res.statusCode = 403; return res.end(JSON.stringify({ error: "recipient_not_authorized", message: "The recipient has not authorized your project." })); }
+      if (kcProjectProfile === msg.recipient_id) { res.statusCode = 400; return res.end(JSON.stringify({ error: "cannot_send_to_self", message: "recipient_id is the sender itself." })); }
       return res.end(JSON.stringify({ status: "ok", conversation: { identifier: `conv-${msg.recipient_id}` }, message: { id: `msg-${kcMessages.length}`, sent_at_millis: Date.now() } }));
     }
     res.statusCode = 404; res.end("{}");
@@ -467,4 +470,31 @@ test("KingsChat messages: both sides hear about a booking, and about a cancellat
   const first = await api("GET", `/expo/admin/notifications?booking=${booked.json.booking.id}`, { headers: admin });
   assert.deepEqual(first.json.notifications.map((n) => n.status).sort(), ["sent", "sent", "sent", "sent"]);
   assert.ok(first.json.notifications.every((n) => n.kcMessageId));
+});
+
+test("KingsChat messages: sent as the project; a message to the project's own profile is skipped", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const ade = (await api("POST", "/expo/auth/kingschat", { body: { code: "good-code" } })).json;
+  const statuses = async (bookingId, n) => {
+    for (let i = 0; i < 100; i++) {
+      const log = await api("GET", `/expo/admin/notifications?booking=${bookingId}`, { headers: admin });
+      if (log.json.notifications.length >= n) return log.json.notifications;
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    throw new Error("the messages were not recorded");
+  };
+
+  // As the project, when the visitor is the project's own profile: skipped, not failed.
+  kcProjectProfile = "kc-123";
+  const own = await api("POST", "/expo/smartmeet/bookings", { token: ade.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-14T10:00", topic: "Syndication" } });
+  assert.equal(own.status, 201);
+  const ownLog = await statuses(own.json.booking.id, 2);
+  kcProjectProfile = null;
+  const toAde = ownLog.find((n) => n.recipientKcId === "kc-123");
+  assert.equal(toAde.status, "skipped");
+  assert.match(toAde.error, /project's own KingsChat profile/);
+  assert.equal(ownLog.find((n) => n.recipientKcId === "kc-456").status, "sent");
+
+  // Every message goes out as the project: never with a sender_id.
+  assert.ok(kcMessages.every((m) => m.sender_id === undefined));
 });

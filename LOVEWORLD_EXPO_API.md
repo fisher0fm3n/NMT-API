@@ -19,6 +19,7 @@ exhibitors yet; `--seed` loads it again). Tests: `node --test test/loveworld_exp
 | `EXPO_SITE_URL` | The website, e.g. `https://www.loveworldexpo.com` (for `/expo/config`'s redirectUri, and the links in KingsChat messages) |
 | `EXPO_KC_MESSAGES` (on) | `off` stops the KingsChat messages about bookings (below). They also need `EXPO_KC_API_KEY` |
 | `EXPO_KC_MESSAGES_URL` | KingsChat's messages API (default `https://connect.kingsch.at/developer/api/messages`); tests point it at a stand-in |
+| `EXPO_KC_DEBUG` | `1` also logs each message's request body; every send's KingsChat answer is always logged (`[expo] KingsChat message …`) |
 | `EXPO_API_KEY` | When set, every `/expo/*` call but `/expo/ping` must send `x-api-key` |
 | `EXPO_ADMIN_KEY` | The `x-admin-key` for `/expo/admin/*` (unset: no admin routes) |
 | `EXPO_TOKEN_SECRET` | Access-token signing key (unset: one is made once and kept in `settings`) |
@@ -129,10 +130,12 @@ reference, the reason when one was given, and a link back to the website.
 
 They follow KingsChat's *Send a Message* API: `POST https://connect.kingsch.at/developer/api/messages`
 with the project's `api-key` (`EXPO_KC_API_KEY`) and no `sender_id`, so they come from the
-project's own KingsChat profile. That needs the **messages_on_behalf_of_project** scope enabled
-for the project in the KingsChat developer console; without it every send fails with
-`project_cannot_send_messages`. People who signed in to the website have authorized the project,
-so they can be reached; a send to anyone else fails with `recipient_not_authorized`.
+KingsChat account the project was created with. That needs the **messages_on_behalf_of_project**
+scope enabled for that project in the KingsChat developer console; without it every send fails
+with `project_cannot_send_messages`. A message to the project's own account cannot be delivered
+(`cannot_send_to_self`) and is recorded as `skipped`, so test with a second KingsChat account as
+the visitor. People who signed in to the website have authorized the
+project, so they can be reached; a send to anyone else fails with `recipient_not_authorized`.
 
 Messages go to the person's KingsChat `profile.id` (`users.kc_user_id`, saved at sign-in; accounts
 that have not signed in since this was added fall back to `kc_id`). Each text is kept under the
