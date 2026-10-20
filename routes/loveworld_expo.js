@@ -57,6 +57,8 @@ const SITE_URL = (env("EXPO_SITE_URL") || "").replace(/\/+$/, "");
 // (scope messages_on_behalf_of_project) with KC_API_KEY. EXPO_KC_MESSAGES=off stops them.
 const KC_MESSAGES_URL = env("EXPO_KC_MESSAGES_URL") || "https://connect.kingsch.at/developer/api/messages";
 const messagesOn = () => (env("EXPO_KC_MESSAGES") || "on").toLowerCase() !== "off" && !!KC_API_KEY;
+// Every send is logged with KingsChat's answer; EXPO_KC_DEBUG=1 also logs the request body.
+const kcDebug = () => ["1", "true", "on"].includes(String(env("EXPO_KC_DEBUG") || "").toLowerCase());
 
 const ACCESS_TTL = Number(env("EXPO_ACCESS_TTL_SECONDS") || 3600);
 const REFRESH_DAYS = Number(env("EXPO_REFRESH_DAYS") || 90);
@@ -755,21 +757,29 @@ function bookingMessages(kind, b, { byName } = {}) {
   };
 }
 
-/** One KingsChat message: { ok, messageId } or { ok: false, error }. */
-async function sendKcMessage(recipientId, text) {
+/** One KingsChat message: { ok, messageId } or { ok: false, error }. `label` names it in the log. */
+async function sendKcMessage(recipientId, text, label = "") {
+  const payload = { recipient_id: recipientId, message: { body: { text: { body: text } } } };
+  const tag = `[expo] KingsChat message${label ? ` ${label}` : ""}`;
+  console.log(`${tag} → POST ${KC_MESSAGES_URL} recipient_id=${recipientId} (${Buffer.byteLength(text, "utf8")} bytes, api-key …${KC_API_KEY.slice(-4)})`);
+  if (kcDebug()) console.log(`${tag} request body: ${JSON.stringify(payload)}`);
   let resp;
   try {
     resp = await fetch(KC_MESSAGES_URL, {
       method: "POST",
       headers: { "api-key": KC_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify({ recipient_id: recipientId, message: { body: { text: { body: text } } } }),
+      body: JSON.stringify(payload),
       signal: AbortSignal.timeout(15000),
     });
   } catch (err) {
+    console.log(`${tag} ← no answer: ${err.message}`);
     return { ok: false, error: `unreachable: ${err.message}` };
   }
-  const json = await resp.json().catch(() => null);
-  if (!resp.ok || json?.status !== "ok") return { ok: false, error: `${resp.status} ${json?.error || ""} ${json?.message || ""}`.replace(/\s+/g, " ").trim() };
+  const raw = await resp.text().catch(() => "");
+  console.log(`${tag} ← ${resp.status} ${resp.statusText} ${raw.slice(0, 1000)}`);
+  let json = null;
+  try { json = JSON.parse(raw); } catch { /* not JSON: the gateway's HTML, say */ }
+  if (!resp.ok || json?.status !== "ok") return { ok: false, error: `${resp.status} ${json?.error || ""} ${json?.message || (json ? "" : raw.slice(0, 200))}`.replace(/\s+/g, " ").trim() };
   return { ok: true, messageId: json?.message?.id || null };
 }
 
@@ -783,6 +793,7 @@ async function notifyBooking(bookingId, kind, { byName } = {}) {
     if (!b) return [];
     const texts = bookingMessages(kind, b, { byName });
     const team = await q(`SELECT id, kc_user_id, kc_id FROM users WHERE exhibitor_id = $1 AND disabled_at IS NULL`, [b.exhibitor_id]);
+    if (!team.length) console.log(`[expo] KingsChat messages (${kind}, ${b.reference}): nobody is on ${b.exhibitor_name}'s team, so only the visitor is told`);
     const recipients = [
       ...(b.visitor_id ? [{ userId: b.visitor_id, kc: b.visitor_kc_user_id || b.visitor_kc_id, text: texts.visitor, kind: `${kind}:visitor` }] : []),
       ...team.map((m) => ({ userId: m.id, kc: m.kc_user_id || m.kc_id, text: texts.exhibitor, kind: `${kind}:exhibitor` })),
@@ -797,9 +808,10 @@ async function notifyBooking(bookingId, kind, { byName } = {}) {
       let result;
       if (!messagesOn()) result = { ok: false, skipped: true, error: KC_API_KEY ? "messages turned off (EXPO_KC_MESSAGES=off)" : "no KingsChat api-key (EXPO_KC_API_KEY)" };
       else if (!r.kc) result = { ok: false, skipped: true, error: "no KingsChat id on the account" };
-      else result = await sendKcMessage(r.kc, r.text);
+      else result = await sendKcMessage(r.kc, r.text, `(${r.kind}, ${b.reference})`);
       const status = result.ok ? "sent" : result.skipped ? "skipped" : "failed";
-      if (status === "failed") console.error(`[expo] KingsChat message (${r.kind}, booking ${b.reference}) failed: ${result.error}`);
+      if (status === "skipped") console.log(`[expo] KingsChat message (${r.kind}, ${b.reference}) not sent: ${result.error}`);
+      if (status === "failed") console.error(`[expo] KingsChat message (${r.kind}, ${b.reference}) failed: ${result.error}`);
       await q(
         `INSERT INTO notifications (booking_id, user_id, kind, recipient_kc_id, body, status, error, kc_message_id, sent_at)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $6 = 'sent' THEN now() END)`,

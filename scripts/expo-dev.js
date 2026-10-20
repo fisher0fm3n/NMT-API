@@ -14,4 +14,12 @@ app.use((err, _req, res, _next) => {
   res.status(err.statusCode || 500).json({ status: false, error: "internal_error", message: err.message });
 });
 const port = Number(process.env.EXPO_DEV_PORT || 3001);
-app.listen(port, "127.0.0.1", () => console.log(`LoveWorld Expo dev API on http://127.0.0.1:${port}/expo`));
+// Express 5 hands a listen error (the port already taken) to this callback rather than throwing.
+app.listen(port, "127.0.0.1", (err) => {
+  if (err) {
+    console.error(`Could not start on port ${port}: ${err.code === "EADDRINUSE" ? "something is already listening there (another copy of this?)" : err.message}`);
+    process.exit(1);
+  }
+  console.log(`LoveWorld Expo dev API on http://127.0.0.1:${port}/expo`);
+  console.log(`KingsChat messages: ${process.env.EXPO_KC_API_KEY || process.env.KINGSCHAT_API_KEY ? "on" : "off (no EXPO_KC_API_KEY, so sends are skipped)"}${["1", "true", "on"].includes(String(process.env.EXPO_KC_DEBUG || "").toLowerCase()) ? ", logging request bodies" : ""}`);
+});
