@@ -1359,6 +1359,40 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { user: shapeAdminUser(user), disabled: !!user.disabled_at, admin: !!user.is_admin });
   }));
 
+  // Deletes an account and everything it made, all or nothing: its SmartMeet meetings (the slots
+  // free up; exhibitors are not messaged), passes, programme applications, sponsor enquiries, its
+  // entries in the message log and its sign-ins. The last admin cannot be deleted. Says how many
+  // of each went.
+  router.delete("/expo/admin/users/:id", requireAdmin, asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    if (!isUuid(id)) return fail(res, 404, "not_found", "No such account.");
+    const user = await q1(`SELECT is_admin FROM users WHERE id = $1`, [id]);
+    if (!user) return fail(res, 404, "not_found", "No such account.");
+    if (user.is_admin && !(await q1(`SELECT 1 FROM users WHERE is_admin AND disabled_at IS NULL AND id <> $1 LIMIT 1`, [id]))) {
+      return fail(res, 409, "last_admin", "This is the only admin account. Make another account an admin first.");
+    }
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const count = async (sql) => (await client.query(sql, [id])).rowCount;
+      const removed = {
+        bookings: await count(`DELETE FROM bookings WHERE user_id = $1`),
+        registrations: await count(`DELETE FROM registrations WHERE user_id = $1`),
+        applications: await count(`DELETE FROM program_applications WHERE user_id = $1`),
+        enquiries: await count(`DELETE FROM sponsor_enquiries WHERE user_id = $1`),
+        messages: await count(`DELETE FROM notifications WHERE user_id = $1`),
+      };
+      await client.query(`DELETE FROM users WHERE id = $1`, [id]);
+      await client.query("COMMIT");
+      ok(res, { deleted: id, removed });
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+  }));
+
   // With `team`: how many accounts run each exhibitor.
   router.get("/expo/admin/exhibitors", requireAdmin, asyncHandler(async (req, res) => {
     const rows = await q(`${EXHIBITOR_SELECT.replace(" FROM exhibitors", ", (SELECT count(*)::int FROM users u WHERE u.exhibitor_id = exhibitors.id AND u.disabled_at IS NULL) AS team FROM exhibitors")} ORDER BY sort, name LIMIT $1`, [limit(req, 2000)]);

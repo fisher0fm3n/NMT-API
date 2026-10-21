@@ -22,12 +22,13 @@ const kingschat = http.createServer((req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.url === "/token") {
       const { code } = JSON.parse(body);
-      if (!["good-code", "second-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
+      if (!["good-code", "second-code", "third-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
       return res.end(JSON.stringify({ access_token: `kc-${code}`, refresh_token: "kc-refresh" }));
     }
     if (req.url === "/profile") {
       const auth = req.headers.authorization || "";
       if (!/^Bearer kc-/.test(auth)) { res.statusCode = 401; return res.end("{}"); }
+      if (auth === "Bearer kc-third-code") return res.end(JSON.stringify({ profile: { id: "kc-999", name: "Tolu Ade", username: "tolu_a", email: "tolu@example.com" } }));
       if (auth === "Bearer kc-second-code") return res.end(JSON.stringify({ profile: { id: "kc-456", name: "Grace Okafor", username: "grace_o", user: { kcID: "kc-777", profilePicture: "https://kc/grace.jpg", emailAddress: "grace@church.org" } } }));
       return res.end(JSON.stringify({ profile: { id: "kc-123", name: "Ade Bello", username: "pastor_ade", email: "ade@church.org", phone_number: "+2348000000000", avatar: "https://kc/ade.jpg" } }));
     }
@@ -580,4 +581,48 @@ test("rescheduling: to another free slot, until 15 minutes before; both sides ar
   assert.equal((await api("PATCH", `/expo/smartmeet/bookings/${other.json.booking.id}`, { token: grace.accessToken, body: { start: "2026-11-11T16:00" } })).status, 404);
   assert.equal((await api("GET", "/expo/config")).json.event.rescheduleCutoffMinutes, 15);
   void admin;
+});
+
+test("admins delete an account and everything it made, but never the last admin", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const n0 = kcMessages.length;
+  const tolu = (await api("POST", "/expo/auth/kingschat", { body: { code: "third-code" } })).json;
+  const booked = await api("POST", "/expo/smartmeet/bookings", { token: tolu.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-12T10:00", topic: "Partnership" } });
+  assert.equal(booked.status, 201, JSON.stringify(booked.json));
+  const reg = await api("POST", "/expo/registrations", { token: tolu.accessToken, body: { firstName: "Tolu", lastName: "Ade", email: "tolu@example.com", pass: "week", passPrice: 30 } });
+  assert.equal(reg.status, 201, JSON.stringify(reg.json));
+  // The welcome and the booking messages go in the background; let them land first.
+  await messagesSoFar(n0 + 2);
+  await new Promise((ok) => setTimeout(ok, 200));
+
+  assert.equal((await api("DELETE", `/expo/admin/users/${tolu.user.id}`)).status, 401);
+  const gone = await api("DELETE", `/expo/admin/users/${tolu.user.id}`, { headers: admin });
+  assert.equal(gone.status, 200, JSON.stringify(gone.json));
+  assert.equal(gone.json.deleted, tolu.user.id);
+  assert.equal(gone.json.removed.bookings, 1);
+  assert.equal(gone.json.removed.registrations, 1);
+  // Its welcome counts here; the booking's messages go with the booking.
+  assert.ok(gone.json.removed.messages >= 1, JSON.stringify(gone.json.removed));
+  const db = new Client({ connectionString: DB_URL });
+  await db.connect();
+  const left = await db.query(`SELECT count(*)::int AS n FROM notifications WHERE user_id = $1 OR booking_id = $2`, [tolu.user.id, booked.json.booking.id]);
+  await db.end();
+  assert.equal(left.rows[0].n, 0);
+
+  // The account and its sign-ins are gone, and the meeting's slot is open again.
+  const me = await api("GET", "/expo/me", { token: tolu.accessToken });
+  assert.equal(me.status, 401);
+  assert.equal(me.json.error, "account_deleted");
+  assert.equal((await api("POST", "/expo/auth/refresh", { body: { refreshToken: tolu.refreshToken } })).status, 401);
+  assert.equal((await api("GET", "/expo/admin/users", { headers: admin })).json.users.some((u) => u.id === tolu.user.id), false);
+  const av = await api("GET", "/expo/smartmeet/availability?exhibitor=loveworld-tv&date=2026-11-12");
+  assert.equal(av.json.slots.find((x) => x.start === "2026-11-12T10:00:00").available, true);
+  assert.equal((await api("DELETE", `/expo/admin/users/${tolu.user.id}`, { headers: admin })).status, 404);
+
+  // Grace is the one admin left (see the admins test): she stays.
+  const grace = (await api("GET", "/expo/admin/users?q=grace_o", { headers: admin })).json.users[0];
+  assert.equal(grace.admin, true);
+  const last = await api("DELETE", `/expo/admin/users/${grace.id}`, { headers: admin });
+  assert.equal(last.status, 409);
+  assert.equal(last.json.error, "last_admin");
 });
