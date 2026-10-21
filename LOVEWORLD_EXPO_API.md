@@ -26,6 +26,7 @@ exhibitors yet; `--seed` loads it again). Tests: `node --test test/loveworld_exp
 | `EXPO_ACCESS_TTL_SECONDS` (3600), `EXPO_REFRESH_DAYS` (90) | Token lifetimes |
 | `EXPO_START_DATE` (2026-11-09), `EXPO_END_DATE` (2026-11-15), `EXPO_UTC_OFFSET` (+01:00) | The event's days and clock |
 | `EXPO_MEETING_MINUTES` (20), `EXPO_DAY_START_HOUR` (10), `EXPO_DAY_END_HOUR` (17), `EXPO_LUNCH_HOUR` (13), `EXPO_MAX_BOOKINGS_PER_DAY` (6) | SmartMeet slots |
+| `EXPO_RESCHEDULE_CUTOFF_MINUTES` (15) | A visitor can move a meeting to another time until this many minutes before it starts |
 
 ## Authentication
 
@@ -63,6 +64,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `missing_code`, `kc_exchange_failed`, `kc_profile_failed`, `kc_no_identity`, `kc_not_configured` | 400, 502, 502, 502, 500 | KingsChat |
 | `not_available` / `bad_date` / `bad_slot` | 404 / 400 / 400 | SmartMeet: exhibitor not taking bookings; not an Expo day; not one of its slots |
 | `slot_taken` / `double_booked` / `day_full` | 409 | Someone got there first; you have a meeting then; `EXPO_MAX_BOOKINGS_PER_DAY` reached |
+| `too_late` / `same_time` | 409 / 400 | Moving a meeting less than `EXPO_RESCHEDULE_CUTOFF_MINUTES` before it starts; moving it to the time it already has |
 | `missing_fields` / `invalid_email` / `missing_topic` / `bad_program` / `bad_status` | 400 | Forms |
 | `not_exhibitor` | 403 | `/expo/exhibitor/*`: the account is not on an exhibitor's team |
 | `last_admin` | 409 | Taking admin away from the only admin account |
@@ -85,6 +87,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /expo/smartmeet/bookings` | The signed-in person's bookings, soonest first (cancelled ones too, with `status`) |
 | `POST /expo/smartmeet/bookings { exhibitorId, start: "2026-11-10T10:00", topic, notes?, name?, email?, organisation? }` | 201 `{ booking: { id, reference "SM-…", exhibitor: { id, name, stand }, start, end, startsAt, endsAt, name, email, organisation, topic, notes, location "SmartMeet Lounge · Table n", status, createdAt } }`; name/email/organisation default to the account's |
 | `GET /expo/smartmeet/bookings/:id` | One booking of theirs |
+| `PATCH /expo/smartmeet/bookings/:id { start: "2026-11-11T14:20" }` | Moves the visitor's own confirmed meeting to another free slot of the same exhibitor, until `EXPO_RESCHEDULE_CUTOFF_MINUTES` (15) before it starts; the reference and table stay, the old slot is freed, and both sides get a KingsChat message with the old and new times. Bookings carry `rescheduledAt`, `rescheduleCount` and `rescheduleUntil` (the last moment it can be moved) |
 | `DELETE /expo/smartmeet/bookings/:id { reason? }` | Cancels it (`status: "cancelled"`, `cancelledBy: "visitor"`, `cancelReason`); the slot is free again, and both sides get a KingsChat message |
 | `POST /expo/registrations { firstName, lastName, email, phone?, organisation?, role?, country?, zone?, interests?: [], pass?, passDay?, passPrice?, passCurrency? }` | 201 `{ reference "REG-…", id, createdAt, registration }`; signed in or not (signed in: the profile fields are kept on the account). `passDay` is the day of a one-day pass (an Expo day, else `bad_date`); `passPrice` / `passCurrency` are the price the website quoted from its own list. A free pass is `status: "confirmed"` at once, one with a price `"pending"` until the Expo team confirms it |
 | `GET /expo/registrations` | The signed-in person's registrations, newest first: `{ registrations: [{ id, reference, firstName, lastName, email, …, pass, passDay, passPrice, passCurrency, status, createdAt }] }` |
@@ -115,15 +118,23 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `PUT /expo/admin/exhibitors/:id { …fields }` | Changes the fields given |
 | `DELETE /expo/admin/exhibitors/:id` | Removes it (and its bookings) |
 | `GET /expo/admin/bookings?exhibitor=&date=&limit=` | Every booking |
-| `GET /expo/admin/notifications?booking=&limit=` | The KingsChat messages sent about bookings, newest first: `{ id, bookingId, reference, kind, user, recipientKcId, status: sent\|failed\|skipped, error, kcMessageId, body, createdAt, sentAt }` |
+| `GET /expo/admin/notifications?booking=&limit=` | The KingsChat messages sent (booking messages and welcomes), newest first: `{ id, bookingId, reference, kind, user, recipientKcId, status: sent\|failed\|skipped, error, kcMessageId, body, createdAt, sentAt }` |
 | `GET /expo/admin/registrations?pass=&status=`, `/expo/admin/enquiries`, `/expo/admin/applications?program=&status=` | The forms, newest first |
 | `POST /expo/admin/registrations/:id { status: pending\|confirmed\|cancelled }`, `POST /expo/admin/enquiries/:id { status: new\|contacted\|closed }`, `POST /expo/admin/applications/:id { status: submitted\|shortlisted\|accepted\|declined }` | Moves one along |
 
 `availability` on an exhibitor (all optional): `{ "dayStart": 10, "dayEnd": 17, "slotMinutes": 20, "closedDates": ["2026-11-09"], "blocked": ["2026-11-10T11:00:00"] }`.
 
-## KingsChat messages about bookings
+## KingsChat messages
 
-When a SmartMeet meeting is booked, and when it is cancelled by the visitor or by the exhibitor's
+**Welcome.** When someone signs in for the first time (the sign-in makes their account, and
+`POST /expo/auth/kingschat` answers `created: true`), they get a KingsChat welcome: what LoveWorld
+Expo is, its dates, the seven sector days, launches and demos, practical sessions, and SmartMeet,
+with links to book a meeting and see the programme. It is sent once per account (recorded in
+`notifications` with `kind: "welcome"`); accounts made before this was added are not welcomed.
+
+### About bookings
+
+When a SmartMeet meeting is booked, moved by the visitor (`rescheduled`), and when it is cancelled by the visitor or by the exhibitor's
 team, the visitor and everyone on the exhibitor's team (accounts with `exhibitor_id` set) get a
 KingsChat message with the details: who, when (on the event's clock), where, the topic, the
 reference, the reason when one was given, and a link back to the website.

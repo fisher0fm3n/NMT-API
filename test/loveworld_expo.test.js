@@ -498,3 +498,86 @@ test("KingsChat messages: sent as the project; a message to the project's own pr
   // Every message goes out as the project: never with a sender_id.
   assert.ok(kcMessages.every((m) => m.sender_id === undefined));
 });
+
+test("a new account is welcomed on KingsChat, once", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  // Ade's account was made by his first sign-in, in an earlier test; he has signed in many times since.
+  let welcome = [];
+  for (let i = 0; i < 50 && !welcome.length; i++) {
+    const log = await api("GET", "/expo/admin/notifications?limit=2000", { headers: admin });
+    welcome = log.json.notifications.filter((n) => n.kind === "welcome" && n.recipientKcId === "kc-123");
+    if (!welcome.length) await new Promise((r) => setTimeout(r, 30));
+  }
+  assert.equal(welcome.length, 1, "one welcome, however often he signs in");
+  assert.equal(welcome[0].status, "sent");
+  assert.equal(welcome[0].bookingId, null);
+  const text = welcome[0].body;
+  assert.match(text, /^👋 Welcome to LoveWorld Expo 2026, Ade!/);
+  assert.match(text, /9–15 Nov 2026/);
+  assert.match(text, /enterprise, health, agriculture, fashion & creativity, technology, manufacturing and investment/);
+  assert.match(text, /SmartMeet/);
+  assert.ok(text.includes("http://localhost:3000/smartmeet"));
+  assert.ok(Buffer.byteLength(text) <= 1024);
+  // A sign-in that does not make an account says so, and sends nothing new.
+  const again = await api("POST", "/expo/auth/kingschat", { body: { code: "good-code" } });
+  assert.equal(again.json.created, false);
+});
+
+test("rescheduling: to another free slot, until 15 minutes before; both sides are told", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const ade = (await api("POST", "/expo/auth/kingschat", { body: { code: "good-code" } })).json;
+  const grace = (await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } })).json;
+  const booked = await api("POST", "/expo/smartmeet/bookings", { token: ade.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-11T14:00", topic: "Syndication" } });
+  assert.equal(booked.status, 201, JSON.stringify(booked.json));
+  const id = booked.json.booking.id;
+  assert.equal(booked.json.booking.rescheduleCount, 0);
+  assert.equal(booked.json.booking.rescheduleUntil, new Date(new Date(booked.json.booking.startsAt).getTime() - 15 * 60000).toISOString());
+
+  // Only the visitor's own, and only to a real slot of the same exhibitor.
+  assert.equal((await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: grace.accessToken, body: { start: "2026-11-11T14:20" } })).status, 404);
+  assert.equal((await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: ade.accessToken, body: { start: "2026-11-11T14:05" } })).json.error, "bad_slot");
+  assert.equal((await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: ade.accessToken, body: { start: "2026-11-11T14:00" } })).json.error, "same_time");
+  assert.equal((await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: ade.accessToken, body: { start: "2026-12-01T10:00" } })).json.error, "bad_date");
+  const other = await api("POST", "/expo/smartmeet/bookings", { token: grace.accessToken, body: { exhibitorId: "loveworld-tv", start: "2026-11-11T15:00", topic: "Studio tour" } });
+  assert.equal(other.status, 201);
+  const taken = await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: ade.accessToken, body: { start: "2026-11-11T15:00" } });
+  assert.equal(taken.status, 409);
+  assert.equal(taken.json.error, "slot_taken");
+
+  // Moved: the new time is his, the old one free again, and both sides get the old and new times.
+  const n0 = kcMessages.length;
+  const moved = await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: ade.accessToken, body: { start: "2026-11-11T14:20" } });
+  assert.equal(moved.status, 200, JSON.stringify(moved.json));
+  assert.equal(moved.json.booking.start, "2026-11-11T14:20:00");
+  assert.equal(moved.json.booking.end, "2026-11-11T14:40:00");
+  assert.equal(moved.json.booking.reference, booked.json.booking.reference);
+  assert.equal(moved.json.booking.location, booked.json.booking.location);
+  assert.equal(moved.json.booking.rescheduleCount, 1);
+  assert.ok(moved.json.booking.rescheduledAt);
+  const av = await api("GET", "/expo/smartmeet/availability?exhibitor=loveworld-tv&date=2026-11-11");
+  assert.equal(av.json.slots.find((x) => x.start === "2026-11-11T14:00:00").available, true);
+  assert.equal(av.json.slots.find((x) => x.start === "2026-11-11T14:20:00").available, false);
+  await messagesSoFar(n0 + 2);
+  const v = kcMessages.slice(n0).find((m) => m.recipient_id === "kc-123").message.body.text.body;
+  const t = kcMessages.slice(n0).find((m) => m.recipient_id === "kc-456").message.body.text.body;
+  assert.match(v, /SmartMeet moved/);
+  assert.match(v, /New time: Wed 11 Nov, 14:20–14:40/);
+  assert.match(v, /Was: Wed 11 Nov, 14:00–14:20/);
+  assert.match(t, /Ade Bello \(@pastor_ade\) moved their meeting\./);
+  assert.match(t, /The earlier slot is open for booking again\./);
+
+  // Within 15 minutes of the start it can no longer be moved (only cancelled).
+  const db = new Client({ connectionString: DB_URL });
+  await db.connect();
+  await db.query(`UPDATE bookings SET starts_at = now() + interval '10 minutes', ends_at = now() + interval '30 minutes' WHERE id = $1`, [id]);
+  await db.end();
+  const late = await api("PATCH", `/expo/smartmeet/bookings/${id}`, { token: ade.accessToken, body: { start: "2026-11-11T16:00" } });
+  assert.equal(late.status, 409);
+  assert.equal(late.json.error, "too_late");
+  assert.match(late.json.message, /15 minutes/);
+  // A cancelled meeting cannot be moved either.
+  await api("DELETE", `/expo/smartmeet/bookings/${other.json.booking.id}`, { token: grace.accessToken });
+  assert.equal((await api("PATCH", `/expo/smartmeet/bookings/${other.json.booking.id}`, { token: grace.accessToken, body: { start: "2026-11-11T16:00" } })).status, 404);
+  assert.equal((await api("GET", "/expo/config")).json.event.rescheduleCutoffMinutes, 15);
+  void admin;
+});

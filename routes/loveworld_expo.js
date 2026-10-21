@@ -73,6 +73,8 @@ const EVENT = {
   dayStart: Number(env("EXPO_DAY_START_HOUR") || 10),
   dayEnd: Number(env("EXPO_DAY_END_HOUR") || 17),
   lunchHour: Number(env("EXPO_LUNCH_HOUR") ?? 13),
+  // A meeting can be moved to another time until this many minutes before it starts.
+  rescheduleCutoffMinutes: Number(env("EXPO_RESCHEDULE_CUTOFF_MINUTES") ?? 15),
   // One person may hold this many confirmed meetings a day (0: no limit).
   maxBookingsPerDay: Number(env("EXPO_MAX_BOOKINGS_PER_DAY") || 6),
 };
@@ -265,6 +267,9 @@ const SCHEMA = `
   -- Who cancelled a booking (visitor, exhibitor or admin) and the reason they gave.
   ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_by TEXT;
   ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
+  -- When a meeting was last moved to another time by the visitor, and how many times.
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS rescheduled_at TIMESTAMPTZ;
+  ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reschedule_count INTEGER NOT NULL DEFAULT 0;
 
   CREATE TABLE IF NOT EXISTS notifications (
     id BIGSERIAL PRIMARY KEY,
@@ -565,8 +570,9 @@ async function upsertKcUser(profile) {
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) RETURNING id`,
       [crypto.randomUUID(), profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null],
     );
+    return { id: row.id, created: true };
   }
-  return row.id;
+  return { id: row.id, created: false };
 }
 
 async function kingsChatUser({ code, accessToken }) {
@@ -579,7 +585,8 @@ async function kingsChatUser({ code, accessToken }) {
   const profile = await fetchKcProfile(accessToken);
   if (!profile) return { error: [502, "kc_profile_failed", "Could not read your KingsChat profile."] };
   if (!profile.kcId && !profile.username) return { error: [502, "kc_no_identity", "KingsChat did not return an identity."] };
-  return { userId: await upsertKcUser(profile) };
+  const account = await upsertKcUser(profile);
+  return { userId: account.id, created: account.created };
 }
 
 /* ---------------------------------------------------------------------------
@@ -599,13 +606,16 @@ const shapeMember = (r) => ({ id: r.id, username: r.kc_username, name: r.kc_name
 /** The fields an exhibitor's own team may change: how the stand reads, and SmartMeet. The rest (name, stand, zone, flags, order) is the admin's. */
 const EXHIBITOR_OWN_FIELDS = ["tagline", "description", "meeting_topics", "availability", "logo", "website", "smartmeet"];
 
-const BOOKING_SELECT = `SELECT b.id, b.reference, b.user_id, b.exhibitor_id, e.name AS exhibitor_name, e.stand, b.starts_at, b.ends_at, b.name, b.email, b.organisation, b.topic, b.notes, b.location, b.status, b.created_at, b.cancelled_at, b.cancelled_by, b.cancel_reason
+const BOOKING_SELECT = `SELECT b.id, b.reference, b.user_id, b.exhibitor_id, e.name AS exhibitor_name, e.stand, b.starts_at, b.ends_at, b.name, b.email, b.organisation, b.topic, b.notes, b.location, b.status, b.created_at, b.cancelled_at, b.cancelled_by, b.cancel_reason, b.rescheduled_at, b.reschedule_count
   FROM bookings b JOIN exhibitors e ON e.id = b.exhibitor_id`;
 const shapeBooking = (r) => r && ({
   id: r.id, reference: r.reference, exhibitorId: r.exhibitor_id, exhibitor: { id: r.exhibitor_id, name: r.exhibitor_name, stand: r.stand },
   start: localTime(r.starts_at), end: localTime(r.ends_at), startsAt: r.starts_at, endsAt: r.ends_at,
   name: r.name, email: r.email, organisation: r.organisation, topic: r.topic, notes: r.notes, location: r.location,
   status: r.status, createdAt: r.created_at, cancelledAt: r.cancelled_at, cancelledBy: r.cancelled_by || null, cancelReason: r.cancel_reason || "",
+  rescheduledAt: r.rescheduled_at || null, rescheduleCount: r.reschedule_count || 0,
+  // Until when the visitor may still move it (EXPO_RESCHEDULE_CUTOFF_MINUTES before the start).
+  rescheduleUntil: new Date(new Date(r.starts_at).getTime() - EVENT.rescheduleCutoffMinutes * 60000).toISOString(),
   ...(r.user_id ? { userId: r.user_id } : {}),
 });
 
@@ -671,9 +681,14 @@ function whenLabel(startsAt, endsAt) {
 const site = (path) => (SITE_URL ? `${SITE_URL}${path}` : "");
 const short = (v, n) => { const t = String(v || "").replace(/\s+/g, " ").trim(); return t.length > n ? `${t.slice(0, n - 1)}…` : t; };
 
+/** A blank line between blocks of a message (an empty value, by contrast, is a line left out). */
+const GAP = "\u2063";
+
 /** Lines into one message, trimmed to KingsChat's inline limit (the longest optional line goes first). */
 function compose(lines) {
-  let list = lines.filter((l) => l != null && l !== false && l !== "");
+  let list = lines.filter((l) => l != null && l !== false && l !== "").map((l) => (l === GAP ? "" : l));
+  // No blank line at the start or end, nor two together (when the lines between were left out).
+  list = list.filter((l, i) => l !== "" || (i > 0 && i < list.length - 1 && list[i - 1] !== ""));
   let text = list.join("\n");
   while (Buffer.byteLength(text, "utf8") > KC_TEXT_LIMIT) {
     const i = list.reduce((m, l, k) => (l.length > list[m].length ? k : m), 0);
@@ -693,7 +708,7 @@ async function bookingForMessages(bookingId) {
 }
 
 /** The texts for one event: what the visitor reads, and what the exhibitor's team reads. */
-function bookingMessages(kind, b, { byName } = {}) {
+function bookingMessages(kind, b, { byName, from } = {}) {
   const who = b.name || b.visitor_name || (b.visitor_username ? `@${b.visitor_username}` : "A visitor");
   const handle = b.visitor_username ? ` (@${b.visitor_username})` : "";
   const when = whenLabel(b.starts_at, b.ends_at);
@@ -703,18 +718,18 @@ function bookingMessages(kind, b, { byName } = {}) {
     return {
       visitor: compose([
         "✅ SmartMeet confirmed · LoveWorld Expo 2026",
-        "",
+        GAP,
         `With: ${b.exhibitor_name}${stand}`,
         `When: ${when}`,
         `Where: ${b.location}`,
         `Topic: ${short(b.topic, 200)}`,
         `Reference: ${b.reference}`,
-        "",
+        GAP,
         site("/my-expo") && `See or cancel your meetings: ${site("/my-expo")}`,
       ]),
       exhibitor: compose([
         `📅 New SmartMeet booking · ${b.exhibitor_name}`,
-        "",
+        GAP,
         `Visitor: ${who}${handle}`,
         b.organisation && `Organisation: ${short(b.organisation, 120)}`,
         `When: ${when}`,
@@ -722,8 +737,37 @@ function bookingMessages(kind, b, { byName } = {}) {
         `Topic: ${short(b.topic, 200)}`,
         b.notes && `Notes: ${short(b.notes, 400)}`,
         `Reference: ${b.reference}`,
-        "",
+        GAP,
         site("/exhibitor/bookings") && `All your meetings: ${site("/exhibitor/bookings")}`,
+      ]),
+    };
+  }
+  if (kind === "rescheduled") {
+    const was = from ? whenLabel(from.startsAt, from.endsAt) : "";
+    return {
+      visitor: compose([
+        "🔁 SmartMeet moved · LoveWorld Expo 2026",
+        GAP,
+        `With: ${b.exhibitor_name}${stand}`,
+        `New time: ${when}`,
+        was && `Was: ${was}`,
+        `Where: ${b.location}`,
+        `Topic: ${short(b.topic, 200)}`,
+        `Reference: ${b.reference}`,
+        GAP,
+        site("/my-expo") && `See or change your meetings: ${site("/my-expo")}`,
+      ]),
+      exhibitor: compose([
+        `🔁 SmartMeet moved · ${b.exhibitor_name}`,
+        GAP,
+        `${who}${handle} moved their meeting.`,
+        `New time: ${when}`,
+        was && `Was: ${was}`,
+        `Where: ${b.location}`,
+        `Topic: ${short(b.topic, 200)}`,
+        `Reference: ${b.reference}`,
+        GAP,
+        was && "The earlier slot is open for booking again.",
       ]),
     };
   }
@@ -733,25 +777,25 @@ function bookingMessages(kind, b, { byName } = {}) {
   return {
     visitor: compose([
       "❌ SmartMeet cancelled · LoveWorld Expo 2026",
-      "",
+      GAP,
       byExhibitor ? `${b.exhibitor_name} cancelled your meeting.` : b.cancelled_by === "admin" ? "The Expo team cancelled your meeting." : "You cancelled your meeting.",
       `With: ${b.exhibitor_name}${stand}`,
       `When: ${when}`,
       reason,
       `Reference: ${b.reference}`,
-      "",
+      GAP,
       site(`/smartmeet?exhibitor=${encodeURIComponent(b.exhibitor_id)}`) && `Book another time: ${site(`/smartmeet?exhibitor=${encodeURIComponent(b.exhibitor_id)}`)}`,
     ]),
     exhibitor: compose([
       `❌ SmartMeet cancelled · ${b.exhibitor_name}`,
-      "",
+      GAP,
       `Cancelled by: ${by}`,
       `Visitor: ${who}${handle}`,
       `When: ${when}`,
       `Topic: ${short(b.topic, 200)}`,
       reason,
       `Reference: ${b.reference}`,
-      "",
+      GAP,
       "The slot is open for booking again.",
     ]),
   };
@@ -787,14 +831,38 @@ async function sendKcMessage(recipientId, text, label = "") {
 }
 
 /**
- * Tell the visitor and the exhibitor's team about a booking event ("booked" or "cancelled").
- * Returns the notifications rows' outcomes; never throws.
+ * One message to one person, sent and recorded in `notifications`: { userId, kind, status, error }.
+ * `r` is { userId, kc, text, kind }; `bookingId` and `ref` (for the log) may be null.
  */
-async function notifyBooking(bookingId, kind, { byName } = {}) {
+async function deliver(r, { bookingId = null, ref = "" } = {}) {
+  let result;
+  const label = `(${r.kind}${ref ? `, ${ref}` : ""})`;
+  if (!messagesOn()) result = { ok: false, skipped: true, error: KC_API_KEY ? "messages turned off (EXPO_KC_MESSAGES=off)" : "no KingsChat api-key (EXPO_KC_API_KEY)" };
+  else if (!r.kc) result = { ok: false, skipped: true, error: "no KingsChat id on the account" };
+  else {
+    result = await sendKcMessage(r.kc, r.text, label);
+    // The recipient is the project's own KingsChat profile: not an outage, just no one to tell.
+    if (result.code === "cannot_send_to_self") result = { ok: false, skipped: true, error: "the recipient is the project's own KingsChat profile itself (cannot_send_to_self)" };
+  }
+  const status = result.ok ? "sent" : result.skipped ? "skipped" : "failed";
+  if (status === "skipped") console.log(`[expo] KingsChat message ${label} not sent: ${result.error}`);
+  if (status === "failed") console.error(`[expo] KingsChat message ${label} failed: ${result.error}`);
+  await q(
+    `INSERT INTO notifications (booking_id, user_id, kind, recipient_kc_id, body, status, error, kc_message_id, sent_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $6 = 'sent' THEN now() END)`,
+    [bookingId, r.userId, r.kind, r.kc || null, r.text, status, result.error || null, result.messageId || null]);
+  return { userId: r.userId, kind: r.kind, status, error: result.error || null };
+}
+
+/**
+ * Tell the visitor and the exhibitor's team about a booking event ("booked", "rescheduled" or
+ * "cancelled"). Returns the notifications rows' outcomes; never throws.
+ */
+async function notifyBooking(bookingId, kind, { byName, from } = {}) {
   try {
     const b = await bookingForMessages(bookingId);
     if (!b) return [];
-    const texts = bookingMessages(kind, b, { byName });
+    const texts = bookingMessages(kind, b, { byName, from });
     const team = await q(`SELECT id, kc_user_id, kc_id FROM users WHERE exhibitor_id = $1 AND disabled_at IS NULL`, [b.exhibitor_id]);
     if (!team.length) console.log(`[expo] KingsChat messages (${kind}, ${b.reference}): nobody is on ${b.exhibitor_name}'s team, so only the visitor is told`);
     const recipients = [
@@ -808,22 +876,7 @@ async function notifyBooking(bookingId, kind, { byName } = {}) {
       const key = r.kc || r.userId;
       if (seen.has(key)) continue;
       seen.add(key);
-      let result;
-      if (!messagesOn()) result = { ok: false, skipped: true, error: KC_API_KEY ? "messages turned off (EXPO_KC_MESSAGES=off)" : "no KingsChat api-key (EXPO_KC_API_KEY)" };
-      else if (!r.kc) result = { ok: false, skipped: true, error: "no KingsChat id on the account" };
-      else {
-        result = await sendKcMessage(r.kc, r.text, `(${r.kind}, ${b.reference})`);
-        // The recipient is the project's own KingsChat profile: not an outage, just no one to tell.
-        if (result.code === "cannot_send_to_self") result = { ok: false, skipped: true, error: "the recipient is the project's own KingsChat profile itself (cannot_send_to_self)" };
-      }
-      const status = result.ok ? "sent" : result.skipped ? "skipped" : "failed";
-      if (status === "skipped") console.log(`[expo] KingsChat message (${r.kind}, ${b.reference}) not sent: ${result.error}`);
-      if (status === "failed") console.error(`[expo] KingsChat message (${r.kind}, ${b.reference}) failed: ${result.error}`);
-      await q(
-        `INSERT INTO notifications (booking_id, user_id, kind, recipient_kc_id, body, status, error, kc_message_id, sent_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $6 = 'sent' THEN now() END)`,
-        [b.id, r.userId, r.kind, r.kc || null, r.text, status, result.error || null, result.messageId || null]);
-      out.push({ userId: r.userId, kind: r.kind, status, error: result.error || null });
+      out.push(await deliver(r, { bookingId: b.id, ref: b.reference }));
     }
     return out;
   } catch (err) {
@@ -834,6 +887,48 @@ async function notifyBooking(bookingId, kind, { byName } = {}) {
 
 /** Send in the background: the answer to the person does not wait for KingsChat. */
 const notifyLater = (bookingId, kind, opts) => { setImmediate(() => { notifyBooking(bookingId, kind, opts); }); };
+
+/** The day of the week and month of a YYYY-MM-DD, e.g. "Mon 9 Nov". */
+function dayLabel(date) {
+  const d = new Date(`${date}T00:00:00Z`);
+  return `${WEEKDAYS[d.getUTCDay()]} ${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
+}
+
+/** The welcome a new account gets on KingsChat: what the Expo is and what is in store. */
+function welcomeMessage(name) {
+  const first = String(name || "").trim().split(/\s+/)[0];
+  const start = new Date(`${EVENT.start}T00:00:00Z`);
+  const end = new Date(`${EVENT.end}T00:00:00Z`);
+  const dates = `${start.getUTCDate()}–${end.getUTCDate()} ${MONTHS[end.getUTCMonth()]} ${end.getUTCFullYear()}`;
+  return compose([
+    `👋 Welcome to LoveWorld Expo 2026${first ? `, ${first}` : ""}!`,
+    GAP,
+    `Where the world meets LoveWorld: seven days, ${dates}, during IPPC 2026.`,
+    GAP,
+    "What's in store:",
+    "• A sector in the spotlight each day: enterprise, health, agriculture, fashion & creativity, technology, manufacturing and investment",
+    "• Product launches and live demos to see and try firsthand",
+    "• Practical sessions with experts",
+    "• SmartMeet: book one-on-one meetings with exhibitors before you arrive",
+    GAP,
+    site("/smartmeet") && `Book a meeting: ${site("/smartmeet")}`,
+    site("/programme") && `The programme: ${site("/programme")}`,
+  ]);
+}
+
+/** Welcome a new account on KingsChat, in the background; once per account (by its record). */
+function welcomeLater(userId) {
+  setImmediate(async () => {
+    try {
+      if (await q1(`SELECT 1 FROM notifications WHERE user_id = $1 AND kind = 'welcome'`, [userId])) return;
+      const u = await q1(`SELECT id, kc_user_id, kc_id, kc_name, kc_username FROM users WHERE id = $1`, [userId]);
+      if (!u) return;
+      await deliver({ userId: u.id, kc: u.kc_user_id || u.kc_id, text: welcomeMessage(u.kc_name || u.kc_username), kind: "welcome" }, { ref: u.kc_username ? `@${u.kc_username}` : "" });
+    } catch (err) {
+      console.error(`[expo] welcome message (${userId}) failed:`, err.message);
+    }
+  });
+}
 
 /* ---------------------------------------------------------------------------
  * Routes
@@ -861,7 +956,7 @@ module.exports = function loveworldExpoRoutes() {
   router.get("/expo/config", ...app, (_req, res) => {
     ok(res, {
       kingschat: { clientId: KC_CLIENT_ID, loginUrl: KC_LOGIN_URL, redirectUri: SITE_URL ? `${SITE_URL}/auth/kingschat/callback` : null },
-      event: { start: EVENT.start, end: EVENT.end, days: eventDays(), utcOffset: EVENT.offset, meetingMinutes: EVENT.meetingMinutes, dayStart: EVENT.dayStart, dayEnd: EVENT.dayEnd, lunchHour: EVENT.lunchHour, maxBookingsPerDay: EVENT.maxBookingsPerDay },
+      event: { start: EVENT.start, end: EVENT.end, days: eventDays(), utcOffset: EVENT.offset, meetingMinutes: EVENT.meetingMinutes, dayStart: EVENT.dayStart, dayEnd: EVENT.dayEnd, lunchHour: EVENT.lunchHour, maxBookingsPerDay: EVENT.maxBookingsPerDay, rescheduleCutoffMinutes: EVENT.rescheduleCutoffMinutes },
     });
   });
 
@@ -877,7 +972,9 @@ module.exports = function loveworldExpoRoutes() {
     if (kc.error) return fail(res, ...kc.error);
     let out;
     try { out = await issue(kc.userId, { deviceId: req.body?.deviceId, userAgent: req.get("user-agent") }); } catch (err) { return refused(res, err); }
-    ok(res, out);
+    // A first sign-in made the account: welcome them on KingsChat.
+    if (kc.created) welcomeLater(kc.userId);
+    ok(res, { ...out, created: !!kc.created });
   }));
 
   router.post("/expo/auth/refresh", ...app, asyncHandler(async (req, res) => {
@@ -1014,6 +1111,48 @@ module.exports = function loveworldExpoRoutes() {
     const row = await q1(`${BOOKING_SELECT} WHERE b.id = $1 AND b.user_id = $2`, [req.params.id, req.expoUserId]);
     if (!row) return fail(res, 404, "not_found", "No such booking.");
     ok(res, { booking: shapeBooking(row) });
+  }));
+
+  // The visitor moves their meeting to another of the exhibitor's slots ({ start: "YYYY-MM-DDTHH:MM" }),
+  // until EXPO_RESCHEDULE_CUTOFF_MINUTES (15) before it starts. Same exhibitor, same table; the old
+  // slot is freed. Both sides get a KingsChat message with the old and new times.
+  router.patch("/expo/smartmeet/bookings/:id", ...user, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such booking.");
+    const current = await q1(`SELECT id, exhibitor_id, starts_at, ends_at, status FROM bookings WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]);
+    if (!current || current.status !== "confirmed") return fail(res, 404, "not_found", "No such booking, or it is cancelled.");
+    const cutoff = EVENT.rescheduleCutoffMinutes;
+    if (new Date(current.starts_at).getTime() - Date.now() < cutoff * 60000) {
+      return fail(res, 409, "too_late", `Meetings can be moved until ${cutoff} minutes before they start.`);
+    }
+    const start = clean(req.body?.start, 19);
+    if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?$/.test(start)) return fail(res, 400, "missing_fields", "Provide the new `start` time (YYYY-MM-DDTHH:MM).");
+    const startLocal = start.length === 16 ? `${start}:00` : start;
+    const date = startLocal.slice(0, 10);
+    if (!isEventDay(date)) return fail(res, 400, "bad_date", `Pick a day of the Expo (${EVENT.start} to ${EVENT.end}).`);
+    const ex = await q1(`${EXHIBITOR_SELECT} WHERE id = $1 AND active`, [current.exhibitor_id]);
+    if (!ex || !ex.smartmeet) return fail(res, 404, "not_available", "That exhibitor is not taking SmartMeet bookings any more.");
+    const slot = slotsFor(ex, date).find((x) => x.start === startLocal);
+    if (!slot || !slot.available) return fail(res, 400, "bad_slot", "That time is not one of the exhibitor's meeting slots.");
+    const startsAt = atEvent(slot.start);
+    const endsAt = atEvent(slot.end);
+    if (startsAt.getTime() === new Date(current.starts_at).getTime()) return fail(res, 400, "same_time", "That is the meeting's time already.");
+    if (startsAt.getTime() - Date.now() < cutoff * 60000) return fail(res, 400, "bad_slot", `Pick a time at least ${cutoff} minutes from now.`);
+    if (await q1(`SELECT 1 FROM bookings WHERE user_id = $1 AND status = 'confirmed' AND starts_at = $2 AND id <> $3`, [req.expoUserId, startsAt, current.id])) {
+      return fail(res, 409, "double_booked", "You already have a meeting at that time.");
+    }
+    if (EVENT.maxBookingsPerDay) {
+      const [from, to] = [atEvent(`${date}T00:00:00`), atEvent(`${date}T23:59:59`)];
+      const n = (await q1(`SELECT count(*)::int AS n FROM bookings WHERE user_id = $1 AND status = 'confirmed' AND starts_at >= $2 AND starts_at < $3 AND id <> $4`, [req.expoUserId, from, to, current.id]))?.n || 0;
+      if (n >= EVENT.maxBookingsPerDay) return fail(res, 409, "day_full", `You can hold ${EVENT.maxBookingsPerDay} meetings a day at most.`);
+    }
+    try {
+      await q(`UPDATE bookings SET starts_at = $2, ends_at = $3, rescheduled_at = now(), reschedule_count = reschedule_count + 1 WHERE id = $1`, [current.id, startsAt, endsAt]);
+    } catch (err) {
+      if (err.code === "23505") return fail(res, 409, "slot_taken", "That slot has just been taken. Pick another time.");
+      throw err;
+    }
+    notifyLater(current.id, "rescheduled", { from: { startsAt: current.starts_at, endsAt: current.ends_at } });
+    ok(res, { booking: shapeBooking(await q1(`${BOOKING_SELECT} WHERE b.id = $1`, [current.id])) });
   }));
 
   // The visitor cancels their own meeting ({ reason }, optional). Both sides get a KingsChat message.
