@@ -60,6 +60,20 @@ const messagesOn = () => (env("EXPO_KC_MESSAGES") || "on").toLowerCase() !== "of
 // Every send is logged with KingsChat's answer; EXPO_KC_DEBUG=1 also logs the request body.
 const kcDebug = () => ["1", "true", "on"].includes(String(env("EXPO_KC_DEBUG") || "").toLowerCase());
 
+// Passes are paid in Espees: a product per purchase (EXPO_ESPEES_API_KEY), paid on Espees' own
+// page into the Expo's merchant wallet, then confirmed with Espees. Once paid, each ticket is
+// added on KingsPass (EXPO_KINGSPASS_URL, the KingsPass server, and the event's
+// EXPO_KINGSPASS_EVENT_TOKEN). Without all of these, checkout says passes aren't on sale.
+const ESPEES_API_KEY = env("EXPO_ESPEES_API_KEY") || "";
+const ESPEES_MERCHANT_WALLET = env("EXPO_ESPEES_MERCHANT_WALLET") || "0xcd7b43d8652066e93298865afa19286b6a75f144";
+const ESPEES_PRODUCT_URL = env("EXPO_ESPEES_PRODUCT_URL") || "https://api.espees.org/v2/payment/product";
+const ESPEES_CONFIRM_URL = env("EXPO_ESPEES_CONFIRM_URL") || "https://api.espees.org/v2/payment/confirm/";
+const ESPEES_PAY_URL = (env("EXPO_ESPEES_PAY_URL") || "https://payment.espees.org/pay").replace(/\/+$/, "");
+// The KingsPass server, with or without its /api (https://kingspass.org or https://kingspass.org/api/).
+const KINGSPASS_URL = (env("EXPO_KINGSPASS_URL") || "").replace(/\/+$/, "").replace(/\/api$/i, "");
+const KINGSPASS_EVENT_TOKEN = env("EXPO_KINGSPASS_EVENT_TOKEN") || "";
+const passesOnSale = () => !!(ESPEES_API_KEY && ESPEES_MERCHANT_WALLET && KINGSPASS_URL && KINGSPASS_EVENT_TOKEN);
+
 const ACCESS_TTL = Number(env("EXPO_ACCESS_TTL_SECONDS") || 3600);
 const REFRESH_DAYS = Number(env("EXPO_REFRESH_DAYS") || 90);
 const adminKey = () => env("EXPO_ADMIN_KEY") || "";
@@ -77,6 +91,21 @@ const EVENT = {
   rescheduleCutoffMinutes: Number(env("EXPO_RESCHEDULE_CUTOFF_MINUTES") ?? 15),
   // One person may hold this many confirmed meetings a day (0: no limit).
   maxBookingsPerDay: Number(env("EXPO_MAX_BOOKINGS_PER_DAY") || 6),
+};
+
+// The passes on sale: their price in Espees and the KingsPass tickets each one issues. Keep the
+// prices in step with the website's src/data/passes.ts (checkout refuses a price the website
+// shows differently). The day and 3-day passes issue the day ticket of each day picked.
+const KINGSPASS_DAY_TICKETS = {
+  "2026-11-09": 2581, "2026-11-10": 2580, "2026-11-11": 2579, "2026-11-12": 2578, "2026-11-13": 2577, "2026-11-14": 2576, "2026-11-15": 2575,
+};
+const PASSES = {
+  day: { name: "Day pass", price: 10, days: 1 },
+  "three-day": { name: "3-day pass", price: 15, days: 3 },
+  week: { name: "Week pass", price: 25, ticket: 2574 },
+  vip: { name: "VIP pass", price: 100, ticket: 2573 },
+  // For trying a real purchase end to end, on KingsPass's test ticket: admins only.
+  test: { name: "Test pass", price: 0.001, ticket: 2582, adminOnly: true },
 };
 
 /* ---------------------------------------------------------------------------
@@ -260,6 +289,26 @@ const SCHEMA = `
   ALTER TABLE registrations ADD COLUMN IF NOT EXISTS pass_currency TEXT NOT NULL DEFAULT '';
   ALTER TABLE registrations ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
   CREATE INDEX IF NOT EXISTS registrations_user ON registrations (user_id, created_at DESC);
+  -- Passes bought online: the ticket holder's title and church (with the name, email, phone,
+  -- country and zone above, from their profile), the days picked, the Espees payment, and the
+  -- KingsPass tickets to issue ([{ ticketId, day, status: to_issue | issued | failed, ... }]).
+  -- status: pending (to pay), paid (tickets still to issue), confirmed, cancelled.
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS title TEXT NOT NULL DEFAULT '';
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS church TEXT NOT NULL DEFAULT '';
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS pass_days JSONB NOT NULL DEFAULT '[]';
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_ref TEXT;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_status TEXT;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_checked_at TIMESTAMPTZ;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS tickets JSONB NOT NULL DEFAULT '[]';
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
+  CREATE UNIQUE INDEX IF NOT EXISTS registrations_payment_ref ON registrations (payment_ref) WHERE payment_ref IS NOT NULL;
+  -- Prices to the thousandth of an Espee (the test pass is 0.001).
+  DO $$ BEGIN
+    IF (SELECT numeric_scale FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'registrations' AND column_name = 'pass_price') < 4 THEN
+      ALTER TABLE registrations ALTER COLUMN pass_price TYPE NUMERIC(14,4);
+    END IF;
+  END $$;
 
   -- The KingsChat user id messages are addressed to: the profile's own id (profile.id), which
   -- kc_id (an account's key, kcID when KingsChat gives one) need not be. Filled in at sign-in.
@@ -953,6 +1002,160 @@ function welcomeLater(userId) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Passes: paid in Espees, issued on KingsPass
+ * ------------------------------------------------------------------------- */
+
+/** The KingsPass tickets a pass issues for the days picked: [{ ticketId, day }]. */
+function passTickets(passId, days) {
+  const pass = PASSES[passId];
+  if (!pass) return [];
+  return pass.days ? days.map((day) => ({ ticketId: KINGSPASS_DAY_TICKETS[day], day })) : [{ ticketId: pass.ticket, day: "" }];
+}
+
+const espeesHeaders = () => ({ "Content-Type": "application/json", Accept: "application/json", "x-api-key": ESPEES_API_KEY });
+const sameAmount = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
+const amountLabel = (n) => `${Number(n).toLocaleString("en-GB", { maximumFractionDigits: 4 })} Espees`;
+const parseJson = (raw) => { try { return JSON.parse(raw); } catch { return null; } };
+
+/** A product on Espees for one purchase: its payment_ref, or throws. */
+async function createEspeesProduct({ sku, narration, price, successUrl, failUrl, data }) {
+  const resp = await fetch(ESPEES_PRODUCT_URL, {
+    method: "POST",
+    headers: espeesHeaders(),
+    body: JSON.stringify({ product_sku: sku, narration, price, merchant_wallet: ESPEES_MERCHANT_WALLET, success_url: successUrl, fail_url: failUrl, user_data: data }),
+    signal: AbortSignal.timeout(15000),
+  });
+  const raw = await resp.text().catch(() => "");
+  const json = parseJson(raw);
+  console.log(`[expo] Espees product ${sku} ← ${resp.status} ${raw.slice(0, 300)}`);
+  if (!resp.ok || !json?.payment_ref) throw new Error(`Espees answered ${resp.status} ${json?.message || raw.slice(0, 200)}`.trim());
+  return String(json.payment_ref);
+}
+
+/** What Espees says of a payment: { status (APPROVED, DECLINE, PENDING, NOT FOUND), sku, price } or { error }. */
+async function confirmEspees(paymentRef) {
+  let resp;
+  try {
+    resp = await fetch(ESPEES_CONFIRM_URL, { method: "POST", headers: espeesHeaders(), body: JSON.stringify({ payment_ref: paymentRef }), signal: AbortSignal.timeout(15000) });
+  } catch (err) {
+    return { error: `unreachable: ${err.message}` };
+  }
+  const raw = await resp.text().catch(() => "");
+  const json = parseJson(raw);
+  console.log(`[expo] Espees confirm ${paymentRef} ← ${resp.status} ${raw.slice(0, 300)}`);
+  const status = String(json?.transaction_status || "").trim().toUpperCase();
+  if (!status) return { error: `${resp.status} ${json?.message || raw.slice(0, 200)}`.trim() };
+  return { status, sku: json.product_sku ?? null, price: json.price ?? null };
+}
+
+/** One ticket on KingsPass for the purchase's holder: { status: "issued", attendeeId } or { status: "failed", error }. */
+async function addKingsPassAttendee(r, ticketId) {
+  if (!KINGSPASS_URL || !KINGSPASS_EVENT_TOKEN) return { status: "failed", error: "KingsPass isn't set up (EXPO_KINGSPASS_URL, EXPO_KINGSPASS_EVENT_TOKEN)" };
+  const form = new FormData();
+  const fields = { title: r.title, firstname: r.first_name, lastname: r.last_name, email: r.email, phone_number: r.phone, country: r.country, zone: r.zone, church: r.church, ticket_id: String(ticketId) };
+  for (const [k, v] of Object.entries(fields)) form.append(k, v ?? "");
+  let resp;
+  try {
+    resp = await fetch(`${KINGSPASS_URL}/api/public/attendees`, { method: "POST", headers: { "X-EVENT-TOKEN": KINGSPASS_EVENT_TOKEN, Accept: "application/json" }, body: form, signal: AbortSignal.timeout(20000) });
+  } catch (err) {
+    return { status: "failed", error: `unreachable: ${err.message}` };
+  }
+  const raw = await resp.text().catch(() => "");
+  const json = parseJson(raw);
+  console.log(`[expo] KingsPass attendee (${r.reference}, ticket ${ticketId}) ← ${resp.status} ${raw.slice(0, 300)}`);
+  if (!resp.ok || json?.success === false || json?.status === false) return { status: "failed", error: `${resp.status} ${json?.message || json?.error || raw.slice(0, 200)}`.trim() };
+  const a = json?.attendee ?? json?.data ?? json;
+  return { status: "issued", attendeeId: a?.id != null ? String(a.id) : null, response: raw.slice(0, 500) };
+}
+
+/** Issues a paid purchase's tickets that aren't out yet, holding its row so no ticket goes out twice. */
+async function issueTickets(id) {
+  const client = await pool.connect();
+  let row;
+  let confirmedNow = false;
+  try {
+    await client.query("BEGIN");
+    row = (await client.query(`SELECT * FROM registrations WHERE id = $1 FOR UPDATE`, [id])).rows[0];
+    if (row?.status === "paid") {
+      const tickets = [];
+      for (const t of row.tickets || []) {
+        if (t.status === "issued") tickets.push(t);
+        else tickets.push({ ticketId: t.ticketId, day: t.day || "", ...(await addKingsPassAttendee(row, t.ticketId)), at: new Date().toISOString() });
+      }
+      confirmedNow = tickets.length > 0 && tickets.every((t) => t.status === "issued");
+      row = (await client.query(
+        `UPDATE registrations SET tickets = $2, status = CASE WHEN $3 THEN 'confirmed' ELSE status END, issued_at = CASE WHEN $3 THEN now() ELSE issued_at END
+          WHERE id = $1 RETURNING *`, [id, JSON.stringify(tickets), confirmedNow])).rows[0];
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+  if (confirmedNow) passMessageLater(row.id);
+  return row;
+}
+
+/**
+ * Brings a purchase up to date: asks Espees about one still to pay (approved, for this purchase
+ * at its full price: "paid"), then issues a paid one's KingsPass tickets (all out: "confirmed",
+ * and the buyer hears on KingsChat). Safe to call again, and at the same time. Returns the row,
+ * with `checkError` when Espees couldn't be asked.
+ */
+async function settleRegistration(id) {
+  let r = await q1(`SELECT * FROM registrations WHERE id = $1`, [id]);
+  if (!r || !r.payment_ref) return r;
+  if (r.status === "pending") {
+    const pay = await confirmEspees(r.payment_ref);
+    if (pay.error) {
+      console.error(`[expo] Espees confirm (${r.reference}) failed: ${pay.error}`);
+      return { ...r, checkError: pay.error };
+    }
+    const matches = (pay.sku == null || String(pay.sku) === r.reference) && (pay.price == null || sameAmount(pay.price, r.pass_price));
+    if (pay.status === "APPROVED" && !matches) console.error(`[expo] Espees approved ${r.reference} for ${pay.sku} at ${pay.price}, not ${r.reference} at ${Number(r.pass_price)}: left pending`);
+    const paid = pay.status === "APPROVED" && matches;
+    r = (await q1(
+      `UPDATE registrations SET payment_status = $2, payment_checked_at = now(), status = CASE WHEN $3 AND status = 'pending' THEN 'paid' ELSE status END,
+         paid_at = CASE WHEN $3 AND paid_at IS NULL THEN now() ELSE paid_at END WHERE id = $1 RETURNING *`,
+      [id, pay.status === "APPROVED" && !matches ? "MISMATCH" : pay.status, paid])) || r;
+  }
+  if (r.status === "paid") r = await issueTickets(id);
+  return r;
+}
+
+/** The buyer's KingsChat message once their pass is confirmed. */
+function passMessage(r) {
+  const days = (r.pass_days || []).map(dayLabel);
+  const n = (r.tickets || []).length;
+  return compose([
+    `🎟️ Your LoveWorld Expo 2026 ${PASSES[r.pass]?.name || r.pass} is confirmed!`,
+    GAP,
+    `Reference: ${r.reference}`,
+    days.length ? `${days.length === 1 ? "Day" : "Days"}: ${days.join(", ")}` : null,
+    `Ticket holder: ${[r.title, r.first_name, r.last_name].filter(Boolean).join(" ")}`,
+    `Paid: ${amountLabel(r.pass_price)}`,
+    GAP,
+    `Your ${n === 1 ? "ticket is" : `${n} tickets are`} on KingsPass, issued to ${r.email}.`,
+    site("/my-expo") && `Your passes: ${site("/my-expo")}`,
+    site("/smartmeet") && `Book meetings with exhibitors: ${site("/smartmeet")}`,
+  ]);
+}
+
+/** Tell the buyer on KingsChat, in the background (once: only the step to confirmed calls it). */
+function passMessageLater(id) {
+  setImmediate(async () => {
+    try {
+      const r = await q1(`SELECT r.*, u.kc_user_id, u.kc_id FROM registrations r JOIN users u ON u.id = r.user_id WHERE r.id = $1`, [id]);
+      if (r) await deliver({ userId: r.user_id, kc: r.kc_user_id || r.kc_id, text: passMessage(r), kind: "pass:confirmed" }, { ref: r.reference });
+    } catch (err) {
+      console.error(`[expo] pass message (${id}) failed:`, err.message);
+    }
+  });
+}
+
+/* ---------------------------------------------------------------------------
  * Routes
  * ------------------------------------------------------------------------- */
 
@@ -1249,10 +1452,15 @@ module.exports = function loveworldExpoRoutes() {
   /* ---- forms ----------------------------------------------------------- */
 
   /** A registration as the person and the admin see it. */
-  const shapeRegistration = (r) => ({
-    id: r.id, reference: r.reference, userId: r.user_id, firstName: r.first_name, lastName: r.last_name, email: r.email, phone: r.phone,
-    organisation: r.organisation, role: r.role, country: r.country, zone: r.zone, interests: r.interests, pass: r.pass, passDay: r.pass_day || "",
+  // A purchase (pending to pay, paid, confirmed) also has its days, payment and tickets; paymentUrl
+  // is Espees' page while it's still to pay. The admin also sees each ticket's KingsPass outcome.
+  const shapeRegistration = (r, { admin = false } = {}) => ({
+    id: r.id, reference: r.reference, userId: r.user_id, title: r.title || "", firstName: r.first_name, lastName: r.last_name, email: r.email, phone: r.phone,
+    organisation: r.organisation, role: r.role, country: r.country, zone: r.zone, church: r.church || "", interests: r.interests, pass: r.pass, passDay: r.pass_day || "",
+    passDays: Array.isArray(r.pass_days) && r.pass_days.length ? r.pass_days : r.pass_day ? [r.pass_day] : [],
     passPrice: Number(r.pass_price) || 0, passCurrency: r.pass_currency || "", status: r.status, createdAt: r.created_at,
+    paymentStatus: r.payment_status || null, paymentUrl: r.status === "pending" && r.payment_ref ? `${ESPEES_PAY_URL}/${r.payment_ref}` : null, paidAt: r.paid_at || null, issuedAt: r.issued_at || null,
+    tickets: (r.tickets || []).map((t) => ({ ticketId: t.ticketId, day: t.day || "", status: t.status, ...(admin ? { attendeeId: t.attendeeId || null, error: t.error || null, at: t.at || null } : {}) })),
   });
 
   // passDay: the day of a one-day pass; passPrice / passCurrency: the price the website quoted.
@@ -1287,6 +1495,74 @@ module.exports = function loveworldExpoRoutes() {
   router.get("/expo/registrations", ...user, asyncHandler(async (req, res) => {
     const rows = await q(`SELECT * FROM registrations WHERE user_id = $1 ORDER BY created_at DESC`, [req.expoUserId]);
     ok(res, { registrations: rows.map(shapeRegistration) });
+  }));
+
+  /* ---- passes: bought with Espees, issued on KingsPass ----------------- */
+
+  // { pass, days: ["2026-11-10", …] (the day and 3-day passes), expectedPrice, returnUrl }. The
+  // ticket holder is the signed-in person, from their profile. Answers with the purchase (pending)
+  // and paymentUrl, Espees' page to pay on, which sends the person back to returnUrl?order=<id>
+  // (with &failed=1 when the payment didn't go through); 201 when the purchase is new.
+  router.post("/expo/passes/checkout", ...user, asyncHandler(async (req, res) => {
+    if (!passesOnSale()) return fail(res, 503, "not_on_sale", "Passes can't be bought online yet.");
+    const b = req.body || {};
+    const u = await q1(`SELECT * FROM users WHERE id = $1`, [req.expoUserId]);
+    if (!profileComplete(u)) return fail(res, 400, "profile_incomplete", "Complete your profile first: your ticket is issued in your name.");
+    const passId = clean(b.pass, 40);
+    const pass = Object.hasOwn(PASSES, passId) ? PASSES[passId] : null;
+    if (!pass || (pass.adminOnly && !u.is_admin)) return fail(res, 400, "bad_pass", "Pick one of the passes on sale.");
+    const days = pass.days ? [...new Set(Array.isArray(b.days) ? b.days.map((d) => clean(d, 10)) : [])].sort() : [];
+    if (pass.days && (days.length !== pass.days || !days.every(isEventDay) || !days.every((d) => KINGSPASS_DAY_TICKETS[d]))) {
+      return fail(res, 400, "bad_days", `Pick ${pass.days === 1 ? "a day" : `${pass.days} different days`} of the Expo (${EVENT.start} to ${EVENT.end}).`);
+    }
+    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, pass.price)) return fail(res, 409, "price_changed", `The ${pass.name} costs ${amountLabel(pass.price)}.`);
+    // The same pass bought again within a day while the last one is still to pay (a second click,
+    // or back from Espees' page): that purchase again, or, if it has been paid meanwhile, alreadyPaid.
+    const open = await q1(
+      `SELECT id FROM registrations WHERE user_id = $1 AND pass = $2 AND pass_days = $3::jsonb AND status = 'pending' AND payment_ref IS NOT NULL
+         AND COALESCE(payment_status, '') NOT IN ('DECLINE', 'MISMATCH') AND created_at > now() - interval '1 day' ORDER BY created_at DESC LIMIT 1`,
+      [u.id, passId, JSON.stringify(days)]);
+    if (open) {
+      const r = await settleRegistration(open.id);
+      if (r.status === "paid" || r.status === "confirmed") return ok(res, { registration: shapeRegistration(r), alreadyPaid: true });
+      if (r.status === "pending" && sameAmount(r.pass_price, pass.price) && !["DECLINE", "MISMATCH"].includes(r.payment_status)) {
+        return ok(res, { registration: shapeRegistration(r), paymentUrl: `${ESPEES_PAY_URL}/${r.payment_ref}` });
+      }
+    }
+    const back = /^https?:\/\//i.test(clean(b.returnUrl, 500)) ? clean(b.returnUrl, 500) : site("/attend/payment");
+    if (!back) return fail(res, 400, "missing_fields", "returnUrl is needed (EXPO_SITE_URL isn't set).");
+    const id = crypto.randomUUID();
+    const ref = reference("LWX");
+    const tickets = passTickets(passId, days).map((t) => ({ ...t, status: "to_issue" }));
+    await q(
+      `INSERT INTO registrations (id, reference, user_id, title, first_name, last_name, email, phone, organisation, role, country, zone, church, pass, pass_day, pass_days, pass_price, pass_currency, tickets, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'ESPEES', $18, 'pending')`,
+      [id, ref, u.id, u.title, u.first_name, u.last_name, u.email, u.phone, u.organisation || "", u.role || "", u.country, u.zone, u.church,
+        passId, days.length === 1 ? days[0] : "", JSON.stringify(days), pass.price, JSON.stringify(tickets)]);
+    const to = (extra) => `${back}${back.includes("?") ? "&" : "?"}order=${id}${extra}`;
+    let row;
+    try {
+      const paymentRef = await createEspeesProduct({
+        sku: ref, price: pass.price, successUrl: to(""), failUrl: to("&failed=1"), data: { registration: id, reference: ref, pass: passId },
+        narration: `LoveWorld Expo 2026 ${pass.name}${days.length ? ` (${days.map(dayLabel).join(", ")})` : ""} · ${ref}`,
+      });
+      row = await q1(`UPDATE registrations SET payment_ref = $2 WHERE id = $1 RETURNING *`, [id, paymentRef]);
+    } catch (err) {
+      console.error(`[expo] checkout ${ref}: ${err.message}`);
+      await q(`UPDATE registrations SET status = 'cancelled', payment_status = 'NOT_STARTED' WHERE id = $1`, [id]);
+      return fail(res, 502, "payment_unavailable", "Espees couldn't start the payment. Please try again in a moment.");
+    }
+    res.status(201);
+    ok(res, { registration: shapeRegistration(row), paymentUrl: `${ESPEES_PAY_URL}/${row.payment_ref}` });
+  }));
+
+  // The person's own purchase, brought up to date: the payment checked with Espees, the tickets
+  // issued once it's paid. checkError: Espees couldn't be asked this time.
+  router.post("/expo/passes/:id/confirm", ...user, asyncHandler(async (req, res) => {
+    const mine = isUuid(req.params.id) && (await q1(`SELECT id FROM registrations WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]));
+    if (!mine) return fail(res, 404, "not_found", "No such purchase.");
+    const r = await settleRegistration(mine.id);
+    ok(res, { registration: shapeRegistration(r), ...(r.checkError ? { checkError: "Espees couldn't be reached to check the payment. Try again in a moment." } : {}) });
   }));
 
   router.post("/expo/sponsor/enquiries", ...maybeUser, asyncHandler(async (req, res) => {
@@ -1488,7 +1764,15 @@ module.exports = function loveworldExpoRoutes() {
     const pass = clean(req.query.pass, 40);
     const status = clean(req.query.status, 20);
     const rows = await q(`SELECT * FROM registrations WHERE ($1 = '' OR pass = $1) AND ($2 = '' OR status = $2) ORDER BY created_at DESC LIMIT $3`, [pass, status, limit(req, 5000)]);
-    ok(res, { registrations: rows.map(shapeRegistration) });
+    ok(res, { registrations: rows.map((r) => shapeRegistration(r, { admin: true })) });
+  }));
+
+  // Any purchase brought up to date (as /expo/passes/:id/confirm): to retry tickets KingsPass refused.
+  router.post("/expo/admin/registrations/:id/settle", requireAdmin, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such registration.");
+    const r = await settleRegistration(req.params.id);
+    if (!r) return fail(res, 404, "not_found", "No such registration.");
+    ok(res, { registration: shapeRegistration(r, { admin: true }), ...(r.checkError ? { checkError: r.checkError } : {}) });
   }));
 
   router.get("/expo/admin/enquiries", requireAdmin, asyncHandler(async (req, res) => {

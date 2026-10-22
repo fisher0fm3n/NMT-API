@@ -27,6 +27,11 @@ exhibitors yet; `--seed` loads it again). Tests: `node --test test/loveworld_exp
 | `EXPO_START_DATE` (2026-11-09), `EXPO_END_DATE` (2026-11-15), `EXPO_UTC_OFFSET` (+01:00) | The event's days and clock |
 | `EXPO_MEETING_MINUTES` (20), `EXPO_DAY_START_HOUR` (10), `EXPO_DAY_END_HOUR` (17), `EXPO_LUNCH_HOUR` (13), `EXPO_MAX_BOOKINGS_PER_DAY` (6) | SmartMeet slots |
 | `EXPO_RESCHEDULE_CUTOFF_MINUTES` (15) | A visitor can move a meeting to another time until this many minutes before it starts |
+| `EXPO_ESPEES_API_KEY` | The Expo's Espees merchant API key: passes are paid in Espees. Without it (or the KingsPass settings below) checkout answers `503 not_on_sale` |
+| `EXPO_ESPEES_MERCHANT_WALLET` | The wallet passes are paid into (default `0xcd7b43d8652066e93298865afa19286b6a75f144`) |
+| `EXPO_KINGSPASS_URL` | The KingsPass server: `https://kingspass.org` (`https://kingspass.org/api/` works too). Tickets are added at `https://kingspass.org/api/public/attendees` |
+| `EXPO_KINGSPASS_EVENT_TOKEN` | The Expo event's KingsPass token, sent as `X-EVENT-TOKEN` |
+| `EXPO_ESPEES_PRODUCT_URL`, `EXPO_ESPEES_CONFIRM_URL`, `EXPO_ESPEES_PAY_URL` | Espees' product, confirm and payment-page addresses (defaults: `https://api.espees.org/v2/payment/product`, `…/v2/payment/confirm/`, `https://payment.espees.org/pay`); tests point them at stand-ins |
 
 ## Authentication
 
@@ -91,6 +96,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `DELETE /expo/smartmeet/bookings/:id { reason? }` | Cancels it (`status: "cancelled"`, `cancelledBy: "visitor"`, `cancelReason`); the slot is free again, and both sides get a KingsChat message |
 | `POST /expo/registrations { firstName, lastName, email, phone?, organisation?, role?, country?, zone?, interests?: [], pass?, passDay?, passPrice?, passCurrency? }` | 201 `{ reference "REG-…", id, createdAt, registration }`; signed in or not (signed in: the profile fields are kept on the account). `passDay` is the day of a one-day pass (an Expo day, else `bad_date`); `passPrice` / `passCurrency` are the price the website quoted from its own list. A free pass is `status: "confirmed"` at once, one with a price `"pending"` until the Expo team confirms it |
 | `GET /expo/registrations` | The signed-in person's registrations, newest first: `{ registrations: [{ id, reference, firstName, lastName, email, …, pass, passDay, passPrice, passCurrency, status, createdAt }] }` |
+| `POST /expo/passes/checkout { pass, days?: ["2026-11-10", …], expectedPrice?, returnUrl }` | Buys a pass for the signed-in person, whose profile must be complete (`profile_incomplete`): the ticket holder's details come from it. `pass`: `day` (10 Espees, one day), `three-day` (15, three different days), `week` (25), `vip` (100), `test` (0.001, admins only). Makes a product on Espees and answers 201 `{ registration, paymentUrl }`: send the person to `paymentUrl`; Espees sends them back to `returnUrl?order=<id>` (`&failed=1` when it didn't go through). The same pass bought again within a day while the last one is still to pay answers 200 with that purchase and its `paymentUrl`; if it was paid meanwhile, `{ registration, alreadyPaid: true }` (its tickets issued). `bad_pass`, `bad_days`, `price_changed` (409: `expectedPrice` isn't the pass's price), `payment_unavailable` (502), `not_on_sale` (503) |
+| `POST /expo/passes/:id/confirm` | The person's own purchase brought up to date: `{ registration, checkError? }`. Asks Espees about one still to pay (`pending`; APPROVED for its reference and full price makes it `paid`), then adds a paid one's tickets on KingsPass (all added: `confirmed`, and the buyer gets a KingsChat message). Safe to call again: a ticket is added once. A purchase has `passDays`, `paymentStatus` (Espees' last word: APPROVED, DECLINE, PENDING, NOT FOUND; MISMATCH when approved for another amount), `paymentUrl` (while pending), `paidAt`, `issuedAt` and `tickets: [{ ticketId, day, status: to_issue\|issued\|failed }]` |
 | `POST /expo/sponsor/enquiries { name, email, organisation, role?, interest?, programs?, message? }` | 201 `{ reference "SP-…", id, createdAt }` |
 | `POST /expo/programs/applications { program: eagles-nest\|qubators\|content-creative, name, email, organisation?, summary?, data?: {} }` | 201 `{ reference "EN-…" / "QB-…" / "CC-…", id, createdAt }` |
 | `GET /expo/programs/applications` | The signed-in person's applications |
@@ -121,11 +128,17 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /expo/admin/bookings?exhibitor=&date=&limit=` | Every booking |
 | `GET /expo/admin/notifications?booking=&limit=` | The KingsChat messages sent (booking messages and welcomes), newest first: `{ id, bookingId, reference, kind, user, recipientKcId, status: sent\|failed\|skipped, error, kcMessageId, body, createdAt, sentAt }` |
 | `GET /expo/admin/registrations?pass=&status=`, `/expo/admin/enquiries`, `/expo/admin/applications?program=&status=` | The forms, newest first |
+| `POST /expo/admin/registrations/:id/settle` | Any purchase brought up to date, as `/expo/passes/:id/confirm` (to retry tickets KingsPass refused). The admin's registrations also show each ticket's KingsPass `attendeeId`, `error` and `at` |
 | `POST /expo/admin/registrations/:id { status: pending\|confirmed\|cancelled }`, `POST /expo/admin/enquiries/:id { status: new\|contacted\|closed }`, `POST /expo/admin/applications/:id { status: submitted\|shortlisted\|accepted\|declined }` | Moves one along |
 
 `availability` on an exhibitor (all optional): `{ "dayStart": 10, "dayEnd": 17, "slotMinutes": 20, "closedDates": ["2026-11-09"], "blocked": ["2026-11-10T11:00:00"] }`.
 
 ## KingsChat messages
+
+**A pass bought.** When a purchase becomes `confirmed` (paid, and every ticket added on KingsPass),
+the buyer gets a KingsChat message: the pass, its reference, the days, the ticket holder, the amount
+paid, that the tickets are on KingsPass under their email, and links to My Expo and SmartMeet.
+Recorded in `notifications` with `kind: "pass:confirmed"`; sent once per purchase.
 
 **Welcome.** When someone signs in for the first time (the sign-in makes their account, and
 `POST /expo/auth/kingschat` answers `created: true`), they get a KingsChat welcome: what LoveWorld

@@ -43,6 +43,51 @@ const kingschat = http.createServer((req, res) => {
   });
 });
 
+// Espees' payment gateway: products made (espeesProducts), and what its confirm says of each
+// payment_ref (espeesPayments: { status, price?, sku? }; PENDING until set). espeesDown: it refuses.
+const espeesProducts = [];
+const espeesPayments = {};
+let espeesDown = false;
+const espees = http.createServer((req, res) => {
+  let body = "";
+  req.on("data", (c) => { body += c; });
+  req.on("end", () => {
+    res.setHeader("content-type", "application/json");
+    const json = JSON.parse(body || "{}");
+    if (req.url === "/product") {
+      if (espeesDown) { res.statusCode = 503; return res.end(JSON.stringify({ message: "Service unavailable" })); }
+      const ref = `payref${espeesProducts.length + 1}`;
+      espeesProducts.push({ ref, apiKey: req.headers["x-api-key"], body: json });
+      return res.end(JSON.stringify({ statusCode: 200, payment_ref: ref, message: "Successfully Done" }));
+    }
+    if (req.url === "/confirm") {
+      const product = espeesProducts.find((p) => p.ref === json.payment_ref);
+      if (!product) { res.statusCode = 404; return res.end(JSON.stringify({ transaction_status: "NOT FOUND" })); }
+      const pay = espeesPayments[product.ref] || { status: "PENDING" };
+      return res.end(JSON.stringify({ customer_username: "pastor_ade", product_sku: pay.sku ?? product.body.product_sku, narration: product.body.narration, price: pay.price ?? product.body.price, transaction_status: pay.status, status_details: "Done" }));
+    }
+    res.statusCode = 404; res.end("{}");
+  });
+});
+
+// KingsPass's add-attendee API: each attendee added (its form fields and the event token) is kept
+// in kingspass; a ticket id in kingspassRefuse is refused.
+const kingspass = [];
+const kingspassRefuse = new Set();
+const kingspassServer = http.createServer((req, res) => {
+  const chunks = [];
+  req.on("data", (c) => chunks.push(c));
+  req.on("end", async () => {
+    res.setHeader("content-type", "application/json");
+    if (req.url !== "/api/public/attendees" || req.method !== "POST") { res.statusCode = 404; return res.end("{}"); }
+    const form = await new Response(Buffer.concat(chunks), { headers: { "content-type": req.headers["content-type"] } }).formData();
+    const fields = Object.fromEntries(form);
+    if (kingspassRefuse.has(Number(fields.ticket_id))) { res.statusCode = 500; return res.end(JSON.stringify({ success: false, message: "Server error" })); }
+    kingspass.push({ token: req.headers["x-event-token"], fields });
+    return res.end(JSON.stringify({ success: true, attendee: { id: 9000 + kingspass.length } }));
+  });
+});
+
 /** Waits until the stand-in KingsChat has been sent `n` messages in all (they go in the background). */
 async function messagesSoFar(n) {
   for (let i = 0; i < 100 && kcMessages.length < n; i++) await new Promise((r) => setTimeout(r, 30));
@@ -60,12 +105,18 @@ const api = async (method, path, { body, token, headers = {} } = {}) => {
 
 test.before(async () => {
   await new Promise((r) => kingschat.listen(0, "127.0.0.1", r));
+  await new Promise((r) => espees.listen(0, "127.0.0.1", r));
+  await new Promise((r) => kingspassServer.listen(0, "127.0.0.1", r));
   const kc = `http://127.0.0.1:${kingschat.address().port}`;
+  const pay = `http://127.0.0.1:${espees.address().port}`;
   Object.assign(process.env, {
     EXPO_SKIP_ENV_FILE: "1", LOVEWORLD_EXPO_DATABASE_URL: DB_URL, EXPO_KC_CLIENT_ID: "test-client", EXPO_KC_TOKEN_URL: `${kc}/token`, EXPO_KC_PROFILE_URL: `${kc}/profile`,
     EXPO_API_KEY: "app-key", EXPO_ADMIN_KEY: "admin-key", EXPO_SITE_URL: "http://localhost:3000", EXPO_MAX_BOOKINGS_PER_DAY: "2",
     EXPO_KC_API_KEY: "kc-project-key", EXPO_KC_MESSAGES_URL: `${kc}/messages`,
+    EXPO_ESPEES_API_KEY: "esp-test-key", EXPO_ESPEES_PRODUCT_URL: `${pay}/product`, EXPO_ESPEES_CONFIRM_URL: `${pay}/confirm`, EXPO_ESPEES_PAY_URL: "https://pay.example/pay",
+    EXPO_KINGSPASS_URL: `http://127.0.0.1:${kingspassServer.address().port}`, EXPO_KINGSPASS_EVENT_TOKEN: "event-token",
   });
+  delete process.env.EXPO_ESPEES_MERCHANT_WALLET;
   delete process.env.EXPO_TOKEN_SECRET;
   routes = require("../routes/loveworld_expo");
   const express = require("express");
@@ -80,6 +131,8 @@ test.before(async () => {
 test.after(async () => {
   server.close();
   kingschat.close();
+  espees.close();
+  kingspassServer.close();
   await routes.pool.end();
   const admin = new Client({ connectionString: DB_URL.replace(/\/[^/?]+(\?|$)/, "/postgres$1") });
   await admin.connect();
@@ -649,4 +702,146 @@ test("admins delete an account and everything it made, but never the last admin"
   const last = await api("DELETE", `/expo/admin/users/${grace.id}`, { headers: admin });
   assert.equal(last.status, 409);
   assert.equal(last.json.error, "last_admin");
+});
+
+test("passes: paid in Espees, then each ticket issued on KingsPass and the buyer told, once", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const n0 = kcMessages.length;
+  const buy = (body, t = token) => api("POST", "/expo/passes/checkout", { token: t, body: { returnUrl: "http://localhost:3000/attend/payment", ...body } });
+  const confirm = (id, t = token) => api("POST", `/expo/passes/${id}/confirm`, { token: t });
+  const toldAbout = (ref) => kcMessages.slice(n0).filter((m) => m.message.body.text.body.includes(ref));
+
+  // What checkout refuses: the wrong number of days, days outside the Expo, a pass not on sale
+  // (the test pass is for admins), and a price the website shows differently.
+  assert.equal((await buy({ pass: "three-day", days: ["2026-11-10", "2026-11-11"] })).json.error, "bad_days");
+  assert.equal((await buy({ pass: "three-day", days: ["2026-11-10", "2026-11-10", "2026-11-11"] })).json.error, "bad_days");
+  assert.equal((await buy({ pass: "day", days: ["2026-12-01"] })).json.error, "bad_days");
+  assert.equal((await buy({ pass: "test" })).json.error, "bad_pass");
+  assert.equal((await buy({ pass: "toString" })).json.error, "bad_pass");
+  const stale = await buy({ pass: "week", expectedPrice: 30 });
+  assert.equal(stale.status, 409);
+  assert.equal(stale.json.error, "price_changed");
+  assert.equal(espeesProducts.length, 0);
+
+  // A 3-day pass: a product on Espees at its price, paid into the Expo's wallet, back to the site.
+  const r = await buy({ pass: "three-day", days: ["2026-11-12", "2026-11-10", "2026-11-11"], expectedPrice: 15 });
+  assert.equal(r.status, 201, JSON.stringify(r.json));
+  const reg = r.json.registration;
+  assert.equal(reg.status, "pending");
+  assert.deepEqual(reg.passDays, ["2026-11-10", "2026-11-11", "2026-11-12"]);
+  assert.equal(reg.passPrice, 15);
+  assert.deepEqual([reg.title, reg.firstName, reg.lastName, reg.church], ["Pastor", "Adewale", "Bello", "Christ Embassy Lekki"]);
+  const product = espeesProducts.at(-1);
+  assert.equal(product.apiKey, "esp-test-key");
+  assert.equal(product.body.product_sku, reg.reference);
+  assert.equal(product.body.price, 15);
+  assert.equal(product.body.merchant_wallet, "0xcd7b43d8652066e93298865afa19286b6a75f144");
+  assert.equal(product.body.success_url, `http://localhost:3000/attend/payment?order=${reg.id}`);
+  assert.equal(product.body.fail_url, `http://localhost:3000/attend/payment?order=${reg.id}&failed=1`);
+  assert.match(product.body.narration, /3-day pass \(Tue 10 Nov, Wed 11 Nov, Thu 12 Nov\)/);
+  assert.equal(r.json.paymentUrl, `https://pay.example/pay/${product.ref}`);
+  assert.equal(reg.paymentUrl, r.json.paymentUrl);
+
+  // Bought again before paying: the same purchase and payment page, no second product.
+  const again = await buy({ pass: "three-day", days: ["2026-11-10", "2026-11-11", "2026-11-12"], expectedPrice: 15 });
+  assert.equal(again.status, 200);
+  assert.equal(again.json.registration.id, reg.id);
+  assert.equal(again.json.paymentUrl, r.json.paymentUrl);
+  assert.equal(espeesProducts.length, 1);
+
+  // Not paid yet, then declined: still to pay, nothing issued. Nobody else can check it.
+  let c = await confirm(reg.id);
+  assert.equal(c.json.registration.status, "pending");
+  espeesPayments[product.ref] = { status: "DECLINE" };
+  c = await confirm(reg.id);
+  assert.equal(c.json.registration.status, "pending");
+  assert.equal(c.json.registration.paymentStatus, "DECLINE");
+  assert.equal(kingspass.length, 0);
+  const grace = (await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } })).json;
+  assert.equal((await confirm(reg.id, grace.accessToken)).status, 404);
+
+  // Paid on a second go: a ticket for each day, the holder's details and the event's token.
+  // KingsPass refuses one at first, so the purchase is paid but not yet confirmed.
+  espeesPayments[product.ref] = { status: "APPROVED" };
+  kingspassRefuse.add(2580);
+  c = await confirm(reg.id);
+  assert.equal(c.json.registration.status, "paid");
+  assert.equal(c.json.registration.paymentUrl, null);
+  assert.deepEqual(c.json.registration.tickets.map((t) => [t.day, t.ticketId, t.status]), [["2026-11-10", 2580, "failed"], ["2026-11-11", 2579, "issued"], ["2026-11-12", 2578, "issued"]]);
+  assert.deepEqual(kingspass.find((k) => k.fields.ticket_id === "2579"), {
+    token: "event-token",
+    fields: { title: "Pastor", firstname: "Adewale", lastname: "Bello", email: "ade@church.org", phone_number: "+2348000000000", country: "Nigeria", zone: reg.zone, church: "Christ Embassy Lekki", ticket_id: "2579" },
+  });
+  assert.equal(toldAbout(reg.reference).length, 0);
+
+  // Tried again: only the refused ticket goes again; confirmed, and the buyer told on KingsChat.
+  kingspassRefuse.clear();
+  const issued = kingspass.length;
+  c = await confirm(reg.id);
+  assert.equal(c.json.registration.status, "confirmed");
+  assert.equal(kingspass.length, issued + 1);
+  assert.equal(kingspass.at(-1).fields.ticket_id, "2580");
+  for (let i = 0; i < 100 && !toldAbout(reg.reference).length; i++) await new Promise((ok) => setTimeout(ok, 30));
+  const text = toldAbout(reg.reference)[0]?.message.body.text.body || "";
+  assert.match(text, /3-day pass is confirmed/);
+  assert.match(text, /Days: Tue 10 Nov, Wed 11 Nov, Thu 12 Nov/);
+  assert.match(text, /Paid: 15 Espees/);
+  assert.match(text, /3 tickets are on KingsPass, issued to ade@church\.org/);
+  // Bought again once paid: a new purchase (the last one is done).
+  const next = await buy({ pass: "three-day", days: ["2026-11-10", "2026-11-11", "2026-11-12"], expectedPrice: 15 });
+  assert.equal(next.status, 201);
+  assert.notEqual(next.json.registration.id, reg.id);
+  // And again: nothing more issued or sent.
+  c = await confirm(reg.id);
+  assert.equal(c.json.registration.status, "confirmed");
+  assert.equal(kingspass.length, issued + 1);
+  await new Promise((ok) => setTimeout(ok, 200));
+  assert.equal(toldAbout(reg.reference).length, 1);
+
+  // Approved, but not at this purchase's price: left to pay, nothing issued.
+  const week = (await buy({ pass: "week", expectedPrice: 25 })).json.registration;
+  espeesPayments[espeesProducts.at(-1).ref] = { status: "APPROVED", price: 0.001 };
+  c = await confirm(week.id);
+  assert.equal(c.json.registration.status, "pending");
+  assert.equal(c.json.registration.paymentStatus, "MISMATCH");
+  assert.deepEqual(c.json.registration.tickets.map((t) => [t.ticketId, t.status]), [[2574, "to_issue"]]);
+
+  // Paid on Espees but never checked (the person closed the page), then bought again: alreadyPaid,
+  // with its tickets issued, rather than a second payment.
+  espeesPayments[espeesProducts.find((p) => p.body.product_sku === next.json.registration.reference).ref] = { status: "APPROVED" };
+  const paidMeanwhile = await buy({ pass: "three-day", days: ["2026-11-10", "2026-11-11", "2026-11-12"], expectedPrice: 15 });
+  assert.equal(paidMeanwhile.json.alreadyPaid, true);
+  assert.equal(paidMeanwhile.json.registration.id, next.json.registration.id);
+  assert.equal(paidMeanwhile.json.registration.status, "confirmed");
+  assert.equal(paidMeanwhile.json.paymentUrl, undefined);
+
+  // Espees down: the purchase isn't left waiting to be paid.
+  espeesDown = true;
+  const down = await buy({ pass: "vip", expectedPrice: 100 });
+  espeesDown = false;
+  assert.equal(down.status, 502);
+  assert.equal(down.json.error, "payment_unavailable");
+
+  // The test pass: an admin with a complete profile, 0.001 Espees, KingsPass's test ticket.
+  assert.equal((await buy({ pass: "test" }, grace.accessToken)).json.error, "profile_incomplete");
+  await api("PATCH", "/expo/me", { token: grace.accessToken, body: { title: "Sis.", firstName: "Grace", lastName: "Okafor", phone: "+2348000000002", country: "Nigeria", zone: "Abuja Zone", church: "Christ Embassy Wuse" } });
+  const t = await buy({ pass: "test", expectedPrice: 0.001 }, grace.accessToken);
+  assert.equal(t.status, 201, JSON.stringify(t.json));
+  assert.equal(t.json.registration.passPrice, 0.001);
+  assert.equal(espeesProducts.at(-1).body.price, 0.001);
+  espeesPayments[espeesProducts.at(-1).ref] = { status: "APPROVED" };
+  // The admin can bring any purchase up to date, and sees KingsPass's attendee for each ticket.
+  const settled = await api("POST", `/expo/admin/registrations/${t.json.registration.id}/settle`, { headers: admin });
+  assert.equal(settled.status, 200, JSON.stringify(settled.json));
+  assert.equal(settled.json.registration.status, "confirmed");
+  assert.equal(kingspass.at(-1).fields.ticket_id, "2582");
+  assert.equal(kingspass.at(-1).fields.title, "Sis.");
+  assert.equal(settled.json.registration.tickets[0].attendeeId, String(9000 + kingspass.length));
+  const list = (await api("GET", "/expo/admin/registrations?pass=three-day", { headers: admin })).json.registrations;
+  assert.equal(list[0].tickets.length, 3);
+  assert.ok(list[0].tickets.every((x) => x.attendeeId));
+  // The person's own list doesn't carry KingsPass's details.
+  const mine = (await api("GET", "/expo/registrations", { token })).json.registrations.find((x) => x.id === reg.id);
+  assert.equal(mine.status, "confirmed");
+  assert.equal(mine.tickets[0].attendeeId, undefined);
 });
