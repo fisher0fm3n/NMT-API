@@ -79,9 +79,11 @@ const espees = http.createServer((req, res) => {
 const nextEspeesRef = () => `esp-ref-${espeesCharges.length + 1}`;
 
 // KingsPass's add-attendee API: each attendee added (its form fields and the event token) is kept
-// in kingspass; a ticket id in kingspassRefuse is refused.
+// in kingspass; a ticket id in kingspassRefuse is refused, and kingspassReply, when set, is the next
+// answer ({ status, body }) instead.
 const kingspass = [];
 const kingspassRefuse = new Set();
+let kingspassReply = null;
 const kingspassServer = http.createServer((req, res) => {
   const chunks = [];
   req.on("data", (c) => chunks.push(c));
@@ -90,6 +92,7 @@ const kingspassServer = http.createServer((req, res) => {
     if (req.url !== "/api/public/attendees" || req.method !== "POST") { res.statusCode = 404; return res.end("{}"); }
     const form = await new Response(Buffer.concat(chunks), { headers: { "content-type": req.headers["content-type"] } }).formData();
     const fields = Object.fromEntries(form);
+    if (kingspassReply) { const { status, body } = kingspassReply; kingspassReply = null; res.statusCode = status; return res.end(JSON.stringify(body)); }
     if (kingspassRefuse.has(Number(fields.ticket_id))) { res.statusCode = 500; return res.end(JSON.stringify({ success: false, message: "Server error" })); }
     kingspass.push({ token: req.headers["x-event-token"], fields });
     return res.end(JSON.stringify({ success: true, attendee: { id: 9000 + kingspass.length } }));
@@ -122,7 +125,7 @@ test.before(async () => {
     EXPO_API_KEY: "app-key", EXPO_ADMIN_KEY: "admin-key", EXPO_SITE_URL: "http://localhost:3000", EXPO_MAX_BOOKINGS_PER_DAY: "2",
     EXPO_KC_API_KEY: "kc-project-key", EXPO_KC_MESSAGES_URL: `${kc}/messages`,
     EXPO_ESPEES_API_TOKEN: "esp-test-token", EXPO_ESPEES_URL: pay,
-    EXPO_KINGSPASS_URL: `http://127.0.0.1:${kingspassServer.address().port}`, EXPO_KINGSPASS_EVENT_TOKEN: "event-token",
+    EXPO_KINGSPASS_URL: `http://127.0.0.1:${kingspassServer.address().port}`, EXPO_KINGSPASS_EVENT_TOKEN: "event-token", EXPO_KINGSPASS_TEST2_TICKET: "2599",
   });
   delete process.env.EXPO_TOKEN_SECRET;
   routes = require("../routes/loveworld_expo");
@@ -783,6 +786,7 @@ test("passes: charged to an Espees wallet or card, each ticket issued on KingsPa
   assert.equal(again.status, 409);
   assert.equal(again.json.error, "already_paid");
   // And again: nothing more issued, charged or sent. Nobody else can check it.
+  // (Further down: a refusal with field errors is recorded as KingsPass gave it.)
   c = await confirm(reg.id);
   assert.equal(c.json.registration.status, "confirmed");
   assert.equal(kingspass.length, issued + 1);
@@ -856,6 +860,24 @@ test("passes: charged to an Espees wallet or card, each ticket issued on KingsPa
   const testReg = (await confirm(t.json.registration.id, grace.accessToken)).json.registration;
   assert.deepEqual([testReg.status, testReg.passPrice], ["confirmed", 0.001]);
   assert.deepEqual([kingspass.at(-1).fields.ticket_id, kingspass.at(-1).fields.title], ["2582", "Sis."]);
+  // Test pass 2: the second test ticket, from its setting.
+  const t2 = await buy({ pass: "test-2", expectedPrice: 0.001, payment: { method: "wallet", username: "grace_o", pin: "0000" } }, grace.accessToken);
+  assert.equal(t2.status, 201, JSON.stringify(t2.json));
+  await settled();
+  assert.equal((await confirm(t2.json.registration.id, grace.accessToken)).json.registration.status, "confirmed");
+  assert.equal(kingspass.at(-1).fields.ticket_id, "2599");
+
+  // KingsPass refuses (its answer as it really comes): the reason is kept as it gave it, for the admin.
+  kingspassReply = { status: 400, body: { success: false, error: true, msg: { attend: "attendee already registered for this event" } } };
+  const fussy = await buy({ pass: "day", days: ["2026-11-09"], expectedPrice: 10 });
+  await settled();
+  const refused = (await api("GET", "/expo/admin/registrations?pass=day", { headers: admin })).json.registrations.find((x) => x.id === fussy.json.registration.id);
+  assert.equal(refused.status, "paid");
+  assert.equal(refused.tickets[0].error, "400 attend: attendee already registered for this event");
+  assert.match(refused.tickets[0].response, /"error":true/);
+  // Tried again once KingsPass accepts it: confirmed.
+  const fussyReg = (await api("POST", `/expo/admin/registrations/${fussy.json.registration.id}/settle`, { headers: admin })).json.registration;
+  assert.equal(fussyReg.status, "confirmed");
 
   // The admin sees each ticket's KingsPass attendee; the person's own list doesn't.
   const list = (await api("GET", "/expo/admin/registrations?pass=three-day", { headers: admin })).json.registrations;

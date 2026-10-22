@@ -106,8 +106,10 @@ const PASSES = {
   "three-day": { name: "3-day pass", price: 15, days: 3 },
   week: { name: "Week pass", price: 25, ticket: 2574 },
   vip: { name: "VIP pass", price: 100, ticket: 2573 },
-  // For trying a real purchase end to end, on KingsPass's test ticket: admins only.
+  // For trying a real purchase end to end, on KingsPass's test tickets ("Lw Expo Pass - Test" and
+  // "Lw Expo Pass - Test 2"): admins only. EXPO_KINGSPASS_TEST2_TICKET can point Test pass 2 elsewhere.
   test: { name: "Test pass", price: 0.001, ticket: 2582, adminOnly: true },
+  "test-2": { name: "Test pass 2", price: 0.001, ticket: Number(env("EXPO_KINGSPASS_TEST2_TICKET")) || 2593, adminOnly: true },
 };
 
 /* ---------------------------------------------------------------------------
@@ -1075,7 +1077,16 @@ async function espeesTransaction(reference) {
   return { done: String(d.status ?? "") === "1", status: String(d.status ?? ""), amount: d.espeesAmount ?? null, reference: d.reference ?? null };
 }
 
-/** One ticket on KingsPass for the purchase's holder: { status: "issued", attendeeId } or { status: "failed", error }. */
+/** KingsPass's reason for refusing an attendee: its message, its field errors ("phone_number: …"), or the answer itself. */
+function kingsPassReason(json, raw) {
+  for (const v of [json?.message, json?.msg, json?.error]) if (typeof v === "string" && v.trim()) return v.trim();
+  // KingsPass gives its reasons under msg ({ "msg": { "attend": "attendee already registered for this event" } }).
+  const fields = [json?.msg, json?.errors, json?.messages, json?.message].find((v) => v && typeof v === "object");
+  if (fields) return Object.entries(fields).map(([k, v]) => `${k}: ${[].concat(v).join(" ")}`).join("; ");
+  return raw.slice(0, 200);
+}
+
+/** One ticket on KingsPass for the purchase's holder: { status: "issued", attendeeId } or { status: "failed", error } (with KingsPass's answer). */
 async function addKingsPassAttendee(r, ticketId) {
   if (!KINGSPASS_URL || !KINGSPASS_EVENT_TOKEN) return { status: "failed", error: "KingsPass isn't set up (EXPO_KINGSPASS_URL, EXPO_KINGSPASS_EVENT_TOKEN)" };
   const form = new FormData();
@@ -1091,7 +1102,9 @@ async function addKingsPassAttendee(r, ticketId) {
   const raw = await resp.text().catch(() => "");
   const json = parseJson(raw);
   console.log(`[expo] KingsPass attendee (${r.reference}, ticket ${ticketId}) ← ${resp.status} ${payLog(raw)}`);
-  if (!resp.ok || json?.success === false || json?.status === false) return { status: "failed", error: `${resp.status} ${json?.message || json?.error || raw.slice(0, 200)}`.trim() };
+  if (!resp.ok || json?.success === false || json?.status === false || json?.error === true) {
+    return { status: "failed", error: `${resp.status} ${kingsPassReason(json, raw)}`.trim(), response: raw.slice(0, 500) };
+  }
   const a = json?.attendee ?? json?.data ?? json;
   return { status: "issued", attendeeId: a?.id != null ? String(a.id) : null, response: raw.slice(0, 500) };
 }
@@ -1489,7 +1502,7 @@ module.exports = function loveworldExpoRoutes() {
     passDays: Array.isArray(r.pass_days) && r.pass_days.length ? r.pass_days : r.pass_day ? [r.pass_day] : [],
     passPrice: Number(r.pass_price) || 0, passCurrency: r.pass_currency || "", status: r.status, createdAt: r.created_at,
     paymentStatus: r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null, paymentError: r.payment_error || null, paidAt: r.paid_at || null, issuedAt: r.issued_at || null,
-    tickets: (r.tickets || []).map((t) => ({ ticketId: t.ticketId, day: t.day || "", status: t.status, ...(admin ? { attendeeId: t.attendeeId || null, error: t.error || null, at: t.at || null } : {}) })),
+    tickets: (r.tickets || []).map((t) => ({ ticketId: t.ticketId, day: t.day || "", status: t.status, ...(admin ? { attendeeId: t.attendeeId || null, error: t.error || null, response: t.response || null, at: t.at || null } : {}) })),
   });
 
   // passDay: the day of a one-day pass; passPrice / passCurrency: the price the website quoted.
@@ -1542,6 +1555,7 @@ module.exports = function loveworldExpoRoutes() {
     const passId = clean(b.pass, 40);
     const pass = Object.hasOwn(PASSES, passId) ? PASSES[passId] : null;
     if (!pass || (pass.adminOnly && !u.is_admin)) return fail(res, 400, "bad_pass", "Pick one of the passes on sale.");
+    if (!pass.days && !pass.ticket) return fail(res, 503, "not_on_sale", `The ${pass.name} has no KingsPass ticket yet.`);
     const days = pass.days ? [...new Set(Array.isArray(b.days) ? b.days.map((d) => clean(d, 10)) : [])].sort() : [];
     if (pass.days && (days.length !== pass.days || !days.every(isEventDay) || !days.every((d) => KINGSPASS_DAY_TICKETS[d]))) {
       return fail(res, 400, "bad_days", `Pick ${pass.days === 1 ? "a day" : `${pass.days} different days`} of the Expo (${EVENT.start} to ${EVENT.end}).`);
