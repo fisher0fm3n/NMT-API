@@ -601,7 +601,8 @@ test("a new account is welcomed on KingsChat, once", async () => {
   assert.equal(welcome[0].bookingId, null);
   const text = welcome[0].body;
   assert.match(text, /^👋 Welcome to LoveWorld Expo 2026, Ade!/);
-  assert.match(text, /9–15 Nov 2026/);
+  assert.match(text, /9–15 Nov 2026\./);
+  assert.doesNotMatch(text, /IPPC/, "the Expo isn't described as held during IPPC");
   assert.match(text, /enterprise, health, agriculture, fashion & creativity, technology, manufacturing and investment/);
   assert.match(text, /SmartMeet/);
   assert.ok(text.includes("http://localhost:3000/smartmeet"));

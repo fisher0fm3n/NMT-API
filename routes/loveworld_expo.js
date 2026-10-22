@@ -983,7 +983,7 @@ function welcomeMessage(name) {
   return compose([
     `👋 Welcome to LoveWorld Expo 2026${first ? `, ${first}` : ""}!`,
     GAP,
-    `Where the world meets LoveWorld: seven days, ${dates}, during IPPC 2026.`,
+    `Where the world meets LoveWorld: seven days, ${dates}.`,
     GAP,
     "What's in store:",
     "• A sector in the spotlight each day: enterprise, health, agriculture, fashion & creativity, technology, manufacturing and investment",
