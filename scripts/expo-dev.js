@@ -21,5 +21,7 @@ app.listen(port, "127.0.0.1", (err) => {
     process.exit(1);
   }
   console.log(`LoveWorld Expo dev API on http://127.0.0.1:${port}/expo`);
+  const passes = routes.passesSetup();
+  console.log(`Passes: ${passes.onSale ? `on sale (KingsPass at ${passes.kingspass})` : `not on sale, missing ${passes.missing.join(", ")}`}${passes.debug ? ", logging every Espees and KingsPass request (EXPO_PAY_DEBUG)" : " (EXPO_PAY_DEBUG=1 logs every Espees and KingsPass request)"}`);
   console.log(`KingsChat messages: ${process.env.EXPO_KC_API_KEY || process.env.KINGSCHAT_API_KEY ? "on" : "off (no EXPO_KC_API_KEY, so sends are skipped)"}${["1", "true", "on"].includes(String(process.env.EXPO_KC_DEBUG || "").toLowerCase()) ? ", logging request bodies" : ""}`);
 });

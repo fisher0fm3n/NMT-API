@@ -60,19 +60,21 @@ const messagesOn = () => (env("EXPO_KC_MESSAGES") || "on").toLowerCase() !== "of
 // Every send is logged with KingsChat's answer; EXPO_KC_DEBUG=1 also logs the request body.
 const kcDebug = () => ["1", "true", "on"].includes(String(env("EXPO_KC_DEBUG") || "").toLowerCase());
 
-// Passes are paid in Espees: a product per purchase (EXPO_ESPEES_API_KEY), paid on Espees' own
-// page into the Expo's merchant wallet, then confirmed with Espees. Once paid, each ticket is
-// added on KingsPass (EXPO_KINGSPASS_URL, the KingsPass server, and the event's
-// EXPO_KINGSPASS_EVENT_TOKEN). Without all of these, checkout says passes aren't on sale.
-const ESPEES_API_KEY = env("EXPO_ESPEES_API_KEY") || "";
-const ESPEES_MERCHANT_WALLET = env("EXPO_ESPEES_MERCHANT_WALLET") || "0xcd7b43d8652066e93298865afa19286b6a75f144";
-const ESPEES_PRODUCT_URL = env("EXPO_ESPEES_PRODUCT_URL") || "https://api.espees.org/v2/payment/product";
-const ESPEES_CONFIRM_URL = env("EXPO_ESPEES_CONFIRM_URL") || "https://api.espees.org/v2/payment/confirm/";
-const ESPEES_PAY_URL = (env("EXPO_ESPEES_PAY_URL") || "https://payment.espees.org/pay").replace(/\/+$/, "");
+// Passes are paid in Espees, charged there and then to the buyer's Espees wallet (username and PIN)
+// or an Espees card (card number and PIN) with the Expo's merchant token (EXPO_ESPEES_API_TOKEN),
+// then confirmed with Espees. The PIN goes to Espees and nowhere else: it is never stored or logged.
+// Once paid, each ticket is added on KingsPass (EXPO_KINGSPASS_URL, the KingsPass server, and the
+// event's EXPO_KINGSPASS_EVENT_TOKEN). Without all of these, checkout says passes aren't on sale.
+const ESPEES_API_TOKEN = env("EXPO_ESPEES_API_TOKEN") || "";
+const ESPEES_URL = (env("EXPO_ESPEES_URL") || "https://web.espees.org/api/externalpayments").replace(/\/+$/, "");
 // The KingsPass server, with or without its /api (https://kingspass.org or https://kingspass.org/api/).
 const KINGSPASS_URL = (env("EXPO_KINGSPASS_URL") || "").replace(/\/+$/, "").replace(/\/api$/i, "");
 const KINGSPASS_EVENT_TOKEN = env("EXPO_KINGSPASS_EVENT_TOKEN") || "";
-const passesOnSale = () => !!(ESPEES_API_KEY && ESPEES_MERCHANT_WALLET && KINGSPASS_URL && KINGSPASS_EVENT_TOKEN);
+const passesOnSale = () => !!(ESPEES_API_TOKEN && KINGSPASS_URL && KINGSPASS_EVENT_TOKEN);
+// Every Espees and KingsPass answer is logged (its first 300 characters); EXPO_PAY_DEBUG=1 also
+// logs what was sent, and the answers in full. Keys, tokens, PINs and card numbers are never logged.
+const payDebug = () => ["1", "true", "on"].includes(String(env("EXPO_PAY_DEBUG") || "").toLowerCase());
+const payLog = (raw) => (payDebug() ? raw : raw.slice(0, 300));
 
 const ACCESS_TTL = Number(env("EXPO_ACCESS_TTL_SECONDS") || 3600);
 const REFRESH_DAYS = Number(env("EXPO_REFRESH_DAYS") || 90);
@@ -303,7 +305,12 @@ const SCHEMA = `
   ALTER TABLE registrations ADD COLUMN IF NOT EXISTS tickets JSONB NOT NULL DEFAULT '[]';
   ALTER TABLE registrations ADD COLUMN IF NOT EXISTS issued_at TIMESTAMPTZ;
   CREATE UNIQUE INDEX IF NOT EXISTS registrations_payment_ref ON registrations (payment_ref) WHERE payment_ref IS NOT NULL;
-  -- Prices to the thousandth of an Espee (the test pass is 0.001).
+  -- How it was paid (wallet or card), who paid (@username, or the card's last four digits; never a
+  -- PIN or the whole card number), and Espees' reason when it refused the payment.
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_method TEXT;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payer TEXT;
+  ALTER TABLE registrations ADD COLUMN IF NOT EXISTS payment_error TEXT;
+  -- Prices to four decimal places of an Espee (the test pass is 0.001).
   DO $$ BEGIN
     IF (SELECT numeric_scale FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'registrations' AND column_name = 'pass_price') < 4 THEN
       ALTER TABLE registrations ALTER COLUMN pass_price TYPE NUMERIC(14,4);
@@ -1012,40 +1019,60 @@ function passTickets(passId, days) {
   return pass.days ? days.map((day) => ({ ticketId: KINGSPASS_DAY_TICKETS[day], day })) : [{ ticketId: pass.ticket, day: "" }];
 }
 
-const espeesHeaders = () => ({ "Content-Type": "application/json", Accept: "application/json", "x-api-key": ESPEES_API_KEY });
 const sameAmount = (a, b) => Math.abs(Number(a) - Number(b)) < 1e-6;
 const amountLabel = (n) => `${Number(n).toLocaleString("en-GB", { maximumFractionDigits: 4 })} Espees`;
 const parseJson = (raw) => { try { return JSON.parse(raw); } catch { return null; } };
 
-/** A product on Espees for one purchase: its payment_ref, or throws. */
-async function createEspeesProduct({ sku, narration, price, successUrl, failUrl, data }) {
-  const resp = await fetch(ESPEES_PRODUCT_URL, {
-    method: "POST",
-    headers: espeesHeaders(),
-    body: JSON.stringify({ product_sku: sku, narration, price, merchant_wallet: ESPEES_MERCHANT_WALLET, success_url: successUrl, fail_url: failUrl, user_data: data }),
-    signal: AbortSignal.timeout(15000),
-  });
-  const raw = await resp.text().catch(() => "");
-  const json = parseJson(raw);
-  console.log(`[expo] Espees product ${sku} ← ${resp.status} ${raw.slice(0, 300)}`);
-  if (!resp.ok || !json?.payment_ref) throw new Error(`Espees answered ${resp.status} ${json?.message || raw.slice(0, 200)}`.trim());
-  return String(json.payment_ref);
-}
-
-/** What Espees says of a payment: { status (APPROVED, DECLINE, PENDING, NOT FOUND), sku, price } or { error }. */
-async function confirmEspees(paymentRef) {
+/** A call to Espees' payments API: { http, json, raw }, or { error, timedOut } when there was no answer. */
+async function espeesCall(path, body, label, timeoutMs = 30000) {
+  if (payDebug()) {
+    // What was sent, with the PIN and all but the card's last four digits hidden.
+    const shown = { ...body, ...(body.pin != null ? { pin: "****" } : {}), ...(body.cardNum != null ? { cardNum: `****${String(body.cardNum).slice(-4)}` } : {}) };
+    console.log(`[expo] Espees ${label} → POST ${ESPEES_URL}/${path} (API-TOKEN …${ESPEES_API_TOKEN.slice(-4)}) ${JSON.stringify(shown)}`);
+  }
   let resp;
   try {
-    resp = await fetch(ESPEES_CONFIRM_URL, { method: "POST", headers: espeesHeaders(), body: JSON.stringify({ payment_ref: paymentRef }), signal: AbortSignal.timeout(15000) });
+    resp = await fetch(`${ESPEES_URL}/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json", "API-TOKEN": ESPEES_API_TOKEN },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
   } catch (err) {
-    return { error: `unreachable: ${err.message}` };
+    // A timeout may come after Espees has taken the payment; a refused connection never does.
+    return { error: err.message, timedOut: err.name === "TimeoutError" };
   }
   const raw = await resp.text().catch(() => "");
-  const json = parseJson(raw);
-  console.log(`[expo] Espees confirm ${paymentRef} ← ${resp.status} ${raw.slice(0, 300)}`);
-  const status = String(json?.transaction_status || "").trim().toUpperCase();
-  if (!status) return { error: `${resp.status} ${json?.message || raw.slice(0, 200)}`.trim() };
-  return { status, sku: json.product_sku ?? null, price: json.price ?? null };
+  console.log(`[expo] Espees ${label} ← ${resp.status} ${payLog(raw)}`);
+  return { http: resp.status, json: parseJson(raw), raw };
+}
+
+/**
+ * Charges a purchase on Espees, from a wallet ({ method: "wallet", username, pin }) or a card
+ * ({ method: "card", cardNum, pin }): { reference } once Espees has taken it; { declined } with
+ * Espees' reason, or { unavailable }, when nothing was taken; { unknown } when it can't be told.
+ */
+async function chargeEspees(r, payment) {
+  const amount = Number(r.pass_price);
+  // A charge can take Espees a while (20 seconds and more): it gets a minute before it's "unknown".
+  const out = payment.method === "card"
+    ? await espeesCall("cardpayment", { cardNum: payment.cardNum, pin: payment.pin, amount: String(amount) }, `card payment ${r.reference}`, 60000)
+    : await espeesCall("makepayment", { username: payment.username, pin: payment.pin, espeesAmount: amount }, `wallet payment ${r.reference}`, 60000);
+  if (out.error) return out.timedOut ? { unknown: `no answer: ${out.error}` } : { unavailable: out.error };
+  const ref = out.json?.data?.reference ?? out.json?.reference;
+  if (out.json?.status === true && ref) return { reference: String(ref) };
+  if (out.json?.status === false) return { declined: clean(out.json.message || out.json.error || "Espees refused the payment.", 300) };
+  // Anything else (a server error, say) may or may not have taken the payment.
+  return { unknown: `${out.http} ${out.raw.slice(0, 200)}`.trim() };
+}
+
+/** What Espees says of a charge: { done (its status is "1"), amount, reference } or { error }. */
+async function espeesTransaction(reference) {
+  const out = await espeesCall("transactionstatus", { reference }, `transaction ${reference}`);
+  if (out.error) return { error: `no answer: ${out.error}` };
+  const d = out.json?.data;
+  if (out.json?.status !== true || !d) return { error: `${out.http} ${out.json?.message || out.raw.slice(0, 200)}`.trim() };
+  return { done: String(d.status ?? "") === "1", status: String(d.status ?? ""), amount: d.espeesAmount ?? null, reference: d.reference ?? null };
 }
 
 /** One ticket on KingsPass for the purchase's holder: { status: "issued", attendeeId } or { status: "failed", error }. */
@@ -1054,6 +1081,7 @@ async function addKingsPassAttendee(r, ticketId) {
   const form = new FormData();
   const fields = { title: r.title, firstname: r.first_name, lastname: r.last_name, email: r.email, phone_number: r.phone, country: r.country, zone: r.zone, church: r.church, ticket_id: String(ticketId) };
   for (const [k, v] of Object.entries(fields)) form.append(k, v ?? "");
+  if (payDebug()) console.log(`[expo] KingsPass attendee (${r.reference}, ticket ${ticketId}) → POST ${KINGSPASS_URL}/api/public/attendees ${JSON.stringify(fields)}`);
   let resp;
   try {
     resp = await fetch(`${KINGSPASS_URL}/api/public/attendees`, { method: "POST", headers: { "X-EVENT-TOKEN": KINGSPASS_EVENT_TOKEN, Accept: "application/json" }, body: form, signal: AbortSignal.timeout(20000) });
@@ -1062,7 +1090,7 @@ async function addKingsPassAttendee(r, ticketId) {
   }
   const raw = await resp.text().catch(() => "");
   const json = parseJson(raw);
-  console.log(`[expo] KingsPass attendee (${r.reference}, ticket ${ticketId}) ← ${resp.status} ${raw.slice(0, 300)}`);
+  console.log(`[expo] KingsPass attendee (${r.reference}, ticket ${ticketId}) ← ${resp.status} ${payLog(raw)}`);
   if (!resp.ok || json?.success === false || json?.status === false) return { status: "failed", error: `${resp.status} ${json?.message || json?.error || raw.slice(0, 200)}`.trim() };
   const a = json?.attendee ?? json?.data ?? json;
   return { status: "issued", attendeeId: a?.id != null ? String(a.id) : null, response: raw.slice(0, 500) };
@@ -1099,27 +1127,28 @@ async function issueTickets(id) {
 }
 
 /**
- * Brings a purchase up to date: asks Espees about one still to pay (approved, for this purchase
- * at its full price: "paid"), then issues a paid one's KingsPass tickets (all out: "confirmed",
- * and the buyer hears on KingsChat). Safe to call again, and at the same time. Returns the row,
- * with `checkError` when Espees couldn't be asked.
+ * Brings a purchase up to date: asks Espees about one it has charged but that isn't confirmed yet
+ * (done, for this purchase's reference and full price: "paid"), then issues a paid one's KingsPass
+ * tickets (all out: "confirmed", and the buyer hears on KingsChat). Safe to call again, and at the
+ * same time. Returns the row, with `checkError` when Espees couldn't be asked.
  */
 async function settleRegistration(id) {
   let r = await q1(`SELECT * FROM registrations WHERE id = $1`, [id]);
-  if (!r || !r.payment_ref) return r;
+  // Only a charge made through Espees' payments API (purchases from before it have no payment_method).
+  if (!r || !r.payment_ref || !r.payment_method) return r;
   if (r.status === "pending") {
-    const pay = await confirmEspees(r.payment_ref);
-    if (pay.error) {
-      console.error(`[expo] Espees confirm (${r.reference}) failed: ${pay.error}`);
-      return { ...r, checkError: pay.error };
+    const t = await espeesTransaction(r.payment_ref);
+    if (t.error) {
+      console.error(`[expo] Espees transaction (${r.reference}) not checked: ${t.error}`);
+      return { ...r, checkError: t.error };
     }
-    const matches = (pay.sku == null || String(pay.sku) === r.reference) && (pay.price == null || sameAmount(pay.price, r.pass_price));
-    if (pay.status === "APPROVED" && !matches) console.error(`[expo] Espees approved ${r.reference} for ${pay.sku} at ${pay.price}, not ${r.reference} at ${Number(r.pass_price)}: left pending`);
-    const paid = pay.status === "APPROVED" && matches;
+    const matches = (t.reference == null || String(t.reference) === r.payment_ref) && (t.amount == null || sameAmount(t.amount, r.pass_price));
+    if (t.done && !matches) console.error(`[expo] Espees transaction ${r.payment_ref} (${r.reference}) is for ${t.amount}, not ${Number(r.pass_price)}: left pending`);
+    const paid = t.done && matches;
     r = (await q1(
       `UPDATE registrations SET payment_status = $2, payment_checked_at = now(), status = CASE WHEN $3 AND status = 'pending' THEN 'paid' ELSE status END,
          paid_at = CASE WHEN $3 AND paid_at IS NULL THEN now() ELSE paid_at END WHERE id = $1 RETURNING *`,
-      [id, pay.status === "APPROVED" && !matches ? "MISMATCH" : pay.status, paid])) || r;
+      [id, paid ? "PAID" : t.done ? "MISMATCH" : "CHARGED", paid])) || r;
   }
   if (r.status === "paid") r = await issueTickets(id);
   return r;
@@ -1452,14 +1481,14 @@ module.exports = function loveworldExpoRoutes() {
   /* ---- forms ----------------------------------------------------------- */
 
   /** A registration as the person and the admin see it. */
-  // A purchase (pending to pay, paid, confirmed) also has its days, payment and tickets; paymentUrl
-  // is Espees' page while it's still to pay. The admin also sees each ticket's KingsPass outcome.
+  // A purchase (pending while Espees confirms it, paid, confirmed) also has its days, payment and
+  // tickets. The admin also sees each ticket's KingsPass outcome.
   const shapeRegistration = (r, { admin = false } = {}) => ({
     id: r.id, reference: r.reference, userId: r.user_id, title: r.title || "", firstName: r.first_name, lastName: r.last_name, email: r.email, phone: r.phone,
     organisation: r.organisation, role: r.role, country: r.country, zone: r.zone, church: r.church || "", interests: r.interests, pass: r.pass, passDay: r.pass_day || "",
     passDays: Array.isArray(r.pass_days) && r.pass_days.length ? r.pass_days : r.pass_day ? [r.pass_day] : [],
     passPrice: Number(r.pass_price) || 0, passCurrency: r.pass_currency || "", status: r.status, createdAt: r.created_at,
-    paymentStatus: r.payment_status || null, paymentUrl: r.status === "pending" && r.payment_ref ? `${ESPEES_PAY_URL}/${r.payment_ref}` : null, paidAt: r.paid_at || null, issuedAt: r.issued_at || null,
+    paymentStatus: r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null, paymentError: r.payment_error || null, paidAt: r.paid_at || null, issuedAt: r.issued_at || null,
     tickets: (r.tickets || []).map((t) => ({ ticketId: t.ticketId, day: t.day || "", status: t.status, ...(admin ? { attendeeId: t.attendeeId || null, error: t.error || null, at: t.at || null } : {}) })),
   });
 
@@ -1499,10 +1528,12 @@ module.exports = function loveworldExpoRoutes() {
 
   /* ---- passes: bought with Espees, issued on KingsPass ----------------- */
 
-  // { pass, days: ["2026-11-10", …] (the day and 3-day passes), expectedPrice, returnUrl }. The
-  // ticket holder is the signed-in person, from their profile. Answers with the purchase (pending)
-  // and paymentUrl, Espees' page to pay on, which sends the person back to returnUrl?order=<id>
-  // (with &failed=1 when the payment didn't go through); 201 when the purchase is new.
+  // { pass, days: ["2026-11-10", …] (the day and 3-day passes), expectedPrice, payment: { method:
+  // "wallet", username, pin } or { method: "card", cardNum, pin } }. The ticket holder is the
+  // signed-in person, from their profile. Espees is charged there and then (the PIN goes to Espees
+  // and is never kept), and the answer comes as soon as it has taken the payment: 201 { registration }
+  // (pending, CHARGED). The charge is then confirmed and the tickets issued in the background, as
+  // /expo/passes/:id/confirm also does (the website's payment page calls it).
   router.post("/expo/passes/checkout", ...user, asyncHandler(async (req, res) => {
     if (!passesOnSale()) return fail(res, 503, "not_on_sale", "Passes can't be bought online yet.");
     const b = req.body || {};
@@ -1516,44 +1547,68 @@ module.exports = function loveworldExpoRoutes() {
       return fail(res, 400, "bad_days", `Pick ${pass.days === 1 ? "a day" : `${pass.days} different days`} of the Expo (${EVENT.start} to ${EVENT.end}).`);
     }
     if (b.expectedPrice != null && !sameAmount(b.expectedPrice, pass.price)) return fail(res, 409, "price_changed", `The ${pass.name} costs ${amountLabel(pass.price)}.`);
-    // The same pass bought again within a day while the last one is still to pay (a second click,
-    // or back from Espees' page): that purchase again, or, if it has been paid meanwhile, alreadyPaid.
-    const open = await q1(
-      `SELECT id FROM registrations WHERE user_id = $1 AND pass = $2 AND pass_days = $3::jsonb AND status = 'pending' AND payment_ref IS NOT NULL
-         AND COALESCE(payment_status, '') NOT IN ('DECLINE', 'MISMATCH') AND created_at > now() - interval '1 day' ORDER BY created_at DESC LIMIT 1`,
-      [u.id, passId, JSON.stringify(days)]);
-    if (open) {
-      const r = await settleRegistration(open.id);
-      if (r.status === "paid" || r.status === "confirmed") return ok(res, { registration: shapeRegistration(r), alreadyPaid: true });
-      if (r.status === "pending" && sameAmount(r.pass_price, pass.price) && !["DECLINE", "MISMATCH"].includes(r.payment_status)) {
-        return ok(res, { registration: shapeRegistration(r), paymentUrl: `${ESPEES_PAY_URL}/${r.payment_ref}` });
-      }
+    const p = b.payment && typeof b.payment === "object" ? b.payment : {};
+    const method = p.method === "card" ? "card" : "wallet";
+    const pin = String(p.pin ?? "").trim().slice(0, 20);
+    const username = clean(p.username, 120).replace(/^@/, "");
+    const cardNum = String(p.cardNum ?? "").replace(/[\s-]/g, "").slice(0, 40);
+    if (!pin || (method === "wallet" ? !username : !/^\d{8,40}$/.test(cardNum))) {
+      return fail(res, 400, "missing_payment", method === "wallet" ? "Enter your Espees username and PIN." : "Enter your Espees card number and PIN.");
     }
-    const back = /^https?:\/\//i.test(clean(b.returnUrl, 500)) ? clean(b.returnUrl, 500) : site("/attend/payment");
-    if (!back) return fail(res, 400, "missing_fields", "returnUrl is needed (EXPO_SITE_URL isn't set).");
+
+    // One payment at a time for each person: the purchase is made, marked as with Espees, under a
+    // lock, so a second Pay while the first is still with Espees is refused rather than charged.
     const id = crypto.randomUUID();
     const ref = reference("LWX");
     const tickets = passTickets(passId, days).map((t) => ({ ...t, status: "to_issue" }));
-    await q(
-      `INSERT INTO registrations (id, reference, user_id, title, first_name, last_name, email, phone, organisation, role, country, zone, church, pass, pass_day, pass_days, pass_price, pass_currency, tickets, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'ESPEES', $18, 'pending')`,
-      [id, ref, u.id, u.title, u.first_name, u.last_name, u.email, u.phone, u.organisation || "", u.role || "", u.country, u.zone, u.church,
-        passId, days.length === 1 ? days[0] : "", JSON.stringify(days), pass.price, JSON.stringify(tickets)]);
-    const to = (extra) => `${back}${back.includes("?") ? "&" : "?"}order=${id}${extra}`;
-    let row;
+    const client = await pool.connect();
     try {
-      const paymentRef = await createEspeesProduct({
-        sku: ref, price: pass.price, successUrl: to(""), failUrl: to("&failed=1"), data: { registration: id, reference: ref, pass: passId },
-        narration: `LoveWorld Expo 2026 ${pass.name}${days.length ? ` (${days.map(dayLabel).join(", ")})` : ""} · ${ref}`,
-      });
-      row = await q1(`UPDATE registrations SET payment_ref = $2 WHERE id = $1 RETURNING *`, [id, paymentRef]);
+      await client.query("BEGIN");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-pay:${u.id}`]);
+      const busy = (await client.query(`SELECT 1 FROM registrations WHERE user_id = $1 AND status = 'pending' AND payment_status = 'PROCESSING' AND created_at > now() - interval '2 minutes'`, [u.id])).rowCount;
+      if (busy) {
+        await client.query("ROLLBACK");
+        return fail(res, 409, "payment_in_progress", "A payment of yours is already going through. Check My Expo in a moment.");
+      }
+      // The same pass, for the same days, paid (or possibly paid) in the last ten minutes: most likely
+      // the same purchase again after the page lost its answer, so it isn't charged a second time.
+      const recent = (await client.query(
+        `SELECT 1 FROM registrations WHERE user_id = $1 AND pass = $2 AND pass_days = $3::jsonb AND created_at > now() - interval '10 minutes'
+           AND (status IN ('paid', 'confirmed') OR payment_status IN ('CHARGED', 'UNKNOWN', 'MISMATCH'))`, [u.id, passId, JSON.stringify(days)])).rowCount;
+      if (recent) {
+        await client.query("ROLLBACK");
+        return fail(res, 409, "already_paid", `You paid for this ${pass.name} a few minutes ago, so you haven't been charged again. See it in My Expo.`);
+      }
+      await client.query(
+        `INSERT INTO registrations (id, reference, user_id, title, first_name, last_name, email, phone, organisation, role, country, zone, church, pass, pass_day, pass_days, pass_price, pass_currency, tickets, status,
+           payment_status, payment_method, payer)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'ESPEES', $18, 'pending', 'PROCESSING', $19, $20)`,
+        [id, ref, u.id, u.title, u.first_name, u.last_name, u.email, u.phone, u.organisation || "", u.role || "", u.country, u.zone, u.church,
+          passId, days.length === 1 ? days[0] : "", JSON.stringify(days), pass.price, JSON.stringify(tickets), method, method === "wallet" ? `@${username}` : `card ****${cardNum.slice(-4)}`]);
+      await client.query("COMMIT");
     } catch (err) {
-      console.error(`[expo] checkout ${ref}: ${err.message}`);
-      await q(`UPDATE registrations SET status = 'cancelled', payment_status = 'NOT_STARTED' WHERE id = $1`, [id]);
-      return fail(res, 502, "payment_unavailable", "Espees couldn't start the payment. Please try again in a moment.");
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
     }
+
+    const charge = await chargeEspees({ reference: ref, pass_price: pass.price }, { method, username, cardNum, pin });
+    if (charge.declined || charge.unavailable) {
+      await q(`UPDATE registrations SET status = 'cancelled', payment_status = 'DECLINED', payment_error = $2 WHERE id = $1`, [id, charge.declined || `unreachable: ${charge.unavailable}`]);
+      return charge.declined
+        ? fail(res, 402, "payment_declined", charge.declined)
+        : fail(res, 502, "payment_unavailable", "Espees couldn't be reached, so nothing was taken. Please try again in a moment.");
+    }
+    if (charge.unknown) {
+      console.error(`[expo] checkout ${ref}: can't tell whether Espees took the payment (${charge.unknown})`);
+      await q(`UPDATE registrations SET payment_status = 'UNKNOWN', payment_error = $2 WHERE id = $1`, [id, charge.unknown]);
+      return fail(res, 502, "payment_unknown", "We couldn't tell whether Espees took the payment. Please don't pay again: check My Expo in a few minutes, or message us on KingsChat.");
+    }
+    const r = await q1(`UPDATE registrations SET payment_ref = $2, payment_status = 'CHARGED' WHERE id = $1 RETURNING *`, [id, charge.reference]);
     res.status(201);
-    ok(res, { registration: shapeRegistration(row), paymentUrl: `${ESPEES_PAY_URL}/${row.payment_ref}` });
+    ok(res, { registration: shapeRegistration(r) });
+    setImmediate(() => settleRegistration(id).catch((err) => console.error(`[expo] settling ${ref}: ${err.message}`)));
   }));
 
   // The person's own purchase, brought up to date: the payment checked with Espees, the tickets
@@ -1805,6 +1860,8 @@ module.exports = function loveworldExpoRoutes() {
 };
 
 module.exports.ensureSchema = ensureSchema;
+/** Which pass settings are there (names only, never values), for the dev server's start-up line. */
+module.exports.passesSetup = () => ({ onSale: passesOnSale(), missing: [["EXPO_ESPEES_API_TOKEN", ESPEES_API_TOKEN], ["EXPO_KINGSPASS_URL", KINGSPASS_URL], ["EXPO_KINGSPASS_EVENT_TOKEN", KINGSPASS_EVENT_TOKEN]].filter(([, v]) => !v).map(([k]) => k), kingspass: KINGSPASS_URL, debug: payDebug() });
 module.exports.notifyBooking = notifyBooking;
 module.exports.pool = pool;
 module.exports.upsertExhibitor = upsertExhibitor;
