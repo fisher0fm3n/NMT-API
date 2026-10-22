@@ -1,5 +1,5 @@
 // routes/loveworld_expo.js
-// LoveWorld Expo (loveworldexpo.com): the account and booking service behind the Expo website.
+// LoveWorld Expo (loveworldnation.online): the account and booking service behind the Expo website.
 //
 // Model (database `loveworld_expo`, Postgres, made with its tables on first use)
 //   users               KingsChat identity, plus what the person tells the Expo about themselves;
