@@ -141,6 +141,30 @@ test("profile fields are kept on the account", async () => {
   assert.equal(badMail.status, 400);
 });
 
+test("the profile starts from KingsChat and is complete once every field is there", async () => {
+  // From the KingsChat sign-in: the name split in two, the email and the phone.
+  let me = (await api("GET", "/expo/me", { token })).json.user;
+  assert.equal(me.firstName, "Ade");
+  assert.equal(me.lastName, "Bello");
+  assert.equal(me.email, "ade@church.org");
+  assert.equal(me.phone, "+2348000000000");
+  assert.equal(me.profileComplete, false);
+  // The rest (country came in the last test), and a first name of the person's own choosing.
+  const r = await api("PATCH", "/expo/me", { token, body: { title: "Pastor", firstName: "Adewale", zone: "Lagos Zone 1", church: "Christ Embassy Lekki" } });
+  assert.equal(r.status, 200);
+  assert.equal(r.json.user.title, "Pastor");
+  assert.equal(r.json.user.church, "Christ Embassy Lekki");
+  assert.equal(r.json.user.profileComplete, true);
+  // Signing in again keeps what the person entered, and an emptied field makes the profile incomplete.
+  const again = await api("POST", "/expo/auth/kingschat", { body: { accessToken: "kc-good-code" } });
+  assert.equal(again.json.user.firstName, "Adewale");
+  token = again.json.accessToken;
+  me = (await api("PATCH", "/expo/me", { token, body: { church: "  " } })).json.user;
+  assert.equal(me.profileComplete, false);
+  me = (await api("PATCH", "/expo/me", { token, body: { church: "Christ Embassy Lekki" } })).json.user;
+  assert.equal(me.profileComplete, true);
+});
+
 test("exhibitors: admin makes them, everyone reads them", async () => {
   const noKey = await api("POST", "/expo/admin/exhibitors", { body: { name: "X" } });
   assert.equal(noKey.status, 401);

@@ -77,8 +77,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /expo/ping` | Alive; the number of accounts and exhibitors (no app key) |
 | `GET /expo/config` | `{ kingschat: { clientId, loginUrl, redirectUri }, event: { start, end, days, utcOffset, meetingMinutes, dayStart, dayEnd, lunchHour, maxBookingsPerDay } }` |
 | `POST /expo/auth/kingschat`, `/expo/auth/refresh`, `/expo/auth/logout` | Above |
-| `GET /expo/me` | `{ user, counts: { bookings, registrations, applications }, exhibitor: { id, name, stand, smartMeet } \| null }` (`exhibitor`: the one the account runs, when the admin has put it on a team) |
-| `PATCH /expo/me { email?, phone?, organisation?, role?, country?, zone? }` | `{ user }` |
+| `GET /expo/me` | `{ user, counts: { bookings, registrations, applications }, exhibitor: { id, name, stand, smartMeet } \| null }` (`exhibitor`: the one the account runs, when the admin has put it on a team). `user.profileComplete` is false until `title`, `firstName`, `lastName`, `email`, `phone`, `country`, `zone` and `church` are all filled in (first and last name start from KingsChat's); the website asks for them before anything else |
+| `PATCH /expo/me { title?, firstName?, lastName?, email?, phone?, country?, zone?, church?, organisation?, role? }` | `{ user }`: only the fields sent change |
 | `DELETE /expo/account` | The account and its bookings, for good |
 | `GET /expo/exhibitors?q=&category=&zone=&smartmeet=1` | `{ exhibitors: [{ id, name, category, zone, stand, tagline, description, smartMeet, featured, meetingTopics, logo, website }] }` (active ones, by `sort` then name) |
 | `GET /expo/exhibitors/:id` | `{ exhibitor }` |

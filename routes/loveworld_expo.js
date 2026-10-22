@@ -264,6 +264,12 @@ const SCHEMA = `
   -- The KingsChat user id messages are addressed to: the profile's own id (profile.id), which
   -- kc_id (an account's key, kcID when KingsChat gives one) need not be. Filled in at sign-in.
   ALTER TABLE users ADD COLUMN IF NOT EXISTS kc_user_id TEXT;
+  -- The profile a person completes after signing in (with email, phone, country and zone): the
+  -- website asks for it until every field is there. First and last name start from KingsChat's.
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS title TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT;
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS church TEXT;
   -- Who cancelled a booking (visitor, exhibitor or admin) and the reason they gave.
   ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_by TEXT;
   ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
@@ -436,12 +442,17 @@ function bearerToken(req) {
   return m ? m[1].trim() : (req.header("x-user-token") || "").trim() || null;
 }
 
-const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, exhibitor_id, is_admin, created_at, last_login_at FROM users`;
+const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, title, first_name, last_name, church, exhibitor_id, is_admin, created_at, last_login_at FROM users`;
+/** The fields a complete profile has: the website asks a signed-in person for them until all are there. */
+const PROFILE_REQUIRED = ["title", "first_name", "last_name", "email", "phone", "country", "zone", "church"];
+const profileComplete = (r) => PROFILE_REQUIRED.every((k) => String(r[k] ?? "").trim() !== "") && isEmail(r.email);
 function shapeUser(r) {
   if (!r) return null;
   return {
     id: r.id, kcId: r.kc_id, username: r.kc_username, name: r.kc_name, avatar: r.kc_avatar,
     email: r.email, phone: r.phone, organisation: r.organisation, role: r.role, country: r.country, zone: r.zone,
+    title: r.title || null, firstName: r.first_name || null, lastName: r.last_name || null, church: r.church || null,
+    profileComplete: profileComplete(r),
     exhibitorId: r.exhibitor_id || null, admin: !!r.is_admin, createdAt: r.created_at, lastLoginAt: r.last_login_at,
   };
 }
@@ -520,6 +531,13 @@ async function exchangeKcCode(code) {
   return accessToken ? { accessToken } : null;
 }
 
+/** First and last name: KingsChat's own fields when it gives them, else its full name split at the first space. */
+function splitName(first, last, full) {
+  if (first || last) return { first: first ? String(first) : null, last: last ? String(last) : null };
+  const parts = String(full || "").trim().split(/\s+/).filter(Boolean);
+  return { first: parts[0] || null, last: parts.slice(1).join(" ") || null };
+}
+
 /** The person's KingsChat profile, read as KingsPresenter reads it (every field name KingsChat has used). */
 async function fetchKcProfile(accessToken) {
   const headers = { Accept: "application/json", Authorization: `Bearer ${accessToken}`, ...(KC_API_KEY ? { "api-key": KC_API_KEY } : {}) };
@@ -538,6 +556,7 @@ async function fetchKcProfile(accessToken) {
   const phone = pick("phoneNumber", "phone_number", "phone");
   // profile.id: the id KingsChat's messages API addresses a person by.
   const kcUserId = p.id != null && p.id !== "" ? String(p.id) : u.id != null && u.id !== "" ? String(u.id) : null;
+  const names = splitName(pick("firstName", "first_name"), pick("lastName", "last_name"), pick("name"));
   return {
     kcId: kcIds[0] || null,
     kcIds,
@@ -547,6 +566,8 @@ async function fetchKcProfile(accessToken) {
     email: pick("emailAddress", "email"),
     phone: phone ? String(phone) : null,
     avatar: pick("profilePicture", "avatar", "displayPicture", "avatarUrl", "avatar_url", "picture"),
+    firstName: names.first,
+    lastName: names.last,
   };
 }
 
@@ -560,15 +581,16 @@ async function upsertKcUser(profile) {
     await q(
       `UPDATE users SET kc_id = COALESCE($2, kc_id), kc_username = COALESCE($3, kc_username), kc_name = COALESCE($4, kc_name),
               kc_avatar = COALESCE($5, kc_avatar), email = COALESCE(email, $6), phone = COALESCE(phone, $7), kc_user_id = COALESCE($8, kc_user_id),
+              first_name = COALESCE(NULLIF(first_name, ''), $9), last_name = COALESCE(NULLIF(last_name, ''), $10),
               updated_at = now(), last_login_at = now()
        WHERE id = $1`,
-      [row.id, profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null],
+      [row.id, profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null, profile.firstName || null, profile.lastName || null],
     );
   } else {
     row = await q1(
-      `INSERT INTO users (id, kc_id, kc_username, kc_name, kc_avatar, email, phone, kc_user_id, last_login_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) RETURNING id`,
-      [crypto.randomUUID(), profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null],
+      `INSERT INTO users (id, kc_id, kc_username, kc_name, kc_avatar, email, phone, kc_user_id, first_name, last_name, last_login_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now()) RETURNING id`,
+      [crypto.randomUUID(), profile.kcId, username, profile.name, profile.avatar, profile.email, profile.phone, profile.kcUserId || null, profile.firstName || null, profile.lastName || null],
     );
     return { id: row.id, created: true };
   }
@@ -1003,16 +1025,23 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { user: u, counts, exhibitor: await exhibitorOf(u.id) });
   }));
 
+  // The profile: any of these fields (a field left out is kept), each trimmed to its length.
+  const PROFILE_FIELDS = {
+    title: ["title", 40], firstName: ["first_name", 80], lastName: ["last_name", 80], email: ["email", 200], phone: ["phone", 40],
+    country: ["country", 80], zone: ["zone", 120], church: ["church", 200], organisation: ["organisation", 200], role: ["role", 80],
+  };
   router.patch("/expo/me", ...user, asyncHandler(async (req, res) => {
     const b = req.body || {};
-    const email = b.email !== undefined ? clean(b.email, 200) : undefined;
-    if (email !== undefined && email && !isEmail(email)) return fail(res, 400, "invalid_email", "That email address does not look right.");
-    await q(
-      `UPDATE users SET email = COALESCE($2, email), phone = COALESCE($3, phone), organisation = COALESCE($4, organisation),
-              role = COALESCE($5, role), country = COALESCE($6, country), zone = COALESCE($7, zone), updated_at = now() WHERE id = $1`,
-      [req.expoUserId, email, b.phone !== undefined ? clean(b.phone, 40) : undefined, b.organisation !== undefined ? clean(b.organisation, 200) : undefined,
-        b.role !== undefined ? clean(b.role, 80) : undefined, b.country !== undefined ? clean(b.country, 80) : undefined, b.zone !== undefined ? clean(b.zone, 120) : undefined].map((v) => (v === undefined ? null : v)),
-    );
+    const vals = [req.expoUserId];
+    const sets = [];
+    for (const [key, [col, max]] of Object.entries(PROFILE_FIELDS)) {
+      if (b[key] === undefined) continue;
+      vals.push(clean(b[key], max));
+      sets.push(`${col} = $${vals.length}`);
+    }
+    const email = b.email !== undefined ? clean(b.email, 200) : "";
+    if (email && !isEmail(email)) return fail(res, 400, "invalid_email", "That email address does not look right.");
+    if (sets.length) await q(`UPDATE users SET ${sets.join(", ")}, updated_at = now() WHERE id = $1`, vals);
     ok(res, { user: await getUserById(req.expoUserId) });
   }));
 
@@ -1316,11 +1345,11 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { stats: row });
   }));
 
-  // ?q= searches name, username and email; ?exhibitor= is one exhibitor's team.
+  // ?q= searches name (KingsChat's and the profile's), username and email; ?exhibitor= is one exhibitor's team.
   router.get("/expo/admin/users", requireAdmin, asyncHandler(async (req, res) => {
     const needle = clean(req.query.q, 100).toLowerCase();
     const exhibitor = clean(req.query.exhibitor, 80);
-    const rows = await q(`${ADMIN_USER_SELECT} WHERE ($1 = '' OR lower(coalesce(u.kc_username,'') || ' ' || coalesce(u.kc_name,'') || ' ' || coalesce(u.email,'')) LIKE '%' || $1 || '%')
+    const rows = await q(`${ADMIN_USER_SELECT} WHERE ($1 = '' OR lower(coalesce(u.kc_username,'') || ' ' || coalesce(u.kc_name,'') || ' ' || coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'') || ' ' || coalesce(u.email,'')) LIKE '%' || $1 || '%')
        AND ($2 = '' OR u.exhibitor_id = $2) ORDER BY u.created_at DESC LIMIT $3`, [needle, exhibitor, limit(req)]);
     ok(res, { users: rows.map(shapeAdminUser) });
   }));
