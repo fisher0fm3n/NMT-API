@@ -349,6 +349,15 @@ const SCHEMA = `
     sent_at TIMESTAMPTZ
   );
   CREATE INDEX IF NOT EXISTS notifications_booking ON notifications (booking_id, created_at);
+
+  -- Page views, counted by the website: the page's address and the day (on the event's clock), and
+  -- nothing about who viewed it.
+  CREATE TABLE IF NOT EXISTS page_views (
+    day DATE NOT NULL,
+    path TEXT NOT NULL,
+    views INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, path)
+  );
 `;
 
 let schemaReady = null;
@@ -1651,6 +1660,26 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { reference: ref, id: row.id, createdAt: row.created_at });
   }));
 
+  // A page view from the website: only a tidy page address is counted ("/programme/eagles-nest",
+  // never a query or anything typed in), and at most PAGE_VIEW_PATHS different pages a day, so the
+  // table can't be flooded. The site sends it with the app key; nothing about the visitor is kept.
+  const PAGE_VIEW_PATHS = 300;
+  router.post("/expo/views", requireAppKey, asyncHandler(async (req, res) => {
+    const raw = clean(req.body?.path, 200).split(/[?#]/)[0];
+    const path = raw.replace(/\/+$/, "") || (raw ? "/" : "");
+    if (path !== "/" && !/^\/[a-z0-9-]+(\/[a-z0-9-]+){0,3}$/.test(path)) return fail(res, 400, "bad_path", "That isn't a page on the site.");
+    // The admin area, the site's own endpoints and the steps of signing in aren't pages people visit.
+    if (/^\/(admin|api|auth)(\/|$)/.test(path)) return fail(res, 400, "bad_path", "Those pages aren't counted.");
+    const day = localTime(new Date()).slice(0, 10);
+    const row = await q1(
+      `INSERT INTO page_views (day, path, views)
+       SELECT $1::date, $2::text, 1 WHERE EXISTS (SELECT 1 FROM page_views WHERE day = $1::date AND path = $2::text) OR (SELECT count(*) FROM page_views WHERE day = $1::date) < $3::int
+       ON CONFLICT (day, path) DO UPDATE SET views = page_views.views + 1 RETURNING views`,
+      [day, path, PAGE_VIEW_PATHS],
+    );
+    ok(res, { counted: !!row });
+  }));
+
   const PROGRAMS = new Set(["eagles-nest", "qubators", "content-creative"]);
   router.post("/expo/programs/applications", ...maybeUser, asyncHandler(async (req, res) => {
     const b = req.body || {};
@@ -1688,6 +1717,29 @@ module.exports = function loveworldExpoRoutes() {
       (SELECT count(*)::int FROM bookings WHERE status = 'confirmed') AS bookings, (SELECT count(*)::int FROM registrations) AS registrations,
       (SELECT count(*)::int FROM sponsor_enquiries) AS enquiries, (SELECT count(*)::int FROM program_applications) AS applications`);
     ok(res, { stats: row });
+  }));
+
+  // Page views over the last ?days= days (30 by default, up to a year), to today on the event's clock:
+  // each day's total (days with none included), each page's total, and the total since counting began.
+  router.get("/expo/admin/page-views", requireAdmin, asyncHandler(async (req, res) => {
+    const span = Math.min(366, Math.max(1, Math.floor(Number(req.query.days)) || 30));
+    const to = localTime(new Date()).slice(0, 10);
+    const from = new Date(Date.parse(`${to}T00:00:00Z`) - (span - 1) * 86_400_000).toISOString().slice(0, 10);
+    const rows = await q(`SELECT day::text AS day, path, views FROM page_views WHERE day BETWEEN $1::date AND $2::date`, [from, to]);
+    const all = await q1(`SELECT coalesce(sum(views), 0)::int AS views, min(day)::text AS since FROM page_views`);
+    const byDay = new Map();
+    const byPath = new Map();
+    for (const r of rows) {
+      byDay.set(r.day, (byDay.get(r.day) || 0) + r.views);
+      byPath.set(r.path, (byPath.get(r.path) || 0) + r.views);
+    }
+    const days = [];
+    for (let t = Date.parse(`${from}T00:00:00Z`); t <= Date.parse(`${to}T00:00:00Z`); t += 86_400_000) {
+      const day = new Date(t).toISOString().slice(0, 10);
+      days.push({ day, views: byDay.get(day) || 0 });
+    }
+    const pages = [...byPath].map(([path, views]) => ({ path, views })).sort((a, b) => b.views - a.views || a.path.localeCompare(b.path));
+    ok(res, { from, to, total: days.reduce((n, d) => n + d.views, 0), days, pages, allTime: { views: all.views, since: all.since } });
   }));
 
   // ?q= searches name (KingsChat's and the profile's), username and email; ?exhibitor= is one exhibitor's team.

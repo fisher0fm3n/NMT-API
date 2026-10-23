@@ -103,6 +103,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `POST /expo/sponsor/enquiries { name, email, organisation, role?, interest?, programs?, message? }` | 201 `{ reference "SP-…", id, createdAt }` |
 | `POST /expo/programs/applications { program: eagles-nest\|qubators\|content-creative, name, email, organisation?, summary?, data?: {} }` | 201 `{ reference "EN-…" / "QB-…" / "CC-…", id, createdAt }` |
 | `GET /expo/programs/applications` | The signed-in person's applications |
+| `POST /expo/views { path }` | Counts a page view (the website sends one as each page is shown): `{ counted }`. Only the page and the day, on the event's clock, are kept, never anything about the visitor. A tidy page address only (`/`, `/programme/eagles-nest`: lowercase letters, digits and hyphens, up to four parts; a query or `#` is dropped), never `/admin`, `/api` or `/auth` (400 `bad_path`); after 300 different pages in a day, new ones aren't counted (`counted: false`). Needs the app key |
 
 ### An exhibitor's team (signed in; the account is on the team, see admin below)
 
@@ -118,6 +119,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | Call | |
 | --- | --- |
 | `GET /expo/admin/stats` | Counts of users, exhibitors, bookings, registrations, enquiries, applications |
+| `GET /expo/admin/page-views?days=` | Page views over the last `days` (30 by default, up to 366) to today: `{ from, to, total, days: [{ day, views }] (every day, none as 0), pages: [{ path, views }] (most viewed first), allTime: { views, since } }` |
 | `GET /expo/admin/users?q=&exhibitor=&limit=` | Accounts, each with `exhibitor: { id, name } \| null` and `admin`; `exhibitor=` is one exhibitor's team |
 | `POST /expo/admin/users/:id { disabled?, reason?, admin? }` | `disabled` disables (signs out) or restores the account; `admin` grants or takes away the website's admin area (the last admin cannot be taken away: `last_admin`). `{ user, disabled, admin }` |
 | `POST /expo/admin/users/:id/exhibitor { exhibitorId }` | Puts the account on that exhibitor's team (it then runs the exhibitor at `/expo/exhibitor`); `exhibitorId: null` takes it off. `{ user }` |

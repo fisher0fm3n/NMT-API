@@ -886,3 +886,37 @@ test("passes: charged to an Espees wallet or card, each ticket issued on KingsPa
   const mine = (await api("GET", "/expo/registrations", { token })).json.registrations.find((x) => x.id === reg.id);
   assert.equal(mine.tickets[0].attendeeId, undefined);
 });
+
+test("page views: only the page and the day, tidy pages only, at most 300 pages a day; totals for the admin", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  for (const path of ["/", "/about", "/about/", "/about?ref=kingschat#vision", "/programme/eagles-nest"]) {
+    const r = await api("POST", "/expo/views", { body: { path } });
+    assert.equal(r.status, 200, path);
+    assert.equal(r.json.counted, true, path);
+  }
+  for (const path of ["", "about", "/About", "/admin", "/admin/users", "/api/views", "/auth/kingschat/continue", "/a/b/c/d/e", "/<script>", "/x y", "/a//b"]) {
+    assert.equal((await api("POST", "/expo/views", { body: { path } })).status, 400, `refused: ${JSON.stringify(path)}`);
+  }
+  // Only from the website (the app key).
+  const bare = await fetch(`${base}/expo/views`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ path: "/" }) });
+  assert.equal(bare.status, 401);
+
+  const stats = (await api("GET", "/expo/admin/page-views?days=7", { headers: admin })).json;
+  assert.equal(stats.days.length, 7);
+  assert.equal(stats.days.at(-1).day, stats.to);
+  assert.equal(stats.days.at(-1).views, 5);
+  assert.equal(stats.total, 5);
+  assert.deepEqual(stats.pages, [{ path: "/about", views: 3 }, { path: "/", views: 1 }, { path: "/programme/eagles-nest", views: 1 }]);
+  assert.equal(stats.allTime.views, 5);
+  assert.equal(stats.allTime.since, stats.to);
+  assert.equal((await api("GET", "/expo/admin/page-views")).status, 401, "admins only");
+
+  // A flood of made-up pages stops at 300 a day; pages already counted still count.
+  for (let i = 0; i < 297; i++) await api("POST", "/expo/views", { body: { path: `/flood-${i}` } });
+  assert.equal((await api("POST", "/expo/views", { body: { path: "/one-too-many" } })).json.counted, false);
+  assert.equal((await api("POST", "/expo/views", { body: { path: "/about" } })).json.counted, true);
+  const after = (await api("GET", "/expo/admin/page-views?days=1", { headers: admin })).json;
+  assert.equal(after.pages.length, 300);
+  assert.equal(after.pages[0].path, "/about");
+  assert.equal(after.pages[0].views, 4);
+});
