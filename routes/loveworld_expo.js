@@ -328,6 +328,9 @@ const SCHEMA = `
   ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS church TEXT;
+  -- Whether the person is a member of Christ Embassy, asked with the profile: zone and church are
+  -- asked of members only. Null for accounts made before the question (see membership()).
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS christ_embassy BOOLEAN;
   -- Who cancelled a booking (visitor, exhibitor or admin) and the reason they gave.
   ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancelled_by TEXT;
   ALTER TABLE bookings ADD COLUMN IF NOT EXISTS cancel_reason TEXT;
@@ -509,17 +512,29 @@ function bearerToken(req) {
   return m ? m[1].trim() : (req.header("x-user-token") || "").trim() || null;
 }
 
-const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, title, first_name, last_name, church, exhibitor_id, is_admin, created_at, last_login_at FROM users`;
-/** The fields a complete profile has: the website asks a signed-in person for them until all are there. */
-const PROFILE_REQUIRED = ["title", "first_name", "last_name", "email", "phone", "country", "zone", "church"];
-const profileComplete = (r) => PROFILE_REQUIRED.every((k) => String(r[k] ?? "").trim() !== "") && isEmail(r.email);
+const USER_SELECT = `SELECT id, kc_id, kc_username, kc_name, kc_avatar, email, phone, organisation, role, country, zone, title, first_name, last_name, church, christ_embassy, exhibitor_id, is_admin, created_at, last_login_at FROM users`;
+const filled = (v) => String(v ?? "").trim() !== "";
+/**
+ * Whether the person is a member of Christ Embassy: their answer, or, for an account made before the
+ * question was asked, yes if they gave a zone and church then (every profile had to), else unknown.
+ */
+const membership = (r) => (typeof r.christ_embassy === "boolean" ? r.christ_embassy : filled(r.zone) && filled(r.church) ? true : null);
+/**
+ * A complete profile, which the website asks a signed-in person for until it is: these fields, the
+ * answer to whether they're a member of Christ Embassy, and, for members, their zone and church.
+ */
+const PROFILE_REQUIRED = ["title", "first_name", "last_name", "email", "phone", "country"];
+const profileComplete = (r) => {
+  const member = membership(r);
+  return PROFILE_REQUIRED.every((k) => filled(r[k])) && isEmail(r.email) && member !== null && (!member || (filled(r.zone) && filled(r.church)));
+};
 function shapeUser(r) {
   if (!r) return null;
   return {
     id: r.id, kcId: r.kc_id, username: r.kc_username, name: r.kc_name, avatar: r.kc_avatar,
     email: r.email, phone: r.phone, organisation: r.organisation, role: r.role, country: r.country, zone: r.zone,
     title: r.title || null, firstName: r.first_name || null, lastName: r.last_name || null, church: r.church || null,
-    profileComplete: profileComplete(r),
+    christEmbassy: membership(r), profileComplete: profileComplete(r),
     exhibitorId: r.exhibitor_id || null, admin: !!r.is_admin, createdAt: r.created_at, lastLoginAt: r.last_login_at,
   };
 }
@@ -1095,11 +1110,19 @@ function kingsPassReason(json, raw) {
   return raw.slice(0, 200);
 }
 
+// KingsPass needs a zone and a church for every attendee; someone who isn't a member of Christ Embassy
+// gives neither, so these go in their place (on KingsPass only: the person's profile stays as it is).
+const KINGSPASS_NO_ZONE = "lwexpo";
+const KINGSPASS_NO_CHURCH = "lwexpo delegate";
+
 /** One ticket on KingsPass for the purchase's holder: { status: "issued", attendeeId } or { status: "failed", error } (with KingsPass's answer). */
 async function addKingsPassAttendee(r, ticketId) {
   if (!KINGSPASS_URL || !KINGSPASS_EVENT_TOKEN) return { status: "failed", error: "KingsPass isn't set up (EXPO_KINGSPASS_URL, EXPO_KINGSPASS_EVENT_TOKEN)" };
   const form = new FormData();
-  const fields = { title: r.title, firstname: r.first_name, lastname: r.last_name, email: r.email, phone_number: r.phone, country: r.country, zone: r.zone, church: r.church, ticket_id: String(ticketId) };
+  const fields = {
+    title: r.title, firstname: r.first_name, lastname: r.last_name, email: r.email, phone_number: r.phone, country: r.country,
+    zone: filled(r.zone) ? r.zone : KINGSPASS_NO_ZONE, church: filled(r.church) ? r.church : KINGSPASS_NO_CHURCH, ticket_id: String(ticketId),
+  };
   for (const [k, v] of Object.entries(fields)) form.append(k, v ?? "");
   if (payDebug()) console.log(`[expo] KingsPass attendee (${r.reference}, ticket ${ticketId}) → POST ${KINGSPASS_URL}/api/public/attendees ${JSON.stringify(fields)}`);
   let resp;
@@ -1279,7 +1302,8 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { user: u, counts, exhibitor: await exhibitorOf(u.id) });
   }));
 
-  // The profile: any of these fields (a field left out is kept), each trimmed to its length.
+  // The profile: any of these fields (a field left out is kept), each trimmed to its length, and
+  // christEmbassy (true or false): whether they're a member, so asked for their zone and church.
   const PROFILE_FIELDS = {
     title: ["title", 40], firstName: ["first_name", 80], lastName: ["last_name", 80], email: ["email", 200], phone: ["phone", 40],
     country: ["country", 80], zone: ["zone", 120], church: ["church", 200], organisation: ["organisation", 200], role: ["role", 80],
@@ -1292,6 +1316,11 @@ module.exports = function loveworldExpoRoutes() {
       if (b[key] === undefined) continue;
       vals.push(clean(b[key], max));
       sets.push(`${col} = $${vals.length}`);
+    }
+    if (b.christEmbassy !== undefined) {
+      if (typeof b.christEmbassy !== "boolean") return fail(res, 400, "bad_membership", "Say whether you're a member of Christ Embassy.");
+      vals.push(b.christEmbassy);
+      sets.push(`christ_embassy = $${vals.length}`);
     }
     const email = b.email !== undefined ? clean(b.email, 200) : "";
     if (email && !isEmail(email)) return fail(res, 400, "invalid_email", "That email address does not look right.");
@@ -1606,7 +1635,7 @@ module.exports = function loveworldExpoRoutes() {
         `INSERT INTO registrations (id, reference, user_id, title, first_name, last_name, email, phone, organisation, role, country, zone, church, pass, pass_day, pass_days, pass_price, pass_currency, tickets, status,
            payment_status, payment_method, payer)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'ESPEES', $18, 'pending', 'PROCESSING', $19, $20)`,
-        [id, ref, u.id, u.title, u.first_name, u.last_name, u.email, u.phone, u.organisation || "", u.role || "", u.country, u.zone, u.church,
+        [id, ref, u.id, u.title, u.first_name, u.last_name, u.email, u.phone, u.organisation || "", u.role || "", u.country, u.zone || "", u.church || "",
           passId, days.length === 1 ? days[0] : "", JSON.stringify(days), pass.price, JSON.stringify(tickets), method, method === "wallet" ? `@${username}` : `card ****${cardNum.slice(-4)}`]);
       await client.query("COMMIT");
     } catch (err) {

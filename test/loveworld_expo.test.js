@@ -920,3 +920,34 @@ test("page views: only the page and the day, tidy pages only, at most 300 pages 
   assert.equal(after.pages[0].path, "/about");
   assert.equal(after.pages[0].views, 4);
 });
+
+test("not a member of Christ Embassy: no zone or church needed; KingsPass gets lwexpo and lwexpo delegate", async () => {
+  const grace = (await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } })).json;
+  const token = grace.accessToken;
+  // An account from before the question, with a zone and church: counted as a member.
+  let me = (await api("GET", "/expo/me", { token })).json.user;
+  assert.equal(me.christEmbassy, true);
+  assert.equal(me.profileComplete, true);
+  // A member who empties their church isn't complete; saying they aren't a member makes it complete.
+  me = (await api("PATCH", "/expo/me", { token, body: { zone: "", church: "" } })).json.user;
+  assert.equal(me.profileComplete, false);
+  assert.equal((await api("PATCH", "/expo/me", { token, body: { christEmbassy: "no" } })).json.error, "bad_membership");
+  me = (await api("PATCH", "/expo/me", { token, body: { christEmbassy: false } })).json.user;
+  assert.deepEqual([me.christEmbassy, me.profileComplete, me.zone, me.church], [false, true, "", null]);
+
+  // Their pass: nothing stored for zone or church; KingsPass gets the placeholders.
+  const bought = await api("POST", "/expo/passes/checkout", { token, body: { pass: "day", days: ["2026-11-13"], expectedPrice: 10, payment: { method: "wallet", username: "grace_o", pin: "1234" } } });
+  assert.equal(bought.status, 201, JSON.stringify(bought.json));
+  await new Promise((ok) => setTimeout(ok, 250));
+  const reg = (await api("POST", `/expo/passes/${bought.json.registration.id}/confirm`, { token })).json.registration;
+  assert.equal(reg.status, "confirmed");
+  assert.deepEqual([reg.zone, reg.church], ["", ""]);
+  assert.deepEqual([kingspass.at(-1).fields.zone, kingspass.at(-1).fields.church], ["lwexpo", "lwexpo delegate"]);
+
+  // They can still give a zone and church on their profile; then those go to KingsPass.
+  me = (await api("PATCH", "/expo/me", { token, body: { zone: "Abuja Zone", church: "Christ Embassy Wuse" } })).json.user;
+  assert.deepEqual([me.christEmbassy, me.profileComplete, me.zone, me.church], [false, true, "Abuja Zone", "Christ Embassy Wuse"]);
+  // A member must give both.
+  me = (await api("PATCH", "/expo/me", { token, body: { christEmbassy: true, church: "" } })).json.user;
+  assert.equal(me.profileComplete, false);
+});
