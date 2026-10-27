@@ -22,12 +22,13 @@ const kingschat = http.createServer((req, res) => {
     res.setHeader("content-type", "application/json");
     if (req.url === "/token") {
       const { code } = JSON.parse(body);
-      if (!["good-code", "second-code", "third-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
+      if (!["good-code", "second-code", "third-code", "rita-code"].includes(code)) { res.statusCode = 400; return res.end("{}"); }
       return res.end(JSON.stringify({ access_token: `kc-${code}`, refresh_token: "kc-refresh" }));
     }
     if (req.url === "/profile") {
       const auth = req.headers.authorization || "";
       if (!/^Bearer kc-/.test(auth)) { res.statusCode = 401; return res.end("{}"); }
+      if (auth === "Bearer kc-rita-code") return res.end(JSON.stringify({ profile: { id: "kc-rita", name: "Rita", username: "PastorRita", email: "rita@example.com" } }));
       if (auth === "Bearer kc-third-code") return res.end(JSON.stringify({ profile: { id: "kc-999", name: "Tolu Ade", username: "tolu_a", email: "tolu@example.com" } }));
       if (auth === "Bearer kc-second-code") return res.end(JSON.stringify({ profile: { id: "kc-456", name: "Grace Okafor", username: "grace_o", user: { kcID: "kc-777", profilePicture: "https://kc/grace.jpg", emailAddress: "grace@church.org" } } }));
       return res.end(JSON.stringify({ profile: { id: "kc-123", name: "Ade Bello", username: "pastor_ade", email: "ade@church.org", phone_number: "+2348000000000", avatar: "https://kc/ade.jpg" } }));
@@ -950,4 +951,15 @@ test("not a member of Christ Embassy: no zone or church needed; KingsPass gets l
   // A member must give both.
   me = (await api("PATCH", "/expo/me", { token, body: { christEmbassy: true, church: "" } })).json.user;
   assert.equal(me.profileComplete, false);
+});
+
+test("@pastorrita is made an admin as she signs in; nobody else is", async () => {
+  const rita = (await api("POST", "/expo/auth/kingschat", { body: { code: "rita-code" } })).json;
+  assert.equal(rita.created, true);
+  assert.equal(rita.user.admin, true, "her first sign-in makes her an admin");
+  assert.equal((await api("GET", "/expo/me", { token: rita.accessToken })).json.user.admin, true);
+  // Signing in again keeps it.
+  assert.equal((await api("POST", "/expo/auth/kingschat", { body: { code: "rita-code" } })).json.user.admin, true);
+  // Anyone else signing in is not.
+  assert.equal((await api("POST", "/expo/auth/kingschat", { body: { code: "third-code" } })).json.user.admin, false);
 });

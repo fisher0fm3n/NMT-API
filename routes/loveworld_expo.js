@@ -653,8 +653,27 @@ async function fetchKcProfile(accessToken) {
   };
 }
 
+// KingsChat usernames (without the @, any case) made admins of the website's admin area as they sign
+// in: EXPO_AUTO_ADMINS, comma-separated, or the Expo team's own below when it isn't set ("" turns it
+// off). The username comes from KingsChat's sign-in, so nobody else can claim it here. They're made
+// admins at every sign-in, so taking one off in the admin area lasts only until they next sign in:
+// take them off this list as well.
+const AUTO_ADMINS = new Set(
+  // Read as it is (env() would treat "" as unset, and it means off here).
+  (process.env.EXPO_AUTO_ADMINS ?? "pastorrita").split(",").map((u) => u.trim().replace(/^@/, "").toLowerCase()).filter(Boolean),
+);
+
 async function upsertKcUser(profile) {
   const username = profile.username || null;
+  const made = await upsertKcAccount(profile, username);
+  if (username && AUTO_ADMINS.has(username.toLowerCase())) {
+    const promoted = await q1(`UPDATE users SET is_admin = true, updated_at = now() WHERE id = $1 AND NOT is_admin RETURNING id`, [made.id]);
+    if (promoted) console.log(`[expo] @${username} signed in and was made an admin (EXPO_AUTO_ADMINS)`);
+  }
+  return made;
+}
+
+async function upsertKcAccount(profile, username) {
   const ids = profile.kcIds?.length ? profile.kcIds : profile.kcId ? [profile.kcId] : [];
   let row =
     (ids.length ? await q1(`SELECT id FROM users WHERE kc_id = ANY($1::text[]) ORDER BY (kc_id = $2) DESC, created_at ASC LIMIT 1`, [ids, profile.kcId]) : null) ||

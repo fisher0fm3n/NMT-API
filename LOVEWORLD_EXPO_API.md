@@ -22,6 +22,7 @@ exhibitors yet; `--seed` loads it again). Tests: `node --test test/loveworld_exp
 | `EXPO_KC_DEBUG` | `1` also logs each message's request body; every send's KingsChat answer is always logged (`[expo] KingsChat message …`) |
 | `EXPO_API_KEY` | When set, every `/expo/*` call but `/expo/ping` must send `x-api-key` |
 | `EXPO_ADMIN_KEY` | The `x-admin-key` for `/expo/admin/*` (unset: no admin routes) |
+| `EXPO_AUTO_ADMINS` (pastorrita) | KingsChat usernames, comma-separated, made admins of the website's admin area each time they sign in; `""` turns it off. As it happens at every sign-in, removing one in the admin area lasts only until they sign in again: take them off this list too |
 | `EXPO_TOKEN_SECRET` | Access-token signing key (unset: one is made once and kept in `settings`) |
 | `EXPO_ACCESS_TTL_SECONDS` (3600), `EXPO_REFRESH_DAYS` (90) | Token lifetimes |
 | `EXPO_START_DATE` (2026-11-09), `EXPO_END_DATE` (2026-11-15), `EXPO_UTC_OFFSET` (+01:00) | The event's days and clock |
@@ -184,7 +185,8 @@ UPDATE users SET is_admin = true WHERE lower(kc_username) = 'their_username';
 ```
 
 The website still calls `/expo/admin/*` with its own `EXPO_ADMIN_KEY`; the flag decides who may
-make it do so.
+make it do so. The KingsChat usernames in `EXPO_AUTO_ADMINS` (pastorrita unless it's set) get the
+flag as they sign in.
 
 ## The website
 
