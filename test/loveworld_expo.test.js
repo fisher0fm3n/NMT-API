@@ -963,3 +963,185 @@ test("@pastorrita is made an admin as she signs in; nobody else is", async () =>
   // Anyone else signing in is not.
   assert.equal((await api("POST", "/expo/auth/kingschat", { body: { code: "third-code" } })).json.user.admin, false);
 });
+
+test("ad spaces: proposed, approved with a payment link, paid in Espees; the owner told on KingsChat at every step", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const signIn = async (code) => (await api("POST", "/expo/auth/kingschat", { body: { code } })).json.accessToken;
+  const [ade, grace, rita, tolu] = [await signIn("good-code"), await signIn("second-code"), await signIn("rita-code"), await signIn("third-code")];
+  const n0 = kcMessages.length;
+  const told = (ref) => kcMessages.slice(n0).map((m) => m.message.body.text.body).filter((t) => t.includes(ref));
+  const eventually = async (check) => { for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 30)); return check(); };
+  const propose = (body, t = ade) => api("POST", "/expo/advertising/proposals", { token: t, body: { title: "Ade's Bakery", description: "Fresh bread daily", ...body } });
+  const step = (id, action, body = {}) => api("POST", `/expo/admin/advertising/${id}/${action}`, { headers: admin, body });
+  const stored = async (sql, params) => {
+    const db = new Client({ connectionString: DB_URL });
+    await db.connect();
+    const rows = (await db.query(sql, params)).rows;
+    await db.end();
+    return rows;
+  };
+
+  // The spaces as they start; signed out, nothing is "yours".
+  let spaces = (await api("GET", "/expo/advertising/spaces", { token: ade })).json.spaces;
+  assert.deepEqual(spaces.map((s) => [s.id, s.price, s.spots, s.remaining, s.perAccount, s.yours]), [["lampposts", 18, 31, 31, 6, 0], ["angel-court", 72, 16, 16, 5, 0]]);
+  assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].yours, null);
+
+  // Refused before anything is kept.
+  assert.equal((await api("POST", "/expo/advertising/proposals", { body: { space: "lampposts", title: "x", description: "y" } })).status, 401);
+  assert.equal((await propose({ space: "light-boxes" })).json.error, "bad_space");
+  assert.equal((await propose({ space: "toString" })).json.error, "bad_space");
+  assert.equal((await propose({ space: "lampposts", title: "" })).json.error, "missing_fields");
+  assert.equal((await propose({ space: "lampposts", quantity: 0 })).json.error, "bad_quantity");
+  assert.equal((await propose({ space: "lampposts", quantity: 1.5 })).json.error, "bad_quantity");
+  assert.equal((await propose({ space: "lampposts", expectedPrice: 20 })).json.error, "price_changed");
+  assert.equal((await propose({ space: "lampposts", quantity: 7 })).json.error, "over_limit");
+
+  // Submitted: pending, at the space's price, nothing charged, and the owner told it's in.
+  const charges = espeesCharges.length;
+  const p = await propose({ space: "lampposts", quantity: 4, expectedPrice: 18 });
+  assert.equal(p.status, 201, JSON.stringify(p.json));
+  const ad = p.json.proposal;
+  assert.deepEqual([ad.status, ad.quantity, ad.unitPrice, ad.total, ad.spaceName, ad.payUrl], ["pending", 4, 18, 72, "Main Road Lamp Posts", null]);
+  assert.match(ad.reference, /^AD-/);
+  assert.equal(espeesCharges.length, charges);
+  assert.ok(await eventually(() => told(ad.reference).length === 1));
+  assert.match(told(ad.reference)[0], /proposal received/);
+  assert.match(told(ad.reference)[0], /4 × Main Road Lamp Posts/);
+
+  // A proposal being reviewed counts toward the account's limit (6), not the space's spots.
+  const over = await propose({ space: "lampposts", quantity: 3 });
+  assert.deepEqual([over.status, over.json.error], [409, "over_limit"]);
+  assert.match(over.json.message, /ask for 2 more/);
+  spaces = (await api("GET", "/expo/advertising/spaces", { token: ade })).json.spaces;
+  assert.deepEqual([spaces[0].remaining, spaces[0].yours], [31, 4]);
+
+  // Artwork: images only (told by their content), the owner's own, while it's being reviewed.
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
+  const art = (data, t = ade) => api("POST", `/expo/advertising/proposals/${ad.id}/artwork`, { token: t, body: { name: "design.png", data } });
+  assert.equal((await art(Buffer.from("not an image").toString("base64"))).json.error, "bad_type");
+  assert.equal((await art(png.toString("base64"), grace)).status, 404);
+  const up = await art(png.toString("base64"));
+  assert.equal(up.status, 201);
+  assert.deepEqual([up.json.artwork.type, up.json.artwork.size], ["image/png", png.length]);
+
+  // The admin sees it with the account and the artwork, and can open the image.
+  assert.equal((await api("GET", "/expo/admin/advertising")).status, 401);
+  const listed = (await api("GET", "/expo/admin/advertising?status=pending", { headers: admin })).json.proposals.find((x) => x.id === ad.id);
+  assert.equal(listed.user.username, "pastor_ade");
+  assert.equal(listed.artwork.length, 1);
+  const img = await fetch(`${base}/expo/admin/advertising/artwork/${listed.artwork[0].id}`, { headers: admin });
+  assert.equal(img.headers.get("content-type"), "image/png");
+  assert.deepEqual(Buffer.from(await img.arrayBuffer()), png);
+
+  // Approved: the spots are held, a payment link is made and sent to the owner on KingsChat.
+  const approved = await step(ad.id, "approve", { note: "Lovely design" });
+  assert.equal(approved.status, 200, JSON.stringify(approved.json));
+  const payUrl = approved.json.proposal.payUrl;
+  assert.match(payUrl, /^http:\/\/localhost:3000\/advertise\/pay\?link=[\w-]{32}$/);
+  const link = payUrl.split("link=").pop();
+  assert.ok(await eventually(() => told(ad.reference).some((t) => t.includes("is approved") && t.includes(`Pay 72 Espees here: ${payUrl}`) && t.includes("Note: Lovely design"))));
+  assert.equal((await step(ad.id, "approve")).json.error, "not_pending");
+  assert.equal((await art(png.toString("base64"))).json.error, "not_pending");
+  assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].remaining, 27);
+
+  // The link shows the ad and what's owed to whoever has it, and nothing about the account.
+  const view = await api("GET", `/expo/advertising/pay/${link}`);
+  assert.deepEqual([view.json.proposal.total, view.json.proposal.status, view.json.proposal.title], [72, "approved", "Ade's Bakery"]);
+  assert.ok(!JSON.stringify(view.json).includes("pastor_ade"));
+  assert.equal((await api("GET", "/expo/advertising/pay/not-a-link")).status, 404);
+
+  // Espees refuses first (nothing taken, it can be tried again), then it's paid from a card.
+  const pay = (payment, body = {}) => api("POST", `/expo/advertising/pay/${link}`, { body: { payment, ...body } });
+  assert.equal((await pay({ method: "wallet", username: "ade" })).json.error, "missing_payment");
+  assert.equal((await pay({ method: "wallet", username: "ade", pin: "1234" }, { expectedTotal: 50 })).json.error, "price_changed");
+  espeesRefuse = "Insufficient balance";
+  const no = await pay({ method: "wallet", username: "ade", pin: "1234" });
+  assert.deepEqual([no.status, no.json.error, no.json.message], [402, "payment_declined", "Insufficient balance"]);
+  assert.equal((await api("GET", `/expo/advertising/pay/${link}`)).json.proposal.paymentError, "Insufficient balance");
+  const paid = await pay({ method: "card", cardNum: "5399 1234 5678 9012", pin: "4321" }, { expectedTotal: 72 });
+  assert.equal(paid.status, 201, JSON.stringify(paid.json));
+  assert.equal(paid.json.proposal.paymentStatus, "CHARGED");
+  assert.deepEqual(espeesCharges.at(-1).body, { cardNum: "5399123456789012", pin: "4321", amount: "72" });
+  // Paying again while it's with Espees (or once paid) isn't charged.
+  const again = await pay({ method: "card", cardNum: "5399123456789012", pin: "4321" });
+  assert.ok(["payment_in_progress", "already_paid"].includes(again.json.error), again.json.error);
+  assert.equal(espeesCharges.length, charges + 1);
+  assert.ok(await eventually(() => told(ad.reference).some((t) => t.includes("Payment received"))));
+  const done = (await api("POST", `/expo/advertising/pay/${link}/confirm`)).json.proposal;
+  assert.deepEqual([done.status, done.paymentStatus], ["paid", "PAID"]);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(told(ad.reference).filter((t) => t.includes("Payment received")).length, 1, "told once");
+  assert.match(told(ad.reference).find((t) => t.includes("Payment received")), /Paid: 72 Espees/);
+  // The PIN and the whole card number went to Espees and nowhere else.
+  const row = JSON.stringify(await stored(`SELECT * FROM ad_proposals WHERE id = $1`, [ad.id]));
+  assert.ok(!row.includes("4321") && !row.includes("5399123456789012"));
+  assert.deepEqual((await stored(`SELECT kind FROM notifications WHERE ad_id = $1 ORDER BY id`, [ad.id])).map((n) => n.kind), ["ad:submitted", "ad:approved", "ad:paid"]);
+  const mine = (await api("GET", "/expo/advertising/proposals", { token: ade })).json;
+  assert.deepEqual(mine.proposals.map((x) => [x.reference, x.status, x.payer, x.payUrl, x.artwork.length]), [[ad.reference, "paid", "card ****9012", payUrl, 1]]);
+  // Paid: it can't be cancelled or turned down.
+  assert.equal((await api("POST", `/expo/advertising/proposals/${ad.id}/cancel`, { token: ade })).json.error, "not_cancellable");
+  assert.equal((await step(ad.id, "reject", { reason: "x" })).json.error, "not_rejectable");
+
+  // Turned down with a reason, which the owner is told; that frees their limit again.
+  const g = (await propose({ space: "angel-court", quantity: 5, title: "Grace Fashion" }, grace)).json.proposal;
+  assert.equal((await propose({ space: "angel-court", quantity: 1 }, grace)).json.error, "over_limit");
+  assert.equal((await step(g.id, "reject")).json.error, "missing_reason");
+  assert.equal((await step(g.id, "reject", { reason: "The artwork is missing" })).json.proposal.status, "rejected");
+  assert.ok(await eventually(() => told(g.reference).some((t) => t.includes("wasn't approved") && t.includes("Reason: The artwork is missing"))));
+  // Withdrawn by its owner (only theirs), and they're told.
+  const g2 = (await propose({ space: "angel-court", quantity: 5, title: "Grace Fashion" }, grace)).json.proposal;
+  assert.equal((await api("POST", `/expo/advertising/proposals/${g2.id}/cancel`, { token: ade })).status, 404);
+  assert.equal((await api("POST", `/expo/advertising/proposals/${g2.id}/cancel`, { token: grace })).json.proposal.status, "cancelled");
+  assert.ok(await eventually(() => told(g2.reference).some((t) => t.includes("is cancelled") && t.includes("You cancelled it"))));
+
+  // Approvals take spots: 16 Angel Court spaces, 5 + 5 + 5 approved leave 1, so a proposal for 2
+  // can't be approved, and no new one for more than is left is taken.
+  const ids = [];
+  for (const [t, title] of [[grace, "Grace Fashion"], [ade, "Ade's Bakery"], [rita, "Rita's Books"]]) {
+    const x = (await propose({ space: "angel-court", quantity: 5, title }, t)).json.proposal;
+    ids.push(x);
+  }
+  const t2 = (await propose({ space: "angel-court", quantity: 1, title: "Tolu Tech" }, tolu)).json.proposal;
+  const t3 = (await propose({ space: "angel-court", quantity: 1, title: "Tolu Tech" }, tolu)).json.proposal;
+  for (const x of ids) assert.equal((await step(x.id, "approve")).json.proposal.status, "approved");
+  assert.equal((await step(t2.id, "approve")).json.proposal.status, "approved");
+  const full = await step(t3.id, "approve");
+  assert.deepEqual([full.status, full.json.error], [409, "not_enough_spaces"]);
+  assert.equal((await propose({ space: "angel-court", quantity: 1 }, tolu)).json.error, "not_enough_spaces");
+  // An approved one cancelled by the team gives its spots back.
+  assert.equal((await step(t2.id, "cancel", { reason: "Duplicate" })).json.proposal.status, "cancelled");
+  assert.ok(await eventually(() => told(t2.reference).some((t) => t.includes("The Expo team cancelled it") && t.includes("Note: Duplicate"))));
+  assert.equal((await step(t3.id, "approve")).json.proposal.status, "approved");
+
+  // No clear answer from Espees: kept for the team, not paid again; once checked, opened for payment
+  // again, or marked paid by hand (and the owner told).
+  const rl = (await api("GET", "/expo/advertising/proposals", { token: rita })).json.proposals[0];
+  const ritaLink = rl.payUrl.split("link=").pop();
+  espeesBroken = true;
+  const unclear = await api("POST", `/expo/advertising/pay/${ritaLink}`, { body: { payment: { method: "wallet", username: "rita", pin: "9999" } } });
+  espeesBroken = false;
+  assert.deepEqual([unclear.status, unclear.json.error], [502, "payment_unknown"]);
+  assert.equal((await api("POST", `/expo/advertising/pay/${ritaLink}`, { body: { payment: { method: "wallet", username: "rita", pin: "9999" } } })).json.error, "payment_in_progress");
+  assert.equal((await api("POST", `/expo/advertising/proposals/${rl.id}/cancel`, { token: rita })).json.error, "not_cancellable");
+  assert.equal((await step(rl.id, "reopen")).json.proposal.paymentStatus, null);
+  assert.equal((await step(rl.id, "reopen")).json.error, "not_reopenable");
+  const marked = await step(rl.id, "paid");
+  assert.deepEqual([marked.json.proposal.status, marked.json.proposal.paymentStatus], ["paid", "MARKED_PAID"]);
+  assert.ok(await eventually(() => told(rl.reference).some((t) => t.includes("Payment received"))));
+  assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[1].remaining, 0);
+
+  // The test space, 0.001 Espees a space, for admins only: hidden from everyone else and refused them.
+  const spaceIds = async (t) => (await api("GET", "/expo/advertising/spaces", t ? { token: t } : {})).json.spaces.map((s) => s.id);
+  assert.deepEqual(await spaceIds(tolu), ["lampposts", "angel-court"]);
+  assert.deepEqual(await spaceIds(null), ["lampposts", "angel-court"]);
+  assert.deepEqual(await spaceIds(rita), ["lampposts", "angel-court", "test"]);
+  assert.equal((await propose({ space: "test", title: "Tolu test" }, tolu)).json.error, "bad_space");
+  const tp = (await propose({ space: "test", quantity: 3, title: "Rita's test", expectedPrice: 0.001 }, rita)).json.proposal;
+  assert.deepEqual([tp.unitPrice, tp.total], [0.001, 0.003]);
+  const testLink = (await step(tp.id, "approve")).json.proposal.payUrl.split("link=").pop();
+  const testPaid = await api("POST", `/expo/advertising/pay/${testLink}`, { body: { payment: { method: "wallet", username: "rita", pin: "1111" }, expectedTotal: 0.003 } });
+  assert.equal(testPaid.status, 201, JSON.stringify(testPaid.json));
+  assert.equal(espeesCharges.at(-1).body.espeesAmount, 0.003);
+  assert.ok(await eventually(() => told(tp.reference).some((t) => t.includes("Payment received") && t.includes("Paid: 0.003 Espees"))));
+  assert.ok((await api("GET", "/expo/admin/advertising", { headers: admin })).json.spaces.some((s) => s.id === "test" && s.adminOnly));
+});

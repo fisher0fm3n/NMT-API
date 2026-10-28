@@ -13,6 +13,9 @@
 //   program_applications  Eagles Nest, Qubators and Content Creative applications
 //   settings            this service's own values (the token signing key when none is set)
 //   notifications       KingsChat messages sent about bookings (to the visitor and the exhibitor's team), and how each went
+//   ad_proposals        ad spaces asked for (the space, how many, what the ad is for): reviewed by the Expo
+//                       team, then paid in Espees through the payment link an approval makes
+//   ad_artwork          the images sent with an ad proposal, for the team to review
 //
 // Auth: POST /expo/auth/kingschat exchanges a KingsChat accessToken (or authCode) for an
 // access token (HS256 JWT, 1 h) and a refresh token. Signed-in calls send
@@ -111,6 +114,18 @@ const PASSES = {
   test: { name: "Test pass", price: 0.001, ticket: 2582, adminOnly: true },
   "test-2": { name: "Test pass 2", price: 0.001, ticket: Number(env("EXPO_KINGSPASS_TEST2_TICKET")) || 2593, adminOnly: true },
 };
+
+// The ad spaces on the grounds: their price in Espees a space, how many there are (`spots`), and the
+// most one account may hold (`perAccount`: its proposals being reviewed, approved or paid). Keep in
+// step with the website's src/data/advertise.ts (a proposal at a price it shows differently is refused).
+const AD_SPACES = {
+  lampposts: { name: "Main Road Lamp Posts", size: "2.03m (h) × 0.76m (w)", price: 18, spots: 31, perAccount: 6 },
+  "angel-court": { name: "Angel Court Exterior Perimetre", size: "3m (h) × 6m (w)", price: 72, spots: 16, perAccount: 5 },
+  // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
+  test: { name: "Test ad space", size: "2.03m (h) × 0.76m (w)", price: 0.001, spots: 100, perAccount: 10, adminOnly: true },
+};
+// Where people are pointed with questions about their ad.
+const EXPO_KC_HANDLE = "@loveworldexpo";
 
 /* ---------------------------------------------------------------------------
  * DB
@@ -361,6 +376,50 @@ const SCHEMA = `
     views INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, path)
   );
+
+  -- Ad space proposals: the space (an AD_SPACES id), how many, the price as quoted, what the ad is
+  -- for, and where it stands: pending (with the Expo team), approved (its payment link, pay_token,
+  -- sent), paid, rejected (review_note: the team's reason) or cancelled (cancelled_by: owner or
+  -- admin). Paid as a pass is, in Espees (payment_ref, payment_status, payment_method, payer,
+  -- payment_error), never with the PIN or a whole card number kept.
+  CREATE TABLE IF NOT EXISTS ad_proposals (
+    id UUID PRIMARY KEY,
+    reference TEXT NOT NULL UNIQUE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    space TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    unit_price NUMERIC(14,4) NOT NULL,
+    total NUMERIC(14,4) NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    review_note TEXT,
+    pay_token TEXT UNIQUE,
+    payment_ref TEXT UNIQUE,
+    payment_status TEXT,
+    payment_method TEXT,
+    payer TEXT,
+    payment_error TEXT,
+    payment_checked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    reviewed_at TIMESTAMPTZ,
+    paid_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    cancelled_by TEXT
+  );
+  CREATE INDEX IF NOT EXISTS ad_proposals_user ON ad_proposals (user_id, created_at DESC);
+  CREATE INDEX IF NOT EXISTS ad_proposals_space ON ad_proposals (space, status);
+  CREATE TABLE IF NOT EXISTS ad_artwork (
+    id UUID PRIMARY KEY,
+    proposal_id UUID NOT NULL REFERENCES ad_proposals(id) ON DELETE CASCADE,
+    name TEXT NOT NULL DEFAULT '',
+    type TEXT NOT NULL,
+    bytes BYTEA NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS ad_artwork_proposal ON ad_artwork (proposal_id, created_at);
+  -- The ad proposal a message was about.
+  ALTER TABLE notifications ADD COLUMN IF NOT EXISTS ad_id UUID REFERENCES ad_proposals(id) ON DELETE CASCADE;
 `;
 
 let schemaReady = null;
@@ -955,9 +1014,9 @@ async function sendKcMessage(recipientId, text, label = "") {
 
 /**
  * One message to one person, sent and recorded in `notifications`: { userId, kind, status, error }.
- * `r` is { userId, kc, text, kind }; `bookingId` and `ref` (for the log) may be null.
+ * `r` is { userId, kc, text, kind }; `bookingId`, `adId` and `ref` (for the log) may be null.
  */
-async function deliver(r, { bookingId = null, ref = "" } = {}) {
+async function deliver(r, { bookingId = null, adId = null, ref = "" } = {}) {
   let result;
   const label = `(${r.kind}${ref ? `, ${ref}` : ""})`;
   if (!messagesOn()) result = { ok: false, skipped: true, error: KC_API_KEY ? "messages turned off (EXPO_KC_MESSAGES=off)" : "no KingsChat api-key (EXPO_KC_API_KEY)" };
@@ -971,9 +1030,9 @@ async function deliver(r, { bookingId = null, ref = "" } = {}) {
   if (status === "skipped") console.log(`[expo] KingsChat message ${label} not sent: ${result.error}`);
   if (status === "failed") console.error(`[expo] KingsChat message ${label} failed: ${result.error}`);
   await q(
-    `INSERT INTO notifications (booking_id, user_id, kind, recipient_kc_id, body, status, error, kc_message_id, sent_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $6 = 'sent' THEN now() END)`,
-    [bookingId, r.userId, r.kind, r.kc || null, r.text, status, result.error || null, result.messageId || null]);
+    `INSERT INTO notifications (booking_id, ad_id, user_id, kind, recipient_kc_id, body, status, error, kc_message_id, sent_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CASE WHEN $7 = 'sent' THEN now() END)`,
+    [bookingId, adId, r.userId, r.kind, r.kc || null, r.text, status, result.error || null, result.messageId || null]);
   return { userId: r.userId, kind: r.kind, status, error: result.error || null };
 }
 
@@ -1246,6 +1305,167 @@ function passMessageLater(id) {
       console.error(`[expo] pass message (${id}) failed:`, err.message);
     }
   });
+}
+
+/**
+ * How a payment is made, from a request's `payment`: { method: "wallet", username, pin } or
+ * { method: "card", cardNum, pin }, with `missing` (the message to show) when something isn't there.
+ */
+function paymentDetails(p) {
+  const v = p && typeof p === "object" ? p : {};
+  const method = v.method === "card" ? "card" : "wallet";
+  const pin = String(v.pin ?? "").trim().slice(0, 20);
+  const username = clean(v.username, 120).replace(/^@/, "");
+  const cardNum = String(v.cardNum ?? "").replace(/[\s-]/g, "").slice(0, 40);
+  const missing = !pin || (method === "wallet" ? !username : !/^\d{8,40}$/.test(cardNum))
+    ? (method === "wallet" ? "Enter your Espees username and PIN." : "Enter your Espees card number and PIN.") : "";
+  return { method, pin, username, cardNum, payer: method === "wallet" ? `@${username}` : `card ****${cardNum.slice(-4)}`, missing };
+}
+
+/* ---------------------------------------------------------------------------
+ * Ad spaces: proposed, approved by the Expo team, then paid in Espees
+ * ------------------------------------------------------------------------- */
+
+// What counts toward an account's limit, and what takes spots from a space (an approval holds them).
+const AD_HOLDING = ["pending", "approved", "paid"];
+const AD_TAKEN = ["approved", "paid"];
+// A payment still with Espees, taken but not yet confirmed, or without a clear answer: the proposal
+// can't be paid again, rejected or cancelled until it's settled (or the team has checked it).
+const AD_PAYING = ["PROCESSING", "CHARGED", "UNKNOWN", "MISMATCH"];
+// Artwork for review: JPG, PNG or WebP images (told apart by their first bytes), each under the
+// JSON body limit once in base64, and so many to a proposal.
+const AD_ARTWORK_MAX_BYTES = Math.floor(1.4 * 1024 * 1024);
+const AD_ARTWORK_MAX = 6;
+
+const adSpace = (id) => (Object.hasOwn(AD_SPACES, id) ? AD_SPACES[id] : null);
+/** The payment link an approval makes (on the website), while there is something to pay or see. */
+const adPayUrl = (r) => (r.pay_token && (r.status === "approved" || r.status === "paid") ? site(`/advertise/pay?link=${r.pay_token}`) || null : null);
+
+function imageType(buf) {
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
+  if (buf.length > 8 && buf.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (buf.length > 12 && buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "WEBP") return "image/webp";
+  return null;
+}
+
+/**
+ * Each ad space with what's left of it (`remaining`: approved and paid proposals take spots) and, for
+ * a signed-in person, how many they hold (`yours`). `db` may be a client in a transaction. The
+ * admin-only test space is there only with `test`.
+ */
+async function adSpaces(userId = null, db = pool, { test = false } = {}) {
+  const rows = (await db.query(
+    `SELECT space, COALESCE(sum(quantity) FILTER (WHERE status = ANY($2)), 0)::int AS taken,
+            COALESCE(sum(quantity) FILTER (WHERE user_id = $1::uuid AND status = ANY($3)), 0)::int AS yours
+       FROM ad_proposals GROUP BY space`, [userId, AD_TAKEN, AD_HOLDING])).rows;
+  return Object.entries(AD_SPACES).filter(([, s]) => test || !s.adminOnly).map(([id, s]) => {
+    const row = rows.find((r) => r.space === id);
+    const taken = row?.taken ?? 0;
+    return { id, name: s.name, size: s.size, price: s.price, spots: s.spots, taken, remaining: Math.max(0, s.spots - taken), perAccount: s.perAccount, yours: userId ? row?.yours ?? 0 : null, adminOnly: !!s.adminOnly };
+  });
+}
+/** Whether the account may see and use the admin-only test space. */
+const isAdminUser = async (userId) => !!userId && !!(await q1(`SELECT 1 FROM users WHERE id = $1 AND is_admin`, [userId]));
+
+/** The artwork of each proposal given, without the images themselves: { proposalId: [{ id, name, type, size }] }. */
+async function adArtworkOf(ids) {
+  const out = {};
+  if (!ids.length) return out;
+  for (const a of await q(`SELECT id, proposal_id, name, type, octet_length(bytes) AS size FROM ad_artwork WHERE proposal_id = ANY($1::uuid[]) ORDER BY created_at`, [ids])) {
+    (out[a.proposal_id] ||= []).push({ id: a.id, name: a.name, type: a.type, size: Number(a.size) });
+  }
+  return out;
+}
+
+/** A proposal as its owner sees it; with `admin`, the account it's from too (`r` joined with users). */
+function shapeAd(r, { artwork = [], admin = false } = {}) {
+  const s = adSpace(r.space);
+  return {
+    id: r.id, reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: s?.size || "",
+    quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total), title: r.title, description: r.description,
+    status: r.status, reviewNote: r.review_note || null, payUrl: adPayUrl(r),
+    paymentStatus: r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null, paymentError: r.payment_error || null,
+    createdAt: r.created_at, reviewedAt: r.reviewed_at || null, paidAt: r.paid_at || null, cancelledAt: r.cancelled_at || null, cancelledBy: r.cancelled_by || null,
+    artwork,
+    ...(admin ? { user: { id: r.user_id, username: r.kc_username || null, name: [r.first_name, r.last_name].filter(Boolean).join(" ") || r.kc_name || null, email: r.email || null, phone: r.phone || null, organisation: r.organisation || null } } : {}),
+  };
+}
+
+/** What the payment link shows, to whoever has it: the ad and what's owed, nothing about the account. */
+function shapeAdPayment(r) {
+  const s = adSpace(r.space);
+  return {
+    reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: s?.size || "", quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total),
+    title: r.title, status: r.status, paymentStatus: r.payment_status || null, paymentError: r.payment_status === "DECLINED" ? r.payment_error || null : null, paidAt: r.paid_at || null,
+  };
+}
+
+/** The KingsChat message for each step of a proposal: submitted, approved, rejected, paid, cancelled. */
+function adMessage(kind, r) {
+  const s = adSpace(r.space);
+  const heads = {
+    submitted: "📝 Ad space proposal received",
+    approved: "✅ Your ad space proposal is approved",
+    rejected: "Your ad space proposal wasn't approved",
+    paid: "🎉 Payment received: your ad space is booked",
+    cancelled: "Your ad space proposal is cancelled",
+  };
+  const note = r.review_note ? `${kind === "rejected" ? "Reason" : "Note"}: ${short(r.review_note, 300)}` : "";
+  const ask = `Questions? Message ${EXPO_KC_HANDLE} on KingsChat.`;
+  const next = {
+    submitted: ["The Expo team will review your proposal. Once it's approved, we'll send you the link to pay here on KingsChat. Nothing is charged before then.", site("/my-expo#ads") && `Your proposals: ${site("/my-expo#ads")}`],
+    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", "Your spaces are held for you until you pay.", ask],
+    rejected: [note, ask, site("/advertise") && `Send a new proposal: ${site("/advertise")}`],
+    paid: [`Your ad goes up on the grounds for the Expo week. Print size: ${s?.size || "as listed"}, supplied as PNG or print PDF.`, ask],
+    cancelled: [r.cancelled_by === "admin" ? "The Expo team cancelled it." : "You cancelled it, so nothing will be charged.", note, ask],
+  };
+  return compose([
+    `${heads[kind]} · LoveWorld Expo 2026`,
+    GAP,
+    `Reference: ${r.reference}`,
+    `Space: ${r.quantity} × ${s?.name || r.space}`,
+    `Ad: ${short(r.title, 120)}`,
+    `${kind === "paid" ? "Paid" : "Total"}: ${amountLabel(r.total)}`,
+    GAP,
+    ...next[kind],
+  ]);
+}
+
+/** Tell the proposal's owner on KingsChat about a step, in the background. */
+function adNotifyLater(id, kind) {
+  setImmediate(async () => {
+    try {
+      const r = await q1(`SELECT a.*, u.kc_user_id, u.kc_id FROM ad_proposals a JOIN users u ON u.id = a.user_id WHERE a.id = $1`, [id]);
+      if (r) await deliver({ userId: r.user_id, kc: r.kc_user_id || r.kc_id, text: adMessage(kind, r), kind: `ad:${kind}` }, { adId: r.id, ref: r.reference });
+    } catch (err) {
+      console.error(`[expo] ad message (${kind}, ${id}) failed:`, err.message);
+    }
+  });
+}
+
+/**
+ * Brings an approved proposal's payment up to date: one Espees has taken is checked with it (done, for
+ * this reference and the full total: "paid", and the owner hears on KingsChat, once). Safe to call
+ * again and at the same time. Returns the row, with `checkError` when Espees couldn't be asked.
+ */
+async function settleAd(id) {
+  const r = await q1(`SELECT * FROM ad_proposals WHERE id = $1`, [id]);
+  if (!r || r.status !== "approved" || !r.payment_ref || !["CHARGED", "MISMATCH"].includes(r.payment_status)) return r;
+  const t = await espeesTransaction(r.payment_ref);
+  if (t.error) {
+    console.error(`[expo] Espees transaction (${r.reference}) not checked: ${t.error}`);
+    return { ...r, checkError: t.error };
+  }
+  const matches = (t.reference == null || String(t.reference) === r.payment_ref) && (t.amount == null || sameAmount(t.amount, r.total));
+  if (t.done && !matches) console.error(`[expo] Espees transaction ${r.payment_ref} (${r.reference}) is for ${t.amount}, not ${Number(r.total)}: left unpaid`);
+  const paid = t.done && matches;
+  // Only the step from approved to paid tells the owner, so a second check at the same time doesn't.
+  const moved = await q1(
+    `UPDATE ad_proposals SET payment_status = $2, payment_checked_at = now(), status = CASE WHEN $3 THEN 'paid' ELSE status END,
+       paid_at = CASE WHEN $3 THEN now() ELSE paid_at END WHERE id = $1 AND status = 'approved' RETURNING *`,
+    [id, paid ? "PAID" : t.done ? "MISMATCH" : "CHARGED", paid]);
+  if (paid && moved) adNotifyLater(id, "paid");
+  return moved || (await q1(`SELECT * FROM ad_proposals WHERE id = $1`, [id]));
 }
 
 /* ---------------------------------------------------------------------------
@@ -1618,14 +1838,9 @@ module.exports = function loveworldExpoRoutes() {
       return fail(res, 400, "bad_days", `Pick ${pass.days === 1 ? "a day" : `${pass.days} different days`} of the Expo (${EVENT.start} to ${EVENT.end}).`);
     }
     if (b.expectedPrice != null && !sameAmount(b.expectedPrice, pass.price)) return fail(res, 409, "price_changed", `The ${pass.name} costs ${amountLabel(pass.price)}.`);
-    const p = b.payment && typeof b.payment === "object" ? b.payment : {};
-    const method = p.method === "card" ? "card" : "wallet";
-    const pin = String(p.pin ?? "").trim().slice(0, 20);
-    const username = clean(p.username, 120).replace(/^@/, "");
-    const cardNum = String(p.cardNum ?? "").replace(/[\s-]/g, "").slice(0, 40);
-    if (!pin || (method === "wallet" ? !username : !/^\d{8,40}$/.test(cardNum))) {
-      return fail(res, 400, "missing_payment", method === "wallet" ? "Enter your Espees username and PIN." : "Enter your Espees card number and PIN.");
-    }
+    const pay = paymentDetails(b.payment);
+    if (pay.missing) return fail(res, 400, "missing_payment", pay.missing);
+    const { method, pin, username, cardNum } = pay;
 
     // One payment at a time for each person: the purchase is made, marked as with Espees, under a
     // lock, so a second Pay while the first is still with Espees is refused rather than charged.
@@ -1655,7 +1870,7 @@ module.exports = function loveworldExpoRoutes() {
            payment_status, payment_method, payer)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, 'ESPEES', $18, 'pending', 'PROCESSING', $19, $20)`,
         [id, ref, u.id, u.title, u.first_name, u.last_name, u.email, u.phone, u.organisation || "", u.role || "", u.country, u.zone || "", u.church || "",
-          passId, days.length === 1 ? days[0] : "", JSON.stringify(days), pass.price, JSON.stringify(tickets), method, method === "wallet" ? `@${username}` : `card ****${cardNum.slice(-4)}`]);
+          passId, days.length === 1 ? days[0] : "", JSON.stringify(days), pass.price, JSON.stringify(tickets), method, pay.payer]);
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -1689,6 +1904,171 @@ module.exports = function loveworldExpoRoutes() {
     if (!mine) return fail(res, 404, "not_found", "No such purchase.");
     const r = await settleRegistration(mine.id);
     ok(res, { registration: shapeRegistration(r), ...(r.checkError ? { checkError: "Espees couldn't be reached to check the payment. Try again in a moment." } : {}) });
+  }));
+
+  /* ---- ad spaces: a proposal, the Expo team's approval, then payment -- */
+
+  // Each space with what's left of it, and (signed in) how many the person holds.
+  router.get("/expo/advertising/spaces", ...maybeUser, asyncHandler(async (req, res) => {
+    ok(res, { spaces: await adSpaces(req.expoUserId, pool, { test: await isAdminUser(req.expoUserId) }) });
+  }));
+
+  // The signed-in person's proposals, newest first, with the spaces as they stand for them.
+  router.get("/expo/advertising/proposals", ...user, asyncHandler(async (req, res) => {
+    const rows = await q(`SELECT * FROM ad_proposals WHERE user_id = $1 ORDER BY created_at DESC`, [req.expoUserId]);
+    const art = await adArtworkOf(rows.map((r) => r.id));
+    ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [] })), spaces: await adSpaces(req.expoUserId, pool, { test: await isAdminUser(req.expoUserId) }) });
+  }));
+
+  // { space, quantity, title, description, expectedPrice? }. Nothing is charged: the proposal waits
+  // for the Expo team (pending), and the person hears on KingsChat that it's in. One account holds at
+  // most a space's perAccount (what it has waiting, approved or paid counts), and no more than are left.
+  router.post("/expo/advertising/proposals", ...user, asyncHandler(async (req, res) => {
+    const b = req.body || {};
+    const spaceId = clean(b.space, 40);
+    const s = adSpace(spaceId);
+    if (!s || (s.adminOnly && !(await isAdminUser(req.expoUserId)))) return fail(res, 400, "bad_space", "Choose one of the ad spaces.");
+    const quantity = Number(b.quantity ?? 1);
+    if (!Number.isInteger(quantity) || quantity < 1) return fail(res, 400, "bad_quantity", "Choose at least 1 space.");
+    const title = clean(b.title, 120);
+    const description = clean(b.description, 1000);
+    if (!title) return fail(res, 400, "missing_fields", "Give your ad a title: the product or service it's for.");
+    if (!description) return fail(res, 400, "missing_fields", "Say what your ad is about.");
+    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, s.price)) return fail(res, 409, "price_changed", `${s.name} are ${amountLabel(s.price)} a space.`);
+
+    const id = crypto.randomUUID();
+    const client = await pool.connect();
+    let row;
+    try {
+      await client.query("BEGIN");
+      // One proposal at a time for each person, so two at once can't go past the limit together.
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-ad-user:${req.expoUserId}`]);
+      const now = (await adSpaces(req.expoUserId, client, { test: true })).find((x) => x.id === spaceId);
+      const room = s.perAccount - now.yours;
+      if (quantity > room) {
+        await client.query("ROLLBACK");
+        return fail(res, 409, "over_limit", room > 0
+          ? `One account can hold up to ${s.perAccount} ${s.name} spaces. You have ${now.yours} already, so you can ask for ${room} more.`
+          : `You already hold the most ${s.name} spaces one account can (${s.perAccount}).`);
+      }
+      if (quantity > now.remaining) {
+        await client.query("ROLLBACK");
+        return fail(res, 409, "not_enough_spaces", now.remaining ? `Only ${now.remaining} ${s.name} space${now.remaining === 1 ? " is" : "s are"} left.` : `${s.name} are fully booked.`);
+      }
+      row = (await client.query(
+        `INSERT INTO ad_proposals (id, reference, user_id, space, quantity, unit_price, total, title, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
+        [id, reference("AD"), req.expoUserId, spaceId, quantity, s.price, Math.round(s.price * quantity * 10000) / 10000, title, description])).rows[0];
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    adNotifyLater(id, "submitted");
+    res.status(201);
+    ok(res, { proposal: shapeAd(row) });
+  }));
+
+  // { name, data: base64 }: one image of artwork for the person's own proposal, while it's being
+  // reviewed. JPG, PNG or WebP (by its content), up to AD_ARTWORK_MAX_BYTES, AD_ARTWORK_MAX to a proposal.
+  router.post("/expo/advertising/proposals/:id/artwork", ...user, asyncHandler(async (req, res) => {
+    const mine = isUuid(req.params.id) && (await q1(`SELECT id, status FROM ad_proposals WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]));
+    if (!mine) return fail(res, 404, "not_found", "No such proposal.");
+    if (mine.status !== "pending") return fail(res, 409, "not_pending", "Artwork can be added while the proposal is being reviewed.");
+    const bytes = Buffer.from(String(req.body?.data || ""), "base64");
+    if (bytes.length > AD_ARTWORK_MAX_BYTES) return fail(res, 413, "too_large", `Each image must be ${(AD_ARTWORK_MAX_BYTES / 1024 / 1024).toFixed(1)} MB or smaller.`);
+    const type = imageType(bytes);
+    if (!type) return fail(res, 400, "bad_type", "Artwork must be a JPG, PNG or WebP image.");
+    const row = await q1(
+      `INSERT INTO ad_artwork (id, proposal_id, name, type, bytes) SELECT $1, $2, $3, $4, $5
+        WHERE (SELECT count(*) FROM ad_artwork WHERE proposal_id = $2) < $6 RETURNING id, name, type, octet_length(bytes) AS size`,
+      [crypto.randomUUID(), mine.id, clean(req.body?.name, 120), type, bytes, AD_ARTWORK_MAX]);
+    if (!row) return fail(res, 409, "too_many", `A proposal can have up to ${AD_ARTWORK_MAX} images.`);
+    res.status(201);
+    ok(res, { artwork: { id: row.id, name: row.name, type: row.type, size: Number(row.size) } });
+  }));
+
+  // The person withdraws their own proposal, before it's paid (and not while a payment is with Espees).
+  router.post("/expo/advertising/proposals/:id/cancel", ...user, asyncHandler(async (req, res) => {
+    const mine = isUuid(req.params.id) && (await q1(`SELECT * FROM ad_proposals WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]));
+    if (!mine) return fail(res, 404, "not_found", "No such proposal.");
+    const row = await q1(
+      `UPDATE ad_proposals SET status = 'cancelled', cancelled_at = now(), cancelled_by = 'owner'
+        WHERE id = $1 AND status IN ('pending', 'approved') AND (payment_status IS NULL OR NOT payment_status = ANY($2)) RETURNING *`, [mine.id, AD_PAYING]);
+    if (!row) {
+      return fail(res, 409, "not_cancellable", mine.status === "paid" ? "This ad space is paid for. Message us on KingsChat about it."
+        : AD_PAYING.includes(mine.payment_status) ? "A payment for this is with Espees, so it can't be cancelled now. Message us on KingsChat." : `This proposal is already ${mine.status}.`);
+    }
+    adNotifyLater(row.id, "cancelled");
+    ok(res, { proposal: shapeAd(row, { artwork: (await adArtworkOf([row.id]))[row.id] || [] }) });
+  }));
+
+  // The payment link: whoever has it sees the ad and what's owed (nothing about the account) and can pay.
+  router.get("/expo/advertising/pay/:token", ...app, asyncHandler(async (req, res) => {
+    const r = await q1(`SELECT * FROM ad_proposals WHERE pay_token = $1`, [clean(req.params.token, 80)]);
+    if (!r) return fail(res, 404, "not_found", "This payment link isn't valid.");
+    ok(res, { proposal: shapeAdPayment(r) });
+  }));
+
+  // { expectedTotal?, payment: { method: "wallet", username, pin } | { method: "card", cardNum, pin } }:
+  // pays an approved proposal in Espees there and then, as a pass is paid (the PIN goes to Espees and
+  // is never kept). Answers as soon as Espees has taken it (201, CHARGED); confirming it with Espees
+  // follows in the background, as /confirm also does, and makes it paid.
+  router.post("/expo/advertising/pay/:token", ...app, asyncHandler(async (req, res) => {
+    if (!ESPEES_API_TOKEN) return fail(res, 503, "not_on_sale", "Payments in Espees aren't set up yet.");
+    const b = req.body || {};
+    const pay = paymentDetails(b.payment);
+    if (pay.missing) return fail(res, 400, "missing_payment", pay.missing);
+    // The proposal is held while it's marked as with Espees, so a second Pay can't charge it again.
+    const client = await pool.connect();
+    let r;
+    try {
+      await client.query("BEGIN");
+      r = (await client.query(`SELECT * FROM ad_proposals WHERE pay_token = $1 FOR UPDATE`, [clean(req.params.token, 80)])).rows[0];
+      const refuse = !r ? [404, "not_found", "This payment link isn't valid."]
+        : r.status === "paid" ? [409, "already_paid", "This ad space is already paid for."]
+        : r.status !== "approved" ? [409, "not_payable", `This proposal is ${r.status}, so it can't be paid.`]
+        : b.expectedTotal != null && !sameAmount(b.expectedTotal, r.total) ? [409, "price_changed", `The total is ${amountLabel(r.total)}.`]
+        : AD_PAYING.includes(r.payment_status) ? [409, "payment_in_progress", "A payment for this is already with Espees. Please don't pay again: check back in a few minutes, or message us on KingsChat."]
+        : null;
+      if (refuse) {
+        await client.query("ROLLBACK");
+        return fail(res, ...refuse);
+      }
+      await client.query(`UPDATE ad_proposals SET payment_status = 'PROCESSING', payment_method = $2, payer = $3, payment_error = NULL, payment_ref = NULL WHERE id = $1`, [r.id, pay.method, pay.payer]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    const charge = await chargeEspees({ reference: r.reference, pass_price: r.total }, pay);
+    if (charge.declined || charge.unavailable) {
+      await q(`UPDATE ad_proposals SET payment_status = 'DECLINED', payment_error = $2 WHERE id = $1`, [r.id, charge.declined || `unreachable: ${charge.unavailable}`]);
+      return charge.declined
+        ? fail(res, 402, "payment_declined", charge.declined)
+        : fail(res, 502, "payment_unavailable", "Espees couldn't be reached, so nothing was taken. Please try again in a moment.");
+    }
+    if (charge.unknown) {
+      console.error(`[expo] ad payment ${r.reference}: can't tell whether Espees took the payment (${charge.unknown})`);
+      await q(`UPDATE ad_proposals SET payment_status = 'UNKNOWN', payment_error = $2 WHERE id = $1`, [r.id, charge.unknown]);
+      return fail(res, 502, "payment_unknown", "We couldn't tell whether Espees took the payment. Please don't pay again: the Expo team will check it and message you on KingsChat.");
+    }
+    const row = await q1(`UPDATE ad_proposals SET payment_ref = $2, payment_status = 'CHARGED' WHERE id = $1 RETURNING *`, [r.id, charge.reference]);
+    res.status(201);
+    ok(res, { proposal: shapeAdPayment(row) });
+    setImmediate(() => settleAd(r.id).catch((err) => console.error(`[expo] settling ${r.reference}: ${err.message}`)));
+  }));
+
+  // The payment link's proposal brought up to date: a payment Espees has taken is checked with it.
+  router.post("/expo/advertising/pay/:token/confirm", ...app, asyncHandler(async (req, res) => {
+    const found = await q1(`SELECT id FROM ad_proposals WHERE pay_token = $1`, [clean(req.params.token, 80)]);
+    if (!found) return fail(res, 404, "not_found", "This payment link isn't valid.");
+    const r = await settleAd(found.id);
+    ok(res, { proposal: shapeAdPayment(r), ...(r.checkError ? { checkError: "Espees couldn't be reached to check the payment. Try again in a moment." } : {}) });
   }));
 
   router.post("/expo/sponsor/enquiries", ...maybeUser, asyncHandler(async (req, res) => {
@@ -1855,6 +2235,8 @@ module.exports = function loveworldExpoRoutes() {
         applications: await count(`DELETE FROM program_applications WHERE user_id = $1`),
         enquiries: await count(`DELETE FROM sponsor_enquiries WHERE user_id = $1`),
         messages: await count(`DELETE FROM notifications WHERE user_id = $1`),
+        // After the messages, which an ad's removal would otherwise take with it uncounted.
+        ads: await count(`DELETE FROM ad_proposals WHERE user_id = $1`),
       };
       await client.query(`DELETE FROM users WHERE id = $1`, [id]);
       await client.query("COMMIT");
@@ -1955,6 +2337,125 @@ module.exports = function loveworldExpoRoutes() {
     const status = clean(req.query.status, 20);
     const rows = await q(`SELECT * FROM program_applications WHERE ($1 = '' OR program = $1) AND ($2 = '' OR status = $2) ORDER BY created_at DESC LIMIT $3`, [program, status, limit(req, 5000)]);
     ok(res, { applications: rows.map((r) => ({ id: r.id, reference: r.reference, userId: r.user_id, program: r.program, name: r.name, email: r.email, organisation: r.organisation, summary: r.summary, data: r.data, status: r.status, createdAt: r.created_at })) });
+  }));
+
+  /* ---- admin: ad space proposals --------------------------------------- */
+
+  // ?status= narrows the list. Each with the account it's from and its artwork (not the images:
+  // /expo/admin/advertising/artwork/:id gives one), and the spaces with what's left of them.
+  router.get("/expo/admin/advertising", requireAdmin, asyncHandler(async (req, res) => {
+    const status = clean(req.query.status, 20);
+    const rows = await q(
+      `SELECT a.*, u.kc_username, u.kc_name, u.first_name, u.last_name, u.email, u.phone, u.organisation
+         FROM ad_proposals a JOIN users u ON u.id = a.user_id WHERE ($1 = '' OR a.status = $1) ORDER BY a.created_at DESC LIMIT $2`, [status, limit(req, 2000)]);
+    const art = await adArtworkOf(rows.map((r) => r.id));
+    ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [], admin: true })), spaces: await adSpaces(null, pool, { test: true }) });
+  }));
+
+  router.get("/expo/admin/advertising/artwork/:id", requireAdmin, asyncHandler(async (req, res) => {
+    const a = isUuid(req.params.id) && (await q1(`SELECT name, type, bytes FROM ad_artwork WHERE id = $1`, [req.params.id]));
+    if (!a) return fail(res, 404, "not_found", "No such image.");
+    res.setHeader("Content-Type", a.type);
+    res.setHeader("Content-Disposition", `inline; filename="${(a.name || "artwork").replace(/[^\w.-]+/g, "_").slice(0, 80)}"`);
+    res.end(a.bytes);
+  }));
+
+  /** An admin's step on a proposal, under a lock on its row: `change(row, client)` answers with the new row, or [http, code, message]. */
+  async function adminStep(req, res, change) {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such proposal.");
+    const client = await pool.connect();
+    let out;
+    try {
+      await client.query("BEGIN");
+      const row = (await client.query(`SELECT * FROM ad_proposals WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+      out = row ? await change(row, client) : [404, "not_found", "No such proposal."];
+      await client.query(Array.isArray(out) ? "ROLLBACK" : "COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (Array.isArray(out)) return fail(res, ...out);
+    return out;
+  }
+  const adminAd = async (row) => {
+    const full = await q1(`SELECT a.*, u.kc_username, u.kc_name, u.first_name, u.last_name, u.email, u.phone, u.organisation FROM ad_proposals a JOIN users u ON u.id = a.user_id WHERE a.id = $1`, [row.id]);
+    return shapeAd(full, { artwork: (await adArtworkOf([row.id]))[row.id] || [], admin: true });
+  };
+  const unsettled = (r) => AD_PAYING.includes(r.payment_status);
+
+  // { note? }: approves a pending proposal if its space still has room (approvals take spots), makes
+  // its payment link, and sends it to the owner on KingsChat.
+  router.post("/expo/admin/advertising/:id/approve", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await adminStep(req, res, async (r, client) => {
+      if (r.status !== "pending") return [409, "not_pending", `This proposal is ${r.status}.`];
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-ad-space:${r.space}`]);
+      const left = (await adSpaces(null, client, { test: true })).find((s) => s.id === r.space)?.remaining ?? 0;
+      if (r.quantity > left) return [409, "not_enough_spaces", `Only ${left} of these space${left === 1 ? " is" : "s are"} left, and this proposal is for ${r.quantity}.`];
+      return (await client.query(`UPDATE ad_proposals SET status = 'approved', pay_token = $2, review_note = $3, reviewed_at = now() WHERE id = $1 RETURNING *`,
+        [r.id, b64url(crypto.randomBytes(24)), clean(req.body?.note, 1000) || null])).rows[0];
+    });
+    if (!row || res.headersSent) return;
+    adNotifyLater(row.id, "approved");
+    ok(res, { proposal: await adminAd(row) });
+  }));
+
+  // { reason }: turns a proposal down (before it's paid); the owner is told why on KingsChat.
+  router.post("/expo/admin/advertising/:id/reject", requireAdmin, asyncHandler(async (req, res) => {
+    const reason = clean(req.body?.reason, 1000);
+    if (!reason) return fail(res, 400, "missing_reason", "Give the reason: it's sent to them.");
+    const row = await adminStep(req, res, async (r, client) => {
+      if (!["pending", "approved"].includes(r.status) || unsettled(r)) return [409, "not_rejectable", unsettled(r) ? "A payment for this is with Espees: check it first." : `This proposal is ${r.status}.`];
+      return (await client.query(`UPDATE ad_proposals SET status = 'rejected', review_note = $2, reviewed_at = now() WHERE id = $1 RETURNING *`, [r.id, reason])).rows[0];
+    });
+    if (!row || res.headersSent) return;
+    adNotifyLater(row.id, "rejected");
+    ok(res, { proposal: await adminAd(row) });
+  }));
+
+  // { reason? }: cancels a proposal that isn't paid (an approved one gives its spots back).
+  router.post("/expo/admin/advertising/:id/cancel", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await adminStep(req, res, async (r, client) => {
+      if (!["pending", "approved"].includes(r.status) || unsettled(r)) return [409, "not_cancellable", unsettled(r) ? "A payment for this is with Espees: check it first." : `This proposal is ${r.status}.`];
+      return (await client.query(`UPDATE ad_proposals SET status = 'cancelled', cancelled_at = now(), cancelled_by = 'admin', review_note = COALESCE($2, review_note) WHERE id = $1 RETURNING *`,
+        [r.id, clean(req.body?.reason, 1000) || null])).rows[0];
+    });
+    if (!row || res.headersSent) return;
+    adNotifyLater(row.id, "cancelled");
+    ok(res, { proposal: await adminAd(row) });
+  }));
+
+  // A payment Espees has taken, checked with it again (as the payment link's /confirm).
+  router.post("/expo/admin/advertising/:id/settle", requireAdmin, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such proposal.");
+    const r = await settleAd(req.params.id);
+    if (!r) return fail(res, 404, "not_found", "No such proposal.");
+    ok(res, { proposal: await adminAd(r), ...(r.checkError ? { checkError: r.checkError } : {}) });
+  }));
+
+  // { note? }: marks an approved proposal paid by hand, once the team has seen the payment in Espees
+  // (one without a clear answer, say); the owner hears on KingsChat as for any payment.
+  router.post("/expo/admin/advertising/:id/paid", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await adminStep(req, res, async (r, client) => {
+      if (r.status !== "approved") return [409, "not_approved", `This proposal is ${r.status}.`];
+      return (await client.query(`UPDATE ad_proposals SET status = 'paid', paid_at = now(), payment_status = 'MARKED_PAID', payment_error = COALESCE($2, payment_error) WHERE id = $1 RETURNING *`,
+        [r.id, clean(req.body?.note, 300) || null])).rows[0];
+    });
+    if (!row || res.headersSent) return;
+    adNotifyLater(row.id, "paid");
+    ok(res, { proposal: await adminAd(row) });
+  }));
+
+  // Lets an approved proposal be paid again once the team has seen in Espees that a payment without a
+  // clear answer (or one stuck being sent) was never taken.
+  router.post("/expo/admin/advertising/:id/reopen", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await adminStep(req, res, async (r, client) => {
+      if (r.status !== "approved" || !["UNKNOWN", "PROCESSING"].includes(r.payment_status)) return [409, "not_reopenable", "Only an approved proposal whose payment had no clear answer can be opened for payment again."];
+      return (await client.query(`UPDATE ad_proposals SET payment_status = NULL, payment_error = NULL, payment_ref = NULL WHERE id = $1 RETURNING *`, [r.id])).rows[0];
+    });
+    if (!row || res.headersSent) return;
+    ok(res, { proposal: await adminAd(row) });
   }));
 
   const STATUSES = { enquiries: ["new", "contacted", "closed"], applications: ["submitted", "shortlisted", "accepted", "declined"], registrations: ["pending", "confirmed", "cancelled"] };
