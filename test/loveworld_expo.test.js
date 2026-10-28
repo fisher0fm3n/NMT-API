@@ -1145,3 +1145,32 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   assert.ok(await eventually(() => told(tp.reference).some((t) => t.includes("Payment received") && t.includes("Paid: 0.003 Espees"))));
   assert.ok((await api("GET", "/expo/admin/advertising", { headers: admin })).json.spaces.some((s) => s.id === "test" && s.adminOnly));
 });
+
+test("ad spaces: a proposal or an image sent again with the same key gives back the one already made", async () => {
+  const tolu = (await api("POST", "/expo/auth/kingschat", { body: { code: "third-code" } })).json.accessToken;
+  const n0 = kcMessages.length;
+  const propose = (body) => api("POST", "/expo/advertising/proposals", { token: tolu, body: { space: "lampposts", quantity: 6, title: "Tolu Tech", description: "Gadgets", ...body } });
+
+  // Sent again after a dropped connection: the same proposal, though it fills the account's limit.
+  const first = await propose({ key: "proposal-key-0001" });
+  assert.equal(first.status, 201, JSON.stringify(first.json));
+  const again = await propose({ key: "proposal-key-0001" });
+  assert.deepEqual([again.status, again.json.repeated, again.json.proposal.id], [200, true, first.json.proposal.id]);
+  // Another key is another proposal (refused here: the account holds its 6); a bad key is no key.
+  assert.equal((await propose({ quantity: 1, key: "proposal-key-0002" })).json.error, "over_limit");
+  assert.equal((await propose({ quantity: 1, key: "no" })).json.error, "over_limit");
+  // One message, for the one proposal.
+  await new Promise((r) => setTimeout(r, 250));
+  assert.equal(kcMessages.slice(n0).filter((m) => m.message.body.text.body.includes(first.json.proposal.reference)).length, 1);
+
+  // An image sent twice with the same key is stored once.
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 7)]);
+  const art = (key) => api("POST", `/expo/advertising/proposals/${first.json.proposal.id}/artwork`, { token: tolu, body: { name: "a.png", data: png.toString("base64"), key } });
+  const a1 = await art("image-key-0001");
+  assert.equal(a1.status, 201);
+  const a2 = await art("image-key-0001");
+  assert.deepEqual([a2.status, a2.json.repeated, a2.json.artwork.id], [200, true, a1.json.artwork.id]);
+  assert.equal((await art("image-key-0002")).status, 201);
+  const mine = (await api("GET", "/expo/advertising/proposals", { token: tolu })).json.proposals.find((p) => p.id === first.json.proposal.id);
+  assert.equal(mine.artwork.length, 2);
+});

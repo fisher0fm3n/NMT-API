@@ -420,6 +420,12 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS ad_artwork_proposal ON ad_artwork (proposal_id, created_at);
   -- The ad proposal a message was about.
   ALTER TABLE notifications ADD COLUMN IF NOT EXISTS ad_id UUID REFERENCES ad_proposals(id) ON DELETE CASCADE;
+  -- The one-time key the website sends with a proposal and with each image, so the same one sent
+  -- again (a retry after a dropped connection) gives back what was made rather than a second.
+  ALTER TABLE ad_proposals ADD COLUMN IF NOT EXISTS client_key TEXT;
+  CREATE UNIQUE INDEX IF NOT EXISTS ad_proposals_client_key ON ad_proposals (user_id, client_key) WHERE client_key IS NOT NULL;
+  ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS client_key TEXT;
+  CREATE UNIQUE INDEX IF NOT EXISTS ad_artwork_client_key ON ad_artwork (proposal_id, client_key) WHERE client_key IS NOT NULL;
 `;
 
 let schemaReady = null;
@@ -1338,6 +1344,8 @@ const AD_ARTWORK_MAX_BYTES = Math.floor(1.4 * 1024 * 1024);
 const AD_ARTWORK_MAX = 6;
 
 const adSpace = (id) => (Object.hasOwn(AD_SPACES, id) ? AD_SPACES[id] : null);
+/** A one-time key from the website (8 to 80 letters, digits, - and _), or null. */
+const clientKey = (v) => (typeof v === "string" && /^[\w-]{8,80}$/.test(v) ? v : null);
 /** The payment link an approval makes (on the website), while there is something to pay or see. */
 const adPayUrl = (r) => (r.pay_token && (r.status === "approved" || r.status === "paid") ? site(`/advertise/pay?link=${r.pay_token}`) || null : null);
 
@@ -1920,11 +1928,14 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [] })), spaces: await adSpaces(req.expoUserId, pool, { test: await isAdminUser(req.expoUserId) }) });
   }));
 
-  // { space, quantity, title, description, expectedPrice? }. Nothing is charged: the proposal waits
-  // for the Expo team (pending), and the person hears on KingsChat that it's in. One account holds at
-  // most a space's perAccount (what it has waiting, approved or paid counts), and no more than are left.
+  // { space, quantity, title, description, expectedPrice?, key? }. Nothing is charged: the proposal
+  // waits for the Expo team (pending), and the person hears on KingsChat that it's in. One account
+  // holds at most a space's perAccount (what it has waiting, approved or paid counts), and no more
+  // than are left. `key` (8 to 80 letters, digits, - and _): the same key sent again by the same
+  // person gives back the proposal it made (200, repeated: true), not a second one, and no message.
   router.post("/expo/advertising/proposals", ...user, asyncHandler(async (req, res) => {
     const b = req.body || {};
+    const key = clientKey(b.key);
     const spaceId = clean(b.space, 40);
     const s = adSpace(spaceId);
     if (!s || (s.adminOnly && !(await isAdminUser(req.expoUserId)))) return fail(res, 400, "bad_space", "Choose one of the ad spaces.");
@@ -1943,6 +1954,12 @@ module.exports = function loveworldExpoRoutes() {
       await client.query("BEGIN");
       // One proposal at a time for each person, so two at once can't go past the limit together.
       await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-ad-user:${req.expoUserId}`]);
+      // Sent before (its answer lost on the way back): that proposal, which already counts toward the limit.
+      const again = key && (await client.query(`SELECT * FROM ad_proposals WHERE user_id = $1 AND client_key = $2`, [req.expoUserId, key])).rows[0];
+      if (again) {
+        await client.query("ROLLBACK");
+        return ok(res, { proposal: shapeAd(again, { artwork: (await adArtworkOf([again.id]))[again.id] || [] }), repeated: true });
+      }
       const now = (await adSpaces(req.expoUserId, client, { test: true })).find((x) => x.id === spaceId);
       const room = s.perAccount - now.yours;
       if (quantity > room) {
@@ -1956,8 +1973,8 @@ module.exports = function loveworldExpoRoutes() {
         return fail(res, 409, "not_enough_spaces", now.remaining ? `Only ${now.remaining} ${s.name} space${now.remaining === 1 ? " is" : "s are"} left.` : `${s.name} are fully booked.`);
       }
       row = (await client.query(
-        `INSERT INTO ad_proposals (id, reference, user_id, space, quantity, unit_price, total, title, description) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING *`,
-        [id, reference("AD"), req.expoUserId, spaceId, quantity, s.price, Math.round(s.price * quantity * 10000) / 10000, title, description])).rows[0];
+        `INSERT INTO ad_proposals (id, reference, user_id, space, quantity, unit_price, total, title, description, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
+        [id, reference("AD"), req.expoUserId, spaceId, quantity, s.price, Math.round(s.price * quantity * 10000) / 10000, title, description, key])).rows[0];
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -1970,23 +1987,35 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposal: shapeAd(row) });
   }));
 
-  // { name, data: base64 }: one image of artwork for the person's own proposal, while it's being
-  // reviewed. JPG, PNG or WebP (by its content), up to AD_ARTWORK_MAX_BYTES, AD_ARTWORK_MAX to a proposal.
+  // { name, data: base64, key? }: one image of artwork for the person's own proposal, while it's being
+  // reviewed. JPG, PNG or WebP (by its content), up to AD_ARTWORK_MAX_BYTES, AD_ARTWORK_MAX to a
+  // proposal. The same `key` sent again gives back the image it stored (200), not a second copy.
   router.post("/expo/advertising/proposals/:id/artwork", ...user, asyncHandler(async (req, res) => {
     const mine = isUuid(req.params.id) && (await q1(`SELECT id, status FROM ad_proposals WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]));
     if (!mine) return fail(res, 404, "not_found", "No such proposal.");
+    const key = clientKey(req.body?.key);
+    const stored = async () => key && q1(`SELECT id, name, type, octet_length(bytes) AS size FROM ad_artwork WHERE proposal_id = $1 AND client_key = $2`, [mine.id, key]);
+    const shapeArt = (a) => ({ id: a.id, name: a.name, type: a.type, size: Number(a.size) });
+    const before = await stored();
+    if (before) return ok(res, { artwork: shapeArt(before), repeated: true });
     if (mine.status !== "pending") return fail(res, 409, "not_pending", "Artwork can be added while the proposal is being reviewed.");
     const bytes = Buffer.from(String(req.body?.data || ""), "base64");
     if (bytes.length > AD_ARTWORK_MAX_BYTES) return fail(res, 413, "too_large", `Each image must be ${(AD_ARTWORK_MAX_BYTES / 1024 / 1024).toFixed(1)} MB or smaller.`);
     const type = imageType(bytes);
     if (!type) return fail(res, 400, "bad_type", "Artwork must be a JPG, PNG or WebP image.");
     const row = await q1(
-      `INSERT INTO ad_artwork (id, proposal_id, name, type, bytes) SELECT $1, $2, $3, $4, $5
-        WHERE (SELECT count(*) FROM ad_artwork WHERE proposal_id = $2) < $6 RETURNING id, name, type, octet_length(bytes) AS size`,
-      [crypto.randomUUID(), mine.id, clean(req.body?.name, 120), type, bytes, AD_ARTWORK_MAX]);
-    if (!row) return fail(res, 409, "too_many", `A proposal can have up to ${AD_ARTWORK_MAX} images.`);
+      `INSERT INTO ad_artwork (id, proposal_id, name, type, bytes, client_key) SELECT $1, $2, $3, $4, $5, $7
+        WHERE (SELECT count(*) FROM ad_artwork WHERE proposal_id = $2) < $6
+        ON CONFLICT (proposal_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING id, name, type, octet_length(bytes) AS size`,
+      [crypto.randomUUID(), mine.id, clean(req.body?.name, 120), type, bytes, AD_ARTWORK_MAX, key]);
+    if (!row) {
+      // Stored by the same key a moment ago (two sends at once), or the proposal is full.
+      const meanwhile = await stored();
+      if (meanwhile) return ok(res, { artwork: shapeArt(meanwhile), repeated: true });
+      return fail(res, 409, "too_many", `A proposal can have up to ${AD_ARTWORK_MAX} images.`);
+    }
     res.status(201);
-    ok(res, { artwork: { id: row.id, name: row.name, type: row.type, size: Number(row.size) } });
+    ok(res, { artwork: shapeArt(row) });
   }));
 
   // The person withdraws their own proposal, before it's paid (and not while a payment is with Espees).
