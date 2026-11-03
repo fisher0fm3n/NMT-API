@@ -985,12 +985,14 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
 
   // The spaces as they start; signed out, nothing is "yours".
   let spaces = (await api("GET", "/expo/advertising/spaces", { token: ade })).json.spaces;
-  assert.deepEqual(spaces.map((s) => [s.id, s.price, s.spots, s.remaining, s.perAccount, s.yours]), [["lampposts", 300, 31, 31, 2, 0], ["angel-court", 1500, 29, 29, 5, 0], ["amphitheatre", 3000, 36, 36, 4, 0]]);
+  assert.deepEqual(spaces.map((s) => [s.id, s.price, s.spots, s.remaining, s.perAccount, s.yours]), [["lampposts", 300, 31, 31, 2, 0], ["angel-court", 1500, 29, 29, 5, 0], ["amphitheatre", 3000, 36, 36, 4, 0], ["light-boxes", 200, 171, 100, 5, 0]]);
+  // 71 light boxes are already gone outside the site: they count as taken.
+  assert.equal(spaces.find((s) => s.id === "light-boxes").taken, 71);
   assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].yours, null);
 
   // Refused before anything is kept.
   assert.equal((await api("POST", "/expo/advertising/proposals", { body: { space: "lampposts", title: "x", description: "y" } })).status, 401);
-  assert.equal((await propose({ space: "light-boxes" })).json.error, "bad_space");
+  assert.equal((await propose({ space: "billboards" })).json.error, "bad_space");
   assert.equal((await propose({ space: "toString" })).json.error, "bad_space");
   assert.equal((await propose({ space: "lampposts", title: "" })).json.error, "missing_fields");
   assert.equal((await propose({ space: "lampposts", quantity: 0 })).json.error, "bad_quantity");
@@ -1135,9 +1137,9 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
 
   // The test space, 0.001 Espees a space, for admins only: hidden from everyone else and refused them.
   const spaceIds = async (t) => (await api("GET", "/expo/advertising/spaces", t ? { token: t } : {})).json.spaces.map((s) => s.id);
-  assert.deepEqual(await spaceIds(tolu), ["lampposts", "angel-court", "amphitheatre"]);
-  assert.deepEqual(await spaceIds(null), ["lampposts", "angel-court", "amphitheatre"]);
-  assert.deepEqual(await spaceIds(rita), ["lampposts", "angel-court", "amphitheatre", "test"]);
+  assert.deepEqual(await spaceIds(tolu), ["lampposts", "angel-court", "amphitheatre", "light-boxes"]);
+  assert.deepEqual(await spaceIds(null), ["lampposts", "angel-court", "amphitheatre", "light-boxes"]);
+  assert.deepEqual(await spaceIds(rita), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "test"]);
   assert.equal((await propose({ space: "test", title: "Tolu test" }, tolu)).json.error, "bad_space");
   const tp = (await propose({ space: "test", quantity: 3, title: "Rita's test", expectedPrice: 0.001 }, rita)).json.proposal;
   assert.deepEqual([tp.unitPrice, tp.total], [0.001, 0.003]);

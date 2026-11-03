@@ -115,13 +115,15 @@ const PASSES = {
   "test-2": { name: "Test pass 2", price: 0.001, ticket: Number(env("EXPO_KINGSPASS_TEST2_TICKET")) || 2593, adminOnly: true },
 };
 
-// The ad spaces on the grounds: their price in Espees a space, how many there are (`spots`), and the
-// most one account may hold (`perAccount`: its proposals being reviewed, approved or paid). Keep in
-// step with the website's src/data/advertise.ts (a proposal at a price it shows differently is refused).
+// The ad spaces on the grounds: their price in Espees a space, how many there are (`spots`), how many
+// of those are already gone outside the site (`reserved`, counted as taken), and the most one account
+// may hold (`perAccount`: its proposals being reviewed, approved or paid). Keep in step with the
+// website's src/data/advertise.ts (a proposal at a price it shows differently is refused).
 const AD_SPACES = {
   lampposts: { name: "Main Road Lamp Posts", size: "2 ft 6\" wide × 6 ft 7\" high", price: 300, spots: 31, perAccount: 2 },
   "angel-court": { name: "Angel Court Exterior Perimeter", size: "11 ft 6\" wide × 9 ft 10\" high", price: 1500, spots: 29, perAccount: 5 },
   amphitheatre: { name: "Amphitheatre Exterior", size: "28 ft wide × 37 ft high", price: 3000, spots: 36, perAccount: 4 },
+  "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 200, spots: 171, reserved: 71, perAccount: 5 },
   // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
   test: { name: "Test ad space", size: "2 ft 6\" wide × 6 ft 7\" high", price: 0.001, spots: 100, perAccount: 10, adminOnly: true },
 };
@@ -1360,9 +1362,9 @@ function imageType(buf) {
 }
 
 /**
- * Each ad space with what's left of it (`remaining`: approved and paid proposals take spots) and, for
- * a signed-in person, how many they hold (`yours`). `db` may be a client in a transaction. The
- * admin-only test space is there only with `test`.
+ * Each ad space with what's left of it (`remaining`: approved and paid proposals take spots, as do its
+ * `reserved` ones) and, for a signed-in person, how many they hold (`yours`). `db` may be a client in a
+ * transaction. The admin-only test space is there only with `test`.
  */
 async function adSpaces(userId = null, db = pool, { test = false } = {}) {
   const rows = (await db.query(
@@ -1371,7 +1373,7 @@ async function adSpaces(userId = null, db = pool, { test = false } = {}) {
        FROM ad_proposals GROUP BY space`, [userId, AD_TAKEN, AD_HOLDING])).rows;
   return Object.entries(AD_SPACES).filter(([, s]) => test || !s.adminOnly).map(([id, s]) => {
     const row = rows.find((r) => r.space === id);
-    const taken = row?.taken ?? 0;
+    const taken = (s.reserved || 0) + (row?.taken ?? 0);
     return { id, name: s.name, size: s.size, price: s.price, spots: s.spots, taken, remaining: Math.max(0, s.spots - taken), perAccount: s.perAccount, yours: userId ? row?.yours ?? 0 : null, adminOnly: !!s.adminOnly };
   });
 }
