@@ -119,11 +119,14 @@ const PASSES = {
 // most one account may hold (`perAccount`: its proposals being reviewed, approved or paid). Keep in
 // step with the website's src/data/advertise.ts (a proposal at a price it shows differently is refused).
 const AD_SPACES = {
-  lampposts: { name: "Main Road Lamp Posts", size: "2.03m (h) × 0.76m (w)", price: 18, spots: 31, perAccount: 6 },
-  "angel-court": { name: "Angel Court Exterior Perimetre", size: "3m (h) × 6m (w)", price: 72, spots: 16, perAccount: 5 },
+  lampposts: { name: "Main Road Lamp Posts", size: "2 ft 6\" wide × 6 ft 7\" high", price: 300, spots: 31, perAccount: 2 },
+  "angel-court": { name: "Angel Court Exterior Perimeter", size: "11 ft 6\" wide × 9 ft 10\" high", price: 1500, spots: 29, perAccount: 5 },
+  amphitheatre: { name: "Amphitheatre Exterior", size: "28 ft wide × 37 ft high", price: 3000, spots: 36, perAccount: 4 },
   // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
-  test: { name: "Test ad space", size: "2.03m (h) × 0.76m (w)", price: 0.001, spots: 100, perAccount: 10, adminOnly: true },
+  test: { name: "Test ad space", size: "2 ft 6\" wide × 6 ft 7\" high", price: 0.001, spots: 100, perAccount: 10, adminOnly: true },
 };
+// When print artwork is due, as the Expo team announced it (said in the approval and payment messages).
+const AD_ARTWORK_DEADLINE = env("EXPO_AD_ARTWORK_DEADLINE") || "Wednesday 4 November, 3pm (GMT+1)";
 // Where people are pointed with questions about their ad.
 const EXPO_KC_HANDLE = "@loveworldexpo";
 
@@ -1422,9 +1425,9 @@ function adMessage(kind, r) {
   const ask = `Questions? Message ${EXPO_KC_HANDLE} on KingsChat.`;
   const next = {
     submitted: ["The Expo team will review your proposal. Once it's approved, we'll send you the link to pay here on KingsChat. Nothing is charged before then.", site("/my-expo#ads") && `Your proposals: ${site("/my-expo#ads")}`],
-    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", "Your spaces are held for you until you pay.", ask],
+    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", "Your spaces are held for you until you pay.", `Print artwork is due by ${AD_ARTWORK_DEADLINE}.`, ask],
     rejected: [note, ask, site("/advertise") && `Send a new proposal: ${site("/advertise")}`],
-    paid: [`Your ad goes up on the grounds for the Expo week. Print size: ${s?.size || "as listed"}, supplied as PNG or print PDF.`, ask],
+    paid: [`Your ad goes up on the grounds for the Expo week. Print size: ${s?.size || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
     cancelled: [r.cancelled_by === "admin" ? "The Expo team cancelled it." : "You cancelled it, so nothing will be charged.", note, ask],
   };
   return compose([
@@ -2200,12 +2203,19 @@ module.exports = function loveworldExpoRoutes() {
   }));
 
   // ?q= searches name (KingsChat's and the profile's), username and email; ?exhibitor= is one exhibitor's team.
+  // Newest first. ?q= (name, username, email) and ?exhibitor= (a team) narrow it; ?limit= and ?offset=
+  // page through it, and `total` is how many match in all.
   router.get("/expo/admin/users", requireAdmin, asyncHandler(async (req, res) => {
     const needle = clean(req.query.q, 100).toLowerCase();
     const exhibitor = clean(req.query.exhibitor, 80);
-    const rows = await q(`${ADMIN_USER_SELECT} WHERE ($1 = '' OR lower(coalesce(u.kc_username,'') || ' ' || coalesce(u.kc_name,'') || ' ' || coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'') || ' ' || coalesce(u.email,'')) LIKE '%' || $1 || '%')
-       AND ($2 = '' OR u.exhibitor_id = $2) ORDER BY u.created_at DESC LIMIT $3`, [needle, exhibitor, limit(req)]);
-    ok(res, { users: rows.map(shapeAdminUser) });
+    const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
+    const where = `WHERE ($1 = '' OR lower(coalesce(u.kc_username,'') || ' ' || coalesce(u.kc_name,'') || ' ' || coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'') || ' ' || coalesce(u.email,'')) LIKE '%' || $1 || '%')
+       AND ($2 = '' OR u.exhibitor_id = $2)`;
+    const [rows, count] = await Promise.all([
+      q(`${ADMIN_USER_SELECT} ${where} ORDER BY u.created_at DESC, u.id LIMIT $3 OFFSET $4`, [needle, exhibitor, limit(req), offset]),
+      q1(`SELECT count(*)::int AS n FROM users u ${where}`, [needle, exhibitor]),
+    ]);
+    ok(res, { users: rows.map(shapeAdminUser), total: count?.n ?? rows.length, offset });
   }));
 
   // Puts an account on an exhibitor's team (it then runs that exhibitor at /expo/exhibitor), or takes it off (exhibitorId null or "").
