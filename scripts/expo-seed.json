@@ -1801,12 +1801,12 @@
   },
   {
     "id": "leaders-school-of-ministry",
-    "name": "Leaders School of Ministry (LSM)",
+    "name": "LoveWorld School of Ministry (LSM)",
     "category": "Education",
     "zone": "4",
     "stand": "",
-    "tagline": "Leaders School of Ministry (LSM)",
-    "description": "Talk to the Leaders School of Ministry (LSM) team in Pavilion 4, the Healing Dome.",
+    "tagline": "LoveWorld School of Ministry (LSM)",
+    "description": "Talk to the LoveWorld School of Ministry (LSM) team in Pavilion 4, the Healing Dome.",
     "smartMeet": true,
     "sort": 150,
     "active": true
