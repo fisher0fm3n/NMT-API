@@ -116,16 +116,19 @@ const PASSES = {
 };
 
 // The ad spaces on the grounds: their price in Espees a space, how many there are (`spots`), how many
-// of those are already gone outside the site (`reserved`, counted as taken), and the most one account
-// may hold (`perAccount`: its proposals being reviewed, approved or paid). Keep in step with the
-// website's src/data/advertise.ts (a proposal at a price it shows differently is refused).
+// of those are already gone outside the site (`reserved`, counted as taken), and the most any one
+// product or service may hold (`perProduct`: one account's proposals with that title, being reviewed,
+// approved or paid). The video advert has no limit on either (null), and comes as a link to the video
+// (`kind: "video"`), one to a proposal. Keep in step with the website's src/data/advertise.ts (a
+// proposal at a price it shows differently is refused).
 const AD_SPACES = {
-  lampposts: { name: "Main Road Lamp Posts", size: "2 ft 6\" wide × 6 ft 7\" high", price: 300, spots: 31, perAccount: 2 },
-  "angel-court": { name: "Angel Court Exterior Perimeter", size: "11 ft 6\" wide × 9 ft 10\" high", price: 1500, spots: 29, perAccount: 5 },
-  amphitheatre: { name: "Amphitheatre Exterior", size: "28 ft wide × 37 ft high", price: 3000, spots: 36, perAccount: 4 },
-  "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 200, spots: 171, reserved: 71, perAccount: 5 },
+  lampposts: { name: "Main Road Lamp Posts", size: "2 ft 6\" wide × 6 ft 7\" high", price: 300, spots: 31, perProduct: 2 },
+  "angel-court": { name: "Angel Court Exterior Perimeter", size: "11 ft 6\" wide × 9 ft 10\" high", price: 1500, spots: 29, perProduct: 5 },
+  amphitheatre: { name: "Amphitheatre Exterior", size: "28 ft wide × 37 ft high", price: 3000, spots: 36, reserved: 11, perProduct: 4 },
+  "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 1500, spots: 171, reserved: 101, perProduct: 4 },
+  video: { name: "Video Advert", size: "30 seconds, 1080 × 1920 HD MP4", price: 2000, spots: null, perProduct: null, kind: "video" },
   // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
-  test: { name: "Test ad space", size: "2 ft 6\" wide × 6 ft 7\" high", price: 0.001, spots: 100, perAccount: 10, adminOnly: true },
+  test: { name: "Test ad space", size: "2 ft 6\" wide × 6 ft 7\" high", price: 0.001, spots: 100, perProduct: 10, adminOnly: true },
 };
 // When print artwork is due, as the Expo team announced it (said in the approval and payment messages).
 const AD_ARTWORK_DEADLINE = env("EXPO_AD_ARTWORK_DEADLINE") || "Wednesday 4 November, 3pm (GMT+1)";
@@ -414,6 +417,8 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS ad_proposals_user ON ad_proposals (user_id, created_at DESC);
   CREATE INDEX IF NOT EXISTS ad_proposals_space ON ad_proposals (space, status);
+  -- A video advert's video: the link the owner gave to it.
+  ALTER TABLE ad_proposals ADD COLUMN IF NOT EXISTS video_url TEXT;
   CREATE TABLE IF NOT EXISTS ad_artwork (
     id UUID PRIMARY KEY,
     proposal_id UUID NOT NULL REFERENCES ad_proposals(id) ON DELETE CASCADE,
@@ -1337,7 +1342,7 @@ function paymentDetails(p) {
  * Ad spaces: proposed, approved by the Expo team, then paid in Espees
  * ------------------------------------------------------------------------- */
 
-// What counts toward an account's limit, and what takes spots from a space (an approval holds them).
+// What counts toward a product's limit, and what takes spots from a space (an approval holds them).
 const AD_HOLDING = ["pending", "approved", "paid"];
 const AD_TAKEN = ["approved", "paid"];
 // A payment still with Espees, taken but not yet confirmed, or without a clear answer: the proposal
@@ -1349,6 +1354,18 @@ const AD_ARTWORK_MAX_BYTES = Math.floor(1.4 * 1024 * 1024);
 const AD_ARTWORK_MAX = 6;
 
 const adSpace = (id) => (Object.hasOwn(AD_SPACES, id) ? AD_SPACES[id] : null);
+/** A proposal's product or service as its limit counts it: the same title, whatever its spacing or capitals. */
+const productKey = (title) => clean(title, 120).replace(/\s+/g, " ").toLowerCase();
+/** A video advert's link: an http(s) address, up to 500 characters, or null. */
+function videoLink(v) {
+  const text = clean(v, 500);
+  try {
+    const u = new URL(text);
+    return /^https?:$/.test(u.protocol) && u.hostname.includes(".") ? u.href : null;
+  } catch {
+    return null;
+  }
+}
 /** A one-time key from the website (8 to 80 letters, digits, - and _), or null. */
 const clientKey = (v) => (typeof v === "string" && /^[\w-]{8,80}$/.test(v) ? v : null);
 /** The payment link an approval makes (on the website), while there is something to pay or see. */
@@ -1363,18 +1380,29 @@ function imageType(buf) {
 
 /**
  * Each ad space with what's left of it (`remaining`: approved and paid proposals take spots, as do its
- * `reserved` ones) and, for a signed-in person, how many they hold (`yours`). `db` may be a client in a
- * transaction. The admin-only test space is there only with `test`.
+ * `reserved` ones; null with no limit) and, for a signed-in person, how many each of their products
+ * holds there (`held`: [{ title, quantity }], titles told apart as productKey does). `db` may be a
+ * client in a transaction. The admin-only test space is there only with `test`.
  */
 async function adSpaces(userId = null, db = pool, { test = false } = {}) {
   const rows = (await db.query(
-    `SELECT space, COALESCE(sum(quantity) FILTER (WHERE status = ANY($2)), 0)::int AS taken,
-            COALESCE(sum(quantity) FILTER (WHERE user_id = $1::uuid AND status = ANY($3)), 0)::int AS yours
-       FROM ad_proposals GROUP BY space`, [userId, AD_TAKEN, AD_HOLDING])).rows;
+    `SELECT space, COALESCE(sum(quantity) FILTER (WHERE status = ANY($1)), 0)::int AS taken FROM ad_proposals GROUP BY space`, [AD_TAKEN])).rows;
+  const mine = userId
+    ? (await db.query(`SELECT space, title, sum(quantity)::int AS quantity FROM ad_proposals WHERE user_id = $1 AND status = ANY($2) GROUP BY space, title ORDER BY min(created_at)`, [userId, AD_HOLDING])).rows
+    : [];
   return Object.entries(AD_SPACES).filter(([, s]) => test || !s.adminOnly).map(([id, s]) => {
     const row = rows.find((r) => r.space === id);
     const taken = (s.reserved || 0) + (row?.taken ?? 0);
-    return { id, name: s.name, size: s.size, price: s.price, spots: s.spots, taken, remaining: Math.max(0, s.spots - taken), perAccount: s.perAccount, yours: userId ? row?.yours ?? 0 : null, adminOnly: !!s.adminOnly };
+    const held = [];
+    for (const m of mine.filter((m) => m.space === id)) {
+      const same = held.find((h) => productKey(h.title) === productKey(m.title));
+      if (same) same.quantity += m.quantity;
+      else held.push({ title: m.title, quantity: m.quantity });
+    }
+    return {
+      id, name: s.name, size: s.size, price: s.price, kind: s.kind || "print", spots: s.spots, taken,
+      remaining: s.spots == null ? null : Math.max(0, s.spots - taken), perProduct: s.perProduct, held: userId ? held : null, adminOnly: !!s.adminOnly,
+    };
   });
 }
 /** Whether the account may see and use the admin-only test space. */
@@ -1395,7 +1423,7 @@ function shapeAd(r, { artwork = [], admin = false } = {}) {
   const s = adSpace(r.space);
   return {
     id: r.id, reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: s?.size || "",
-    quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total), title: r.title, description: r.description,
+    quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total), title: r.title, description: r.description, videoUrl: r.video_url || null,
     status: r.status, reviewNote: r.review_note || null, payUrl: adPayUrl(r),
     paymentStatus: r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null, paymentError: r.payment_error || null,
     createdAt: r.created_at, reviewedAt: r.reviewed_at || null, paidAt: r.paid_at || null, cancelledAt: r.cancelled_at || null, cancelledBy: r.cancelled_by || null,
@@ -1425,11 +1453,12 @@ function adMessage(kind, r) {
   };
   const note = r.review_note ? `${kind === "rejected" ? "Reason" : "Note"}: ${short(r.review_note, 300)}` : "";
   const ask = `Questions? Message ${EXPO_KC_HANDLE} on KingsChat.`;
+  const video = s?.kind === "video";
   const next = {
     submitted: ["The Expo team will review your proposal. Once it's approved, we'll send you the link to pay here on KingsChat. Nothing is charged before then.", site("/my-expo#ads") && `Your proposals: ${site("/my-expo#ads")}`],
-    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", "Your spaces are held for you until you pay.", `Print artwork is due by ${AD_ARTWORK_DEADLINE}.`, ask],
+    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", video ? "" : "Your spaces are held for you until you pay.", video ? "" : `Print artwork is due by ${AD_ARTWORK_DEADLINE}.`, ask],
     rejected: [note, ask, site("/advertise") && `Send a new proposal: ${site("/advertise")}`],
-    paid: [`Your ad goes up on the grounds for the Expo week. Print size: ${s?.size || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
+    paid: [video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${s?.size || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
     cancelled: [r.cancelled_by === "admin" ? "The Expo team cancelled it." : "You cancelled it, so nothing will be charged.", note, ask],
   };
   return compose([
@@ -1438,6 +1467,7 @@ function adMessage(kind, r) {
     `Reference: ${r.reference}`,
     `Space: ${r.quantity} × ${s?.name || r.space}`,
     `Ad: ${short(r.title, 120)}`,
+    r.video_url ? `Video: ${r.video_url}` : "",
     `${kind === "paid" ? "Paid" : "Total"}: ${amountLabel(r.total)}`,
     GAP,
     ...next[kind],
@@ -1933,24 +1963,30 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [] })), spaces: await adSpaces(req.expoUserId, pool, { test: await isAdminUser(req.expoUserId) }) });
   }));
 
-  // { space, quantity, title, description, expectedPrice?, key? }. Nothing is charged: the proposal
-  // waits for the Expo team (pending), and the person hears on KingsChat that it's in. One account
-  // holds at most a space's perAccount (what it has waiting, approved or paid counts), and no more
-  // than are left. `key` (8 to 80 letters, digits, - and _): the same key sent again by the same
-  // person gives back the proposal it made (200, repeated: true), not a second one, and no message.
+  // { space, quantity, title, description, videoUrl?, expectedPrice?, key? }. Nothing is charged: the
+  // proposal waits for the Expo team (pending), and the person hears on KingsChat that it's in. Each
+  // product or service (one account's proposals with that title) holds at most a space's perProduct
+  // (what it has waiting, approved or paid counts), and no more than are left. A video advert is one
+  // video, given as a link (videoUrl), with no limit. `key` (8 to 80 letters, digits, - and _): the
+  // same key sent again by the same person gives back the proposal it made (200, repeated: true), not
+  // a second one, and no message.
   router.post("/expo/advertising/proposals", ...user, asyncHandler(async (req, res) => {
     const b = req.body || {};
     const key = clientKey(b.key);
     const spaceId = clean(b.space, 40);
     const s = adSpace(spaceId);
     if (!s || (s.adminOnly && !(await isAdminUser(req.expoUserId)))) return fail(res, 400, "bad_space", "Choose one of the ad spaces.");
+    const video = s.kind === "video";
     const quantity = Number(b.quantity ?? 1);
     if (!Number.isInteger(quantity) || quantity < 1) return fail(res, 400, "bad_quantity", "Choose at least 1 space.");
+    if (video && quantity !== 1) return fail(res, 400, "bad_quantity", "A video advert is one video: send a proposal for each.");
     const title = clean(b.title, 120);
     const description = clean(b.description, 1000);
     if (!title) return fail(res, 400, "missing_fields", "Give your ad a title: the product or service it's for.");
     if (!description) return fail(res, 400, "missing_fields", "Say what your ad is about.");
-    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, s.price)) return fail(res, 409, "price_changed", `${s.name} are ${amountLabel(s.price)} a space.`);
+    const videoUrl = video ? videoLink(b.videoUrl) : null;
+    if (video && !videoUrl) return fail(res, 400, "bad_video_link", "Give the link to your video: a web address where the Expo team can download it.");
+    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, s.price)) return fail(res, 409, "price_changed", `${s.name} are ${amountLabel(s.price)} a ${video ? "video" : "space"}.`);
 
     const id = crypto.randomUUID();
     const client = await pool.connect();
@@ -1966,20 +2002,23 @@ module.exports = function loveworldExpoRoutes() {
         return ok(res, { proposal: shapeAd(again, { artwork: (await adArtworkOf([again.id]))[again.id] || [] }), repeated: true });
       }
       const now = (await adSpaces(req.expoUserId, client, { test: true })).find((x) => x.id === spaceId);
-      const room = s.perAccount - now.yours;
-      if (quantity > room) {
-        await client.query("ROLLBACK");
-        return fail(res, 409, "over_limit", room > 0
-          ? `One account can hold up to ${s.perAccount} ${s.name} spaces. You have ${now.yours} already, so you can ask for ${room} more.`
-          : `You already hold the most ${s.name} spaces one account can (${s.perAccount}).`);
+      if (s.perProduct != null) {
+        const have = now.held.filter((h) => productKey(h.title) === productKey(title)).reduce((n, h) => n + h.quantity, 0);
+        const room = s.perProduct - have;
+        if (quantity > room) {
+          await client.query("ROLLBACK");
+          return fail(res, 409, "over_limit", room > 0
+            ? `Each product or service can hold up to ${s.perProduct} ${s.name} spaces. ${title} has ${have} already, so you can ask for ${room} more.`
+            : `${title} already holds the most ${s.name} spaces one product or service can (${s.perProduct}).`);
+        }
       }
-      if (quantity > now.remaining) {
+      if (now.remaining != null && quantity > now.remaining) {
         await client.query("ROLLBACK");
         return fail(res, 409, "not_enough_spaces", now.remaining ? `Only ${now.remaining} ${s.name} space${now.remaining === 1 ? " is" : "s are"} left.` : `${s.name} are fully booked.`);
       }
       row = (await client.query(
-        `INSERT INTO ad_proposals (id, reference, user_id, space, quantity, unit_price, total, title, description, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *`,
-        [id, reference("AD"), req.expoUserId, spaceId, quantity, s.price, Math.round(s.price * quantity * 10000) / 10000, title, description, key])).rows[0];
+        `INSERT INTO ad_proposals (id, reference, user_id, space, quantity, unit_price, total, title, description, video_url, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
+        [id, reference("AD"), req.expoUserId, spaceId, quantity, s.price, Math.round(s.price * quantity * 10000) / 10000, title, description, videoUrl, key])).rows[0];
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -2432,8 +2471,10 @@ module.exports = function loveworldExpoRoutes() {
     const row = await adminStep(req, res, async (r, client) => {
       if (r.status !== "pending") return [409, "not_pending", `This proposal is ${r.status}.`];
       await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-ad-space:${r.space}`]);
-      const left = (await adSpaces(null, client, { test: true })).find((s) => s.id === r.space)?.remaining ?? 0;
-      if (r.quantity > left) return [409, "not_enough_spaces", `Only ${left} of these space${left === 1 ? " is" : "s are"} left, and this proposal is for ${r.quantity}.`];
+      // A space with no limit (the video advert) has no `remaining`; one no longer offered has none left.
+      const sp = (await adSpaces(null, client, { test: true })).find((s) => s.id === r.space);
+      const left = sp ? sp.remaining : 0;
+      if (left != null && r.quantity > left) return [409, "not_enough_spaces", `Only ${left} of these space${left === 1 ? " is" : "s are"} left, and this proposal is for ${r.quantity}.`];
       return (await client.query(`UPDATE ad_proposals SET status = 'approved', pay_token = $2, review_note = $3, reviewed_at = now() WHERE id = $1 RETURNING *`,
         [r.id, b64url(crypto.randomBytes(24)), clean(req.body?.note, 1000) || null])).rows[0];
     });

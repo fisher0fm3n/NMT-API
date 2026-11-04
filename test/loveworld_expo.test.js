@@ -983,12 +983,15 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
     return rows;
   };
 
-  // The spaces as they start; signed out, nothing is "yours".
+  // The spaces as they start; signed out, nothing is held. The video advert has no limit.
   let spaces = (await api("GET", "/expo/advertising/spaces", { token: ade })).json.spaces;
-  assert.deepEqual(spaces.map((s) => [s.id, s.price, s.spots, s.remaining, s.perAccount, s.yours]), [["lampposts", 300, 31, 31, 2, 0], ["angel-court", 1500, 29, 29, 5, 0], ["amphitheatre", 3000, 36, 36, 4, 0], ["light-boxes", 200, 171, 100, 5, 0]]);
-  // 71 light boxes are already gone outside the site: they count as taken.
-  assert.equal(spaces.find((s) => s.id === "light-boxes").taken, 71);
-  assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].yours, null);
+  assert.deepEqual(spaces.map((s) => [s.id, s.kind, s.price, s.spots, s.remaining, s.perProduct, s.held]), [
+    ["lampposts", "print", 300, 31, 31, 2, []], ["angel-court", "print", 1500, 29, 29, 5, []], ["amphitheatre", "print", 3000, 36, 25, 4, []],
+    ["light-boxes", "print", 1500, 171, 70, 4, []], ["video", "video", 2000, null, null, null, []],
+  ]);
+  // 101 light boxes and 11 Amphitheatre spaces are already gone outside the site: they count as taken.
+  assert.deepEqual(spaces.filter((s) => s.taken).map((s) => [s.id, s.taken]), [["amphitheatre", 11], ["light-boxes", 101]]);
+  assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].held, null);
 
   // Refused before anything is kept.
   assert.equal((await api("POST", "/expo/advertising/proposals", { body: { space: "lampposts", title: "x", description: "y" } })).status, 401);
@@ -1012,12 +1015,14 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   assert.match(told(ad.reference)[0], /proposal received/);
   assert.match(told(ad.reference)[0], /1 × Main Road Lamp Posts/);
 
-  // A proposal being reviewed counts toward the account's limit (2), not the space's spots.
+  // A proposal being reviewed counts toward its product's limit (2), not the space's spots: the same
+  // title, however it's spaced or capitalised.
   const over = await propose({ space: "lampposts", quantity: 2 });
   assert.deepEqual([over.status, over.json.error], [409, "over_limit"]);
   assert.match(over.json.message, /ask for 1 more/);
+  assert.equal((await propose({ space: "lampposts", quantity: 2, title: "  ade's   BAKERY " })).json.error, "over_limit");
   spaces = (await api("GET", "/expo/advertising/spaces", { token: ade })).json.spaces;
-  assert.deepEqual([spaces[0].remaining, spaces[0].yours], [31, 1]);
+  assert.deepEqual([spaces[0].remaining, spaces[0].held], [31, [{ title: "Ade's Bakery", quantity: 1 }]]);
 
   // Artwork: images only (told by their content), the owner's own, while it's being reviewed.
   const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(64, 1)]);
@@ -1086,9 +1091,13 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   assert.equal((await api("POST", `/expo/advertising/proposals/${ad.id}/cancel`, { token: ade })).json.error, "not_cancellable");
   assert.equal((await step(ad.id, "reject", { reason: "x" })).json.error, "not_rejectable");
 
-  // Turned down with a reason, which the owner is told; that frees their limit again.
+  // Turned down with a reason, which the owner is told; that frees their limit again. The limit is the
+  // product's: the same account can still propose another product (withdrawn here, so it holds none).
   const g = (await propose({ space: "angel-court", quantity: 5, title: "Grace Fashion" }, grace)).json.proposal;
-  assert.equal((await propose({ space: "angel-court", quantity: 1 }, grace)).json.error, "over_limit");
+  assert.equal((await propose({ space: "angel-court", quantity: 1, title: "Grace Fashion" }, grace)).json.error, "over_limit");
+  const shoes = await propose({ space: "angel-court", quantity: 1, title: "Grace Shoes" }, grace);
+  assert.equal(shoes.status, 201, JSON.stringify(shoes.json));
+  assert.equal((await api("POST", `/expo/advertising/proposals/${shoes.json.proposal.id}/cancel`, { token: grace })).json.proposal.status, "cancelled");
   assert.equal((await step(g.id, "reject")).json.error, "missing_reason");
   assert.equal((await step(g.id, "reject", { reason: "The artwork is missing" })).json.proposal.status, "rejected");
   assert.ok(await eventually(() => told(g.reference).some((t) => t.includes("wasn't approved") && t.includes("Reason: The artwork is missing"))));
@@ -1137,9 +1146,9 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
 
   // The test space, 0.001 Espees a space, for admins only: hidden from everyone else and refused them.
   const spaceIds = async (t) => (await api("GET", "/expo/advertising/spaces", t ? { token: t } : {})).json.spaces.map((s) => s.id);
-  assert.deepEqual(await spaceIds(tolu), ["lampposts", "angel-court", "amphitheatre", "light-boxes"]);
-  assert.deepEqual(await spaceIds(null), ["lampposts", "angel-court", "amphitheatre", "light-boxes"]);
-  assert.deepEqual(await spaceIds(rita), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "test"]);
+  assert.deepEqual(await spaceIds(tolu), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "video"]);
+  assert.deepEqual(await spaceIds(null), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "video"]);
+  assert.deepEqual(await spaceIds(rita), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "video", "test"]);
   assert.equal((await propose({ space: "test", title: "Tolu test" }, tolu)).json.error, "bad_space");
   const tp = (await propose({ space: "test", quantity: 3, title: "Rita's test", expectedPrice: 0.001 }, rita)).json.proposal;
   assert.deepEqual([tp.unitPrice, tp.total], [0.001, 0.003]);
@@ -1178,6 +1187,43 @@ test("ad spaces: a proposal or an image sent again with the same key gives back 
   assert.equal((await art("image-key-0002")).status, 201);
   const mine = (await api("GET", "/expo/advertising/proposals", { token: tolu })).json.proposals.find((p) => p.id === first.json.proposal.id);
   assert.equal(mine.artwork.length, 2);
+});
+
+test("ad spaces: a video advert is one video, given as a link, with no limit", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const grace = (await api("POST", "/expo/auth/kingschat", { body: { code: "second-code" } })).json.accessToken;
+  const n0 = kcMessages.length;
+  const told = (ref) => kcMessages.slice(n0).map((m) => m.message.body.text.body).filter((t) => t.includes(ref));
+  const eventually = async (check) => { for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 30)); return check(); };
+  const propose = (body) => api("POST", "/expo/advertising/proposals", { token: grace, body: { space: "video", title: "Grace Fashion", description: "The new collection", videoUrl: "https://drive.example.com/grace.mp4", ...body } });
+
+  // A web address to download it from, and one video to a proposal.
+  assert.equal((await propose({ videoUrl: "" })).json.error, "bad_video_link");
+  assert.equal((await propose({ videoUrl: "grace.mp4" })).json.error, "bad_video_link");
+  assert.equal((await propose({ videoUrl: "javascript:alert(1)" })).json.error, "bad_video_link");
+  assert.equal((await propose({ quantity: 2 })).json.error, "bad_quantity");
+  assert.equal((await propose({ expectedPrice: 200 })).json.error, "price_changed");
+
+  // No limit for a product, nor in all: five for the same one are all taken, and approved.
+  const made = [];
+  for (let i = 0; i < 5; i++) {
+    const p = await propose({ expectedPrice: 2000 });
+    assert.equal(p.status, 201, JSON.stringify(p.json));
+    made.push(p.json.proposal);
+  }
+  assert.deepEqual([made[0].spaceName, made[0].quantity, made[0].total, made[0].videoUrl], ["Video Advert", 1, 2000, "https://drive.example.com/grace.mp4"]);
+  const approved = await api("POST", `/expo/admin/advertising/${made[0].id}/approve`, { headers: admin, body: {} });
+  assert.equal(approved.json.proposal.status, "approved", JSON.stringify(approved.json));
+  const space = (await api("GET", "/expo/advertising/spaces", { token: grace })).json.spaces.find((s) => s.id === "video");
+  assert.deepEqual([space.spots, space.remaining, space.perProduct, space.held], [null, null, null, [{ title: "Grace Fashion", quantity: 5 }]]);
+
+  // The admin sees the link; the owner is told with it, and nothing about print.
+  const listed = (await api("GET", "/expo/admin/advertising", { headers: admin })).json.proposals.find((x) => x.id === made[0].id);
+  assert.equal(listed.videoUrl, "https://drive.example.com/grace.mp4");
+  assert.ok(await eventually(() => told(made[0].reference).some((t) => t.includes("is approved"))));
+  const approvedText = told(made[0].reference).find((t) => t.includes("is approved"));
+  assert.match(approvedText, /Video: https:\/\/drive\.example\.com\/grace\.mp4/);
+  assert.doesNotMatch(approvedText, /Print artwork|spaces are held/);
 });
 
 test("admins page through the accounts: limit and offset, with how many match in all", async () => {
