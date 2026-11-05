@@ -119,11 +119,20 @@ const PASSES = {
 // of those are already gone outside the site (`reserved`, counted as taken), and the most any one
 // product or service may hold (`perProduct`: one account's proposals with that title, being reviewed,
 // approved or paid). The video advert has no limit on either (null), and comes as a link to the video
-// (`kind: "video"`), one to a proposal. Keep in step with the website's src/data/advertise.ts (a
-// proposal at a price it shows differently is refused).
+// (`kind: "video"`), one to a proposal. A space with `sizes` is booked in one of them, at that size's
+// price (its own `size` and `price` are what it's listed with: the sizes, and the lowest price); its
+// spots and limit are for all its sizes together. Keep in step with the website's
+// src/data/advertise.ts (a proposal at a price it shows differently is refused).
 const AD_SPACES = {
   lampposts: { name: "Main Road Lamp Posts", size: "2 ft 6\" wide × 6 ft 7\" high", price: 300, spots: 31, perProduct: 2 },
-  "angel-court": { name: "Angel Court Exterior Perimeter", size: "11 ft 6\" wide × 9 ft 10\" high", price: 1500, spots: 29, perProduct: 5 },
+  "walkway-banners": {
+    name: "Walkway Banners", size: "4 m, 2.5 m or 2 m wide × 2.5 m high", price: 1200, spots: 29, perProduct: 5,
+    sizes: {
+      "4x2.5": { size: "4 m wide × 2.5 m high", price: 1500 },
+      "2.5x2.5": { size: "2.5 m wide × 2.5 m high", price: 1200 },
+      "2x2.5": { size: "2 m wide × 2.5 m high", price: 1200 },
+    },
+  },
   amphitheatre: { name: "Amphitheatre Exterior", size: "28 ft wide × 37 ft high", price: 3000, spots: 36, reserved: 11, perProduct: 4 },
   "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 1500, spots: 171, reserved: 101, perProduct: 4 },
   video: { name: "Video Advert", size: "30 seconds, 1080 × 1920 HD MP4", price: 2000, spots: null, perProduct: null, kind: "video" },
@@ -419,6 +428,8 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS ad_proposals_space ON ad_proposals (space, status);
   -- A video advert's video: the link the owner gave to it.
   ALTER TABLE ad_proposals ADD COLUMN IF NOT EXISTS video_url TEXT;
+  -- For a space that comes in sizes: the one chosen (an id from its AD_SPACES sizes).
+  ALTER TABLE ad_proposals ADD COLUMN IF NOT EXISTS size TEXT;
   CREATE TABLE IF NOT EXISTS ad_artwork (
     id UUID PRIMARY KEY,
     proposal_id UUID NOT NULL REFERENCES ad_proposals(id) ON DELETE CASCADE,
@@ -1354,6 +1365,10 @@ const AD_ARTWORK_MAX_BYTES = Math.floor(1.4 * 1024 * 1024);
 const AD_ARTWORK_MAX = 6;
 
 const adSpace = (id) => (Object.hasOwn(AD_SPACES, id) ? AD_SPACES[id] : null);
+/** One of a space's sizes by its id ({ size, price }), or null (no such size, or a space without sizes). */
+const adSizeOf = (s, id) => (s?.sizes && typeof id === "string" && Object.hasOwn(s.sizes, id) ? s.sizes[id] : null);
+/** What a proposal's print is: its chosen size, or its space's size. */
+const adSizeLabel = (r) => adSizeOf(adSpace(r.space), r.size)?.size || adSpace(r.space)?.size || "";
 /** A proposal's product or service as its limit counts it: the same title, whatever its spacing or capitals. */
 const productKey = (title) => clean(title, 120).replace(/\s+/g, " ").toLowerCase();
 /** A video advert's link: an http(s) address, up to 500 characters, or null. */
@@ -1402,6 +1417,7 @@ async function adSpaces(userId = null, db = pool, { test = false } = {}) {
     return {
       id, name: s.name, size: s.size, price: s.price, kind: s.kind || "print", spots: s.spots, taken,
       remaining: s.spots == null ? null : Math.max(0, s.spots - taken), perProduct: s.perProduct, held: userId ? held : null, adminOnly: !!s.adminOnly,
+      sizes: s.sizes ? Object.entries(s.sizes).map(([sizeId, z]) => ({ id: sizeId, size: z.size, price: z.price })) : null,
     };
   });
 }
@@ -1422,7 +1438,7 @@ async function adArtworkOf(ids) {
 function shapeAd(r, { artwork = [], admin = false } = {}) {
   const s = adSpace(r.space);
   return {
-    id: r.id, reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: s?.size || "",
+    id: r.id, reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: adSizeLabel(r), sizeId: r.size || null,
     quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total), title: r.title, description: r.description, videoUrl: r.video_url || null,
     status: r.status, reviewNote: r.review_note || null, payUrl: adPayUrl(r),
     paymentStatus: r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null, paymentError: r.payment_error || null,
@@ -1436,7 +1452,7 @@ function shapeAd(r, { artwork = [], admin = false } = {}) {
 function shapeAdPayment(r) {
   const s = adSpace(r.space);
   return {
-    reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: s?.size || "", quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total),
+    reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: adSizeLabel(r), sizeId: r.size || null, quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total),
     title: r.title, status: r.status, paymentStatus: r.payment_status || null, paymentError: r.payment_status === "DECLINED" ? r.payment_error || null : null, paidAt: r.paid_at || null,
   };
 }
@@ -1458,14 +1474,14 @@ function adMessage(kind, r) {
     submitted: ["The Expo team will review your proposal. Once it's approved, we'll send you the link to pay here on KingsChat. Nothing is charged before then.", site("/my-expo#ads") && `Your proposals: ${site("/my-expo#ads")}`],
     approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", video ? "" : "Your spaces are held for you until you pay.", video ? "" : `Print artwork is due by ${AD_ARTWORK_DEADLINE}.`, ask],
     rejected: [note, ask, site("/advertise") && `Send a new proposal: ${site("/advertise")}`],
-    paid: [video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${s?.size || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
+    paid: [video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${adSizeLabel(r) || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
     cancelled: [r.cancelled_by === "admin" ? "The Expo team cancelled it." : "You cancelled it, so nothing will be charged.", note, ask],
   };
   return compose([
     `${heads[kind]} · LoveWorld Expo 2026`,
     GAP,
     `Reference: ${r.reference}`,
-    `Space: ${r.quantity} × ${s?.name || r.space}`,
+    `Space: ${r.quantity} × ${s?.name || r.space}${adSizeOf(s, r.size) ? `, ${adSizeOf(s, r.size).size}` : ""}`,
     `Ad: ${short(r.title, 120)}`,
     r.video_url ? `Video: ${r.video_url}` : "",
     `${kind === "paid" ? "Paid" : "Total"}: ${amountLabel(r.total)}`,
@@ -1963,8 +1979,9 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [] })), spaces: await adSpaces(req.expoUserId, pool, { test: await isAdminUser(req.expoUserId) }) });
   }));
 
-  // { space, quantity, title, description, videoUrl?, expectedPrice?, key? }. Nothing is charged: the
-  // proposal waits for the Expo team (pending), and the person hears on KingsChat that it's in. Each
+  // { space, size?, quantity, title, description, videoUrl?, expectedPrice?, key? }. Nothing is charged:
+  // the proposal waits for the Expo team (pending), and the person hears on KingsChat that it's in. A
+  // space that comes in sizes needs one of them (`size`, its id), at that size's price. Each
   // product or service (one account's proposals with that title) holds at most a space's perProduct
   // (what it has waiting, approved or paid counts), and no more than are left. A video advert is one
   // video, given as a link (videoUrl), with no limit. `key` (8 to 80 letters, digits, - and _): the
@@ -1986,7 +2003,10 @@ module.exports = function loveworldExpoRoutes() {
     if (!description) return fail(res, 400, "missing_fields", "Say what your ad is about.");
     const videoUrl = video ? videoLink(b.videoUrl) : null;
     if (video && !videoUrl) return fail(res, 400, "bad_video_link", "Give the link to your video: a web address where the Expo team can download it.");
-    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, s.price)) return fail(res, 409, "price_changed", `${s.name} are ${amountLabel(s.price)} a ${video ? "video" : "space"}.`);
+    const size = adSizeOf(s, b.size);
+    if (s.sizes && !size) return fail(res, 400, "bad_size", `Choose a size for ${s.name}: ${Object.values(s.sizes).map((z) => z.size).join(", ")}.`);
+    const price = size ? size.price : s.price;
+    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, price)) return fail(res, 409, "price_changed", `${s.name}${size ? `, ${size.size},` : ""} are ${amountLabel(price)} a ${video ? "video" : "space"}.`);
 
     const id = crypto.randomUUID();
     const client = await pool.connect();
@@ -2017,8 +2037,8 @@ module.exports = function loveworldExpoRoutes() {
         return fail(res, 409, "not_enough_spaces", now.remaining ? `Only ${now.remaining} ${s.name} space${now.remaining === 1 ? " is" : "s are"} left.` : `${s.name} are fully booked.`);
       }
       row = (await client.query(
-        `INSERT INTO ad_proposals (id, reference, user_id, space, quantity, unit_price, total, title, description, video_url, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *`,
-        [id, reference("AD"), req.expoUserId, spaceId, quantity, s.price, Math.round(s.price * quantity * 10000) / 10000, title, description, videoUrl, key])).rows[0];
+        `INSERT INTO ad_proposals (id, reference, user_id, space, size, quantity, unit_price, total, title, description, video_url, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
+        [id, reference("AD"), req.expoUserId, spaceId, size ? b.size : null, quantity, price, Math.round(price * quantity * 10000) / 10000, title, description, videoUrl, key])).rows[0];
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});

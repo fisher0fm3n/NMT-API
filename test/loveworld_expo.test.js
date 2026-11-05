@@ -986,9 +986,16 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   // The spaces as they start; signed out, nothing is held. The video advert has no limit.
   let spaces = (await api("GET", "/expo/advertising/spaces", { token: ade })).json.spaces;
   assert.deepEqual(spaces.map((s) => [s.id, s.kind, s.price, s.spots, s.remaining, s.perProduct, s.held]), [
-    ["lampposts", "print", 300, 31, 31, 2, []], ["angel-court", "print", 1500, 29, 29, 5, []], ["amphitheatre", "print", 3000, 36, 25, 4, []],
+    ["lampposts", "print", 300, 31, 31, 2, []], ["walkway-banners", "print", 1200, 29, 29, 5, []], ["amphitheatre", "print", 3000, 36, 25, 4, []],
     ["light-boxes", "print", 1500, 171, 70, 4, []], ["video", "video", 2000, null, null, null, []],
   ]);
+  // Walkway banners come in three sizes, each at its own price; the others in one (sizes null).
+  assert.deepEqual(spaces[1].sizes, [
+    { id: "4x2.5", size: "4 m wide × 2.5 m high", price: 1500 },
+    { id: "2.5x2.5", size: "2.5 m wide × 2.5 m high", price: 1200 },
+    { id: "2x2.5", size: "2 m wide × 2.5 m high", price: 1200 },
+  ]);
+  assert.equal(spaces[0].sizes, null);
   // 101 light boxes and 11 Amphitheatre spaces are already gone outside the site: they count as taken.
   assert.deepEqual(spaces.filter((s) => s.taken).map((s) => [s.id, s.taken]), [["amphitheatre", 11], ["light-boxes", 101]]);
   assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].held, null);
@@ -1002,6 +1009,11 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   assert.equal((await propose({ space: "lampposts", quantity: 1.5 })).json.error, "bad_quantity");
   assert.equal((await propose({ space: "lampposts", expectedPrice: 20 })).json.error, "price_changed");
   assert.equal((await propose({ space: "lampposts", quantity: 3 })).json.error, "over_limit");
+  // A space in sizes needs one of its own.
+  assert.equal((await propose({ space: "walkway-banners" })).json.error, "bad_size");
+  assert.equal((await propose({ space: "walkway-banners", size: "5x5" })).json.error, "bad_size");
+  assert.equal((await propose({ space: "walkway-banners", size: "toString" })).json.error, "bad_size");
+  assert.equal((await propose({ space: "walkway-banners", size: "4x2.5", expectedPrice: 1200 })).json.error, "price_changed");
 
   // Submitted: pending, at the space's price, nothing charged, and the owner told it's in.
   const charges = espeesCharges.length;
@@ -1093,35 +1105,41 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
 
   // Turned down with a reason, which the owner is told; that frees their limit again. The limit is the
   // product's: the same account can still propose another product (withdrawn here, so it holds none).
-  const g = (await propose({ space: "angel-court", quantity: 5, title: "Grace Fashion" }, grace)).json.proposal;
-  assert.equal((await propose({ space: "angel-court", quantity: 1, title: "Grace Fashion" }, grace)).json.error, "over_limit");
-  const shoes = await propose({ space: "angel-court", quantity: 1, title: "Grace Shoes" }, grace);
+  const g = (await propose({ space: "walkway-banners", size: "4x2.5", quantity: 5, title: "Grace Fashion", expectedPrice: 1500 }, grace)).json.proposal;
+  assert.deepEqual([g.size, g.sizeId, g.unitPrice, g.total], ["4 m wide × 2.5 m high", "4x2.5", 1500, 7500]);
+  assert.ok(await eventually(() => told(g.reference).some((t) => t.includes("5 × Walkway Banners, 4 m wide × 2.5 m high"))));
+  // The limit is for all the sizes together.
+  assert.equal((await propose({ space: "walkway-banners", size: "2x2.5", quantity: 1, title: "Grace Fashion" }, grace)).json.error, "over_limit");
+  const shoes = await propose({ space: "walkway-banners", size: "2x2.5", quantity: 1, title: "Grace Shoes", expectedPrice: 1200 }, grace);
   assert.equal(shoes.status, 201, JSON.stringify(shoes.json));
+  assert.deepEqual([shoes.json.proposal.size, shoes.json.proposal.unitPrice], ["2 m wide × 2.5 m high", 1200]);
+  assert.deepEqual((await stored(`SELECT size, unit_price::float AS price FROM ad_proposals WHERE id = $1`, [shoes.json.proposal.id]))[0], { size: "2x2.5", price: 1200 });
   assert.equal((await api("POST", `/expo/advertising/proposals/${shoes.json.proposal.id}/cancel`, { token: grace })).json.proposal.status, "cancelled");
   assert.equal((await step(g.id, "reject")).json.error, "missing_reason");
   assert.equal((await step(g.id, "reject", { reason: "The artwork is missing" })).json.proposal.status, "rejected");
   assert.ok(await eventually(() => told(g.reference).some((t) => t.includes("wasn't approved") && t.includes("Reason: The artwork is missing"))));
   // Withdrawn by its owner (only theirs), and they're told.
-  const g2 = (await propose({ space: "angel-court", quantity: 5, title: "Grace Fashion" }, grace)).json.proposal;
+  const g2 = (await propose({ space: "walkway-banners", size: "2.5x2.5", quantity: 5, title: "Grace Fashion" }, grace)).json.proposal;
   assert.equal((await api("POST", `/expo/advertising/proposals/${g2.id}/cancel`, { token: ade })).status, 404);
   assert.equal((await api("POST", `/expo/advertising/proposals/${g2.id}/cancel`, { token: grace })).json.proposal.status, "cancelled");
   assert.ok(await eventually(() => told(g2.reference).some((t) => t.includes("is cancelled") && t.includes("You cancelled it"))));
 
-  // Approvals take spots: 29 Angel Court spaces, five accounts' 5 each approved leave 4, which Tolu's
-  // 4 then take, so his last one can't be approved, and no new one for more than is left is taken.
+  // Approvals take spots: 29 walkway banners in all their sizes, five accounts' 5 each approved leave
+  // 4, which Tolu's 4 then take, so his last one can't be approved, and no new one for more than is
+  // left is taken, whatever its size.
   const [extra1, extra2] = [await signIn("extra-1"), await signIn("extra-2")];
   const ids = [];
-  for (const [t, title] of [[grace, "Grace Fashion"], [ade, "Ade's Bakery"], [extra1, "Extra One"], [extra2, "Extra Two"], [rita, "Rita's Books"]]) {
-    const x = (await propose({ space: "angel-court", quantity: 5, title }, t)).json.proposal;
+  for (const [t, title, size] of [[grace, "Grace Fashion", "4x2.5"], [ade, "Ade's Bakery", "2.5x2.5"], [extra1, "Extra One", "2x2.5"], [extra2, "Extra Two", "4x2.5"], [rita, "Rita's Books", "2x2.5"]]) {
+    const x = (await propose({ space: "walkway-banners", size, quantity: 5, title }, t)).json.proposal;
     ids.push(x);
   }
-  const t2 = (await propose({ space: "angel-court", quantity: 4, title: "Tolu Tech" }, tolu)).json.proposal;
-  const t3 = (await propose({ space: "angel-court", quantity: 1, title: "Tolu Tech" }, tolu)).json.proposal;
+  const t2 = (await propose({ space: "walkway-banners", size: "2.5x2.5", quantity: 4, title: "Tolu Tech" }, tolu)).json.proposal;
+  const t3 = (await propose({ space: "walkway-banners", size: "4x2.5", quantity: 1, title: "Tolu Tech" }, tolu)).json.proposal;
   for (const x of ids) assert.equal((await step(x.id, "approve")).json.proposal.status, "approved");
   assert.equal((await step(t2.id, "approve")).json.proposal.status, "approved");
   const full = await step(t3.id, "approve");
   assert.deepEqual([full.status, full.json.error], [409, "not_enough_spaces"]);
-  assert.equal((await propose({ space: "angel-court", quantity: 1 }, await signIn("extra-3"))).json.error, "not_enough_spaces");
+  assert.equal((await propose({ space: "walkway-banners", size: "2x2.5", quantity: 1 }, await signIn("extra-3"))).json.error, "not_enough_spaces");
   // An approved one cancelled by the team gives its spots back.
   assert.equal((await step(t2.id, "cancel", { reason: "Duplicate" })).json.proposal.status, "cancelled");
   assert.ok(await eventually(() => told(t2.reference).some((t) => t.includes("The Expo team cancelled it") && t.includes("Note: Duplicate"))));
@@ -1141,14 +1159,14 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   assert.equal((await step(rl.id, "reopen")).json.error, "not_reopenable");
   const marked = await step(rl.id, "paid");
   assert.deepEqual([marked.json.proposal.status, marked.json.proposal.paymentStatus], ["paid", "MARKED_PAID"]);
-  assert.ok(await eventually(() => told(rl.reference).some((t) => t.includes("Payment received"))));
+  assert.ok(await eventually(() => told(rl.reference).some((t) => t.includes("Payment received") && t.includes("Print size: 2 m wide × 2.5 m high"))));
   assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[1].remaining, 3);
 
   // The test space, 0.001 Espees a space, for admins only: hidden from everyone else and refused them.
   const spaceIds = async (t) => (await api("GET", "/expo/advertising/spaces", t ? { token: t } : {})).json.spaces.map((s) => s.id);
-  assert.deepEqual(await spaceIds(tolu), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "video"]);
-  assert.deepEqual(await spaceIds(null), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "video"]);
-  assert.deepEqual(await spaceIds(rita), ["lampposts", "angel-court", "amphitheatre", "light-boxes", "video", "test"]);
+  assert.deepEqual(await spaceIds(tolu), ["lampposts", "walkway-banners", "amphitheatre", "light-boxes", "video"]);
+  assert.deepEqual(await spaceIds(null), ["lampposts", "walkway-banners", "amphitheatre", "light-boxes", "video"]);
+  assert.deepEqual(await spaceIds(rita), ["lampposts", "walkway-banners", "amphitheatre", "light-boxes", "video", "test"]);
   assert.equal((await propose({ space: "test", title: "Tolu test" }, tolu)).json.error, "bad_space");
   const tp = (await propose({ space: "test", quantity: 3, title: "Rita's test", expectedPrice: 0.001 }, rita)).json.proposal;
   assert.deepEqual([tp.unitPrice, tp.total], [0.001, 0.003]);
