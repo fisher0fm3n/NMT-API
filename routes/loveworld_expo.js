@@ -124,7 +124,7 @@ const PASSES = {
 // spots and limit are for all its sizes together. Keep in step with the website's
 // src/data/advertise.ts (a proposal at a price it shows differently is refused).
 const AD_SPACES = {
-  lampposts: { name: "Main Road Lamp Posts", size: "2 ft 6\" wide × 6 ft 7\" high", price: 300, spots: 31, perProduct: 2 },
+  lampposts: { name: "Main Road Lamp Posts", size: "0.76 m wide × 2.01 m high", price: 300, spots: 31, perProduct: 2 },
   "walkway-banners": {
     name: "Walkway Banners", size: "4 m, 2.5 m or 2 m wide × 2.5 m high", price: 1200, spots: 29, perProduct: 5,
     sizes: {
@@ -133,11 +133,11 @@ const AD_SPACES = {
       "2x2.5": { size: "2 m wide × 2.5 m high", price: 1200 },
     },
   },
-  amphitheatre: { name: "Amphitheatre Exterior", size: "28 ft wide × 37 ft high", price: 3000, spots: 36, reserved: 11, perProduct: 4 },
+  amphitheatre: { name: "Amphitheatre Exterior", size: "8.53 m wide × 11.28 m high", price: 3000, spots: 36, reserved: 11, perProduct: 4 },
   "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 1500, spots: 171, reserved: 101, perProduct: 4 },
   video: { name: "Video Advert", size: "30 seconds, 1080 × 1920 HD MP4", price: 2000, spots: null, perProduct: null, kind: "video" },
   // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
-  test: { name: "Test ad space", size: "2 ft 6\" wide × 6 ft 7\" high", price: 0.001, spots: 100, perProduct: 10, adminOnly: true },
+  test: { name: "Test ad space", size: "0.76 m wide × 2.01 m high", price: 0.001, spots: 100, perProduct: 10, adminOnly: true },
 };
 // When print artwork is due, as the Expo team announced it (said in the approval and payment messages).
 const AD_ARTWORK_DEADLINE = env("EXPO_AD_ARTWORK_DEADLINE") || "Wednesday 4 November, 3pm (GMT+1)";
