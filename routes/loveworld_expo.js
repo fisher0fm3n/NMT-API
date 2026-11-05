@@ -121,23 +121,24 @@ const PASSES = {
 // approved or paid). The video advert has no limit on either (null), and comes as a link to the video
 // (`kind: "video"`), one to a proposal. A space with `sizes` is booked in one of them, at that size's
 // price (its own `size` and `price` are what it's listed with: the sizes, and the lowest price); its
-// spots and limit are for all its sizes together. Keep in step with the website's
+// spots and limit are for all its sizes together. A printed space's `ppi` is the resolution its print
+// file's images need at full size (said in the messages). Keep in step with the website's
 // src/data/advertise.ts (a proposal at a price it shows differently is refused).
 const AD_SPACES = {
-  lampposts: { name: "Main Road Lamp Posts", size: "0.76 m wide × 2.01 m high", price: 300, spots: 31, perProduct: 2 },
+  lampposts: { name: "Main Road Lamp Posts", size: "0.76 m wide × 2.01 m high", price: 300, spots: 31, perProduct: 2, ppi: 150 },
   "walkway-banners": {
-    name: "Walkway Banners", size: "4 m, 2.5 m or 2 m wide × 2.5 m high", price: 1200, spots: 29, perProduct: 5,
+    name: "Walkway Banners", size: "4 m, 2.5 m or 2 m wide × 2.5 m high", price: 1200, spots: 29, perProduct: 5, ppi: 100,
     sizes: {
       "4x2.5": { size: "4 m wide × 2.5 m high", price: 1500 },
       "2.5x2.5": { size: "2.5 m wide × 2.5 m high", price: 1200 },
       "2x2.5": { size: "2 m wide × 2.5 m high", price: 1200 },
     },
   },
-  amphitheatre: { name: "Amphitheatre Exterior", size: "8.53 m wide × 11.28 m high", price: 3000, spots: 36, reserved: 11, perProduct: 4 },
-  "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 1500, spots: 171, reserved: 101, perProduct: 4 },
+  amphitheatre: { name: "Amphitheatre Exterior", size: "8.53 m wide × 11.28 m high", price: 3000, spots: 36, reserved: 11, perProduct: 4, ppi: 50 },
+  "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 1500, spots: 171, reserved: 101, perProduct: 4, ppi: 100 },
   video: { name: "Video Advert", size: "30 seconds, 1080 × 1920 HD MP4", price: 2000, spots: null, perProduct: null, kind: "video" },
   // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
-  test: { name: "Test ad space", size: "0.76 m wide × 2.01 m high", price: 0.001, spots: 100, perProduct: 10, adminOnly: true },
+  test: { name: "Test ad space", size: "0.76 m wide × 2.01 m high", price: 0.001, spots: 100, perProduct: 10, ppi: 150, adminOnly: true },
 };
 // When print artwork is due, as the Expo team announced it (said in the approval and payment messages).
 const AD_ARTWORK_DEADLINE = env("EXPO_AD_ARTWORK_DEADLINE") || "Wednesday 4 November, 3pm (GMT+1)";
@@ -1471,14 +1472,16 @@ function adMessage(kind, r) {
   const note = r.review_note ? `${kind === "rejected" ? "Reason" : "Note"}: ${short(r.review_note, 300)}` : "";
   const ask = `Questions? Message ${EXPO_KC_HANDLE} on KingsChat.`;
   const video = s?.kind === "video";
+  // What the print file must be, for a printed space.
+  const printFile = `Print file: a print-ready PDF at ${adSizeLabel(r) || "the size listed"}, full size, with images at ${s?.ppi || 100} dpi (ppi), by ${AD_ARTWORK_DEADLINE}.`;
   const next = {
     submitted: ["The Expo team will review your proposal. Once it's approved, we'll send you the link to pay here on KingsChat. Nothing is charged before then.", site("/my-expo#ads") && `Your proposals: ${site("/my-expo#ads")}`],
-    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", video ? "" : "Your spaces are held for you until you pay.", video ? "" : `Print artwork is due by ${AD_ARTWORK_DEADLINE}.`, ask],
+    approved: [note, adPayUrl(r) ? `Pay ${amountLabel(r.total)} here: ${adPayUrl(r)}` : "Pay from My Expo on the website.", video ? "" : "Your spaces are held for you until you pay.", video ? "" : printFile, ask],
     rejected: [note, ask, site("/advertise") && `Send a new proposal: ${site("/advertise")}`],
-    paid: [video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${adSizeLabel(r) || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
+    paid: [video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. ${printFile}`, ask],
     cancelled: [r.cancelled_by === "admin" ? "The Expo team cancelled it." : "You cancelled it, so nothing will be charged.", note, ask],
     complimentary: [note, "It comes with your sponsorship of the Expo, so there's nothing to pay.",
-      video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${adSizeLabel(r) || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
+      video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. ${printFile}`, ask],
   };
   return compose([
     `${heads[kind]} · LoveWorld Expo 2026`,

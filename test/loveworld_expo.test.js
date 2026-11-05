@@ -1060,7 +1060,7 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   const payUrl = approved.json.proposal.payUrl;
   assert.match(payUrl, /^http:\/\/localhost:3000\/advertise\/pay\?link=[\w-]{32}$/);
   const link = payUrl.split("link=").pop();
-  assert.ok(await eventually(() => told(ad.reference).some((t) => t.includes("is approved") && t.includes(`Pay 300 Espees here: ${payUrl}`) && t.includes("Note: Lovely design") && t.includes("Print artwork is due by Wednesday 4 November, 3pm (GMT+1)."))));
+  assert.ok(await eventually(() => told(ad.reference).some((t) => t.includes("is approved") && t.includes(`Pay 300 Espees here: ${payUrl}`) && t.includes("Note: Lovely design") && t.includes("Print file: a print-ready PDF at 0.76 m wide × 2.01 m high, full size, with images at 150 dpi (ppi), by Wednesday 4 November, 3pm (GMT+1)."))));
   assert.equal((await step(ad.id, "approve")).json.error, "not_pending");
   assert.equal((await art(png.toString("base64"))).json.error, "not_pending");
   assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[0].remaining, 30);
@@ -1159,7 +1159,7 @@ test("ad spaces: proposed, approved with a payment link, paid in Espees; the own
   assert.equal((await step(rl.id, "reopen")).json.error, "not_reopenable");
   const marked = await step(rl.id, "paid");
   assert.deepEqual([marked.json.proposal.status, marked.json.proposal.paymentStatus], ["paid", "MARKED_PAID"]);
-  assert.ok(await eventually(() => told(rl.reference).some((t) => t.includes("Payment received") && t.includes("Print size: 2 m wide × 2.5 m high"))));
+  assert.ok(await eventually(() => told(rl.reference).some((t) => t.includes("Payment received") && t.includes("Print file: a print-ready PDF at 2 m wide × 2.5 m high, full size, with images at 100 dpi (ppi)"))));
   assert.equal((await api("GET", "/expo/advertising/spaces")).json.spaces[1].remaining, 3);
 
   // The test space, 0.001 Espees a space, for admins only: hidden from everyone else and refused them.
