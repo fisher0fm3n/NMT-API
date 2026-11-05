@@ -1466,6 +1466,7 @@ function adMessage(kind, r) {
     rejected: "Your ad space proposal wasn't approved",
     paid: "🎉 Payment received: your ad space is booked",
     cancelled: "Your ad space proposal is cancelled",
+    complimentary: "🎁 Your ad space is booked, complimentary",
   };
   const note = r.review_note ? `${kind === "rejected" ? "Reason" : "Note"}: ${short(r.review_note, 300)}` : "";
   const ask = `Questions? Message ${EXPO_KC_HANDLE} on KingsChat.`;
@@ -1476,6 +1477,8 @@ function adMessage(kind, r) {
     rejected: [note, ask, site("/advertise") && `Send a new proposal: ${site("/advertise")}`],
     paid: [video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${adSizeLabel(r) || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
     cancelled: [r.cancelled_by === "admin" ? "The Expo team cancelled it." : "You cancelled it, so nothing will be charged.", note, ask],
+    complimentary: [note, "It comes with your sponsorship of the Expo, so there's nothing to pay.",
+      video ? "Your video advert is booked for the Expo week." : `Your ad goes up on the grounds for the Expo week. Print size: ${adSizeLabel(r) || "as listed"}, supplied as PNG or print PDF by ${AD_ARTWORK_DEADLINE}.`, ask],
   };
   return compose([
     `${heads[kind]} · LoveWorld Expo 2026`,
@@ -1484,7 +1487,7 @@ function adMessage(kind, r) {
     `Space: ${r.quantity} × ${s?.name || r.space}${adSizeOf(s, r.size) ? `, ${adSizeOf(s, r.size).size}` : ""}`,
     `Ad: ${short(r.title, 120)}`,
     r.video_url ? `Video: ${r.video_url}` : "",
-    `${kind === "paid" ? "Paid" : "Total"}: ${amountLabel(r.total)}`,
+    kind === "complimentary" ? "To pay: nothing (complimentary)" : `${kind === "paid" ? "Paid" : "Total"}: ${amountLabel(r.total)}`,
     GAP,
     ...next[kind],
   ]);
@@ -2484,17 +2487,23 @@ module.exports = function loveworldExpoRoutes() {
     return shapeAd(full, { artwork: (await adArtworkOf([row.id]))[row.id] || [], admin: true });
   };
   const unsettled = (r) => AD_PAYING.includes(r.payment_status);
+  // Whether a pending proposal's space still has room for it, as it starts to take spots: null if so,
+  // else the refusal. Holds the space's lock to the end of the transaction.
+  const noRoom = async (r, client) => {
+    await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-ad-space:${r.space}`]);
+    // A space with no limit (the video advert) has no `remaining`; one no longer offered has none left.
+    const sp = (await adSpaces(null, client, { test: true })).find((s) => s.id === r.space);
+    const left = sp ? sp.remaining : 0;
+    return left != null && r.quantity > left ? [409, "not_enough_spaces", `Only ${left} of these space${left === 1 ? " is" : "s are"} left, and this proposal is for ${r.quantity}.`] : null;
+  };
 
   // { note? }: approves a pending proposal if its space still has room (approvals take spots), makes
   // its payment link, and sends it to the owner on KingsChat.
   router.post("/expo/admin/advertising/:id/approve", requireAdmin, asyncHandler(async (req, res) => {
     const row = await adminStep(req, res, async (r, client) => {
       if (r.status !== "pending") return [409, "not_pending", `This proposal is ${r.status}.`];
-      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-ad-space:${r.space}`]);
-      // A space with no limit (the video advert) has no `remaining`; one no longer offered has none left.
-      const sp = (await adSpaces(null, client, { test: true })).find((s) => s.id === r.space);
-      const left = sp ? sp.remaining : 0;
-      if (left != null && r.quantity > left) return [409, "not_enough_spaces", `Only ${left} of these space${left === 1 ? " is" : "s are"} left, and this proposal is for ${r.quantity}.`];
+      const full = await noRoom(r, client);
+      if (full) return full;
       return (await client.query(`UPDATE ad_proposals SET status = 'approved', pay_token = $2, review_note = $3, reviewed_at = now() WHERE id = $1 RETURNING *`,
         [r.id, b64url(crypto.randomBytes(24)), clean(req.body?.note, 1000) || null])).rows[0];
     });
@@ -2525,6 +2534,27 @@ module.exports = function loveworldExpoRoutes() {
     });
     if (!row || res.headersSent) return;
     adNotifyLater(row.id, "cancelled");
+    ok(res, { proposal: await adminAd(row) });
+  }));
+
+  // { note? }: books a proposal free, for a sponsor whose category comes with ad space: one being
+  // reviewed (if its space still has room) or approved (not while a payment for it is with Espees). It
+  // is then paid, with nothing to pay (payment_status COMPLIMENTARY) and no payment link; it takes its
+  // spots as any booking does, and the owner is told on KingsChat.
+  router.post("/expo/admin/advertising/:id/complimentary", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await adminStep(req, res, async (r, client) => {
+      if (!["pending", "approved"].includes(r.status) || unsettled(r)) return [409, "not_complimentary", unsettled(r) ? "A payment for this is with Espees: check it first." : `This proposal is ${r.status}.`];
+      if (r.status === "pending") {
+        const full = await noRoom(r, client);
+        if (full) return full;
+      }
+      return (await client.query(
+        `UPDATE ad_proposals SET status = 'paid', payment_status = 'COMPLIMENTARY', paid_at = now(), reviewed_at = COALESCE(reviewed_at, now()), pay_token = NULL,
+           review_note = COALESCE($2, review_note) WHERE id = $1 RETURNING *`,
+        [r.id, clean(req.body?.note, 1000) || null])).rows[0];
+    });
+    if (!row || res.headersSent) return;
+    adNotifyLater(row.id, "complimentary");
     ok(res, { proposal: await adminAd(row) });
   }));
 

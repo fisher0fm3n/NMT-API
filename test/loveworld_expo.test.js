@@ -1244,6 +1244,46 @@ test("ad spaces: a video advert is one video, given as a link, with no limit", a
   assert.doesNotMatch(approvedText, /Print artwork|spaces are held/);
 });
 
+test("ad spaces: a sponsor's proposal booked free, with nothing to pay", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const ade = (await api("POST", "/expo/auth/kingschat", { body: { code: "good-code" } })).json.accessToken;
+  const n0 = kcMessages.length;
+  const told = (ref) => kcMessages.slice(n0).map((m) => m.message.body.text.body).filter((t) => t.includes(ref));
+  const eventually = async (check) => { for (let i = 0; i < 100 && !check(); i++) await new Promise((r) => setTimeout(r, 30)); return check(); };
+  const propose = (body) => api("POST", "/expo/advertising/proposals", { token: ade, body: { space: "amphitheatre", quantity: 2, title: "Ade's Diamond Sponsorship", description: "Sponsor's complimentary spaces", ...body } });
+  const step = (id, action, body = {}) => api("POST", `/expo/admin/advertising/${id}/${action}`, { headers: admin, body });
+  const remaining = async () => (await api("GET", "/expo/advertising/spaces")).json.spaces.find((s) => s.id === "amphitheatre").remaining;
+  const espees = espeesCharges.length;
+
+  // Admins only.
+  const p = (await propose()).json.proposal;
+  assert.equal((await api("POST", `/expo/admin/advertising/${p.id}/complimentary`, { body: {} })).status, 401);
+
+  // From being reviewed straight to booked: paid with nothing charged, no payment link, its spots taken.
+  const before = await remaining();
+  const done = await step(p.id, "complimentary", { note: "Diamond sponsor, Tech City" });
+  assert.equal(done.status, 200, JSON.stringify(done.json));
+  assert.deepEqual([done.json.proposal.status, done.json.proposal.paymentStatus, done.json.proposal.payUrl, done.json.proposal.reviewNote], ["paid", "COMPLIMENTARY", null, "Diamond sponsor, Tech City"]);
+  assert.ok(done.json.proposal.paidAt);
+  assert.equal(await remaining(), before - 2);
+  assert.equal(espeesCharges.length, espees);
+  assert.ok(await eventually(() => told(p.reference).some((t) => t.includes("booked, complimentary"))));
+  const text = told(p.reference).find((t) => t.includes("booked, complimentary"));
+  assert.match(text, /nothing to pay/);
+  assert.match(text, /To pay: nothing \(complimentary\)/);
+  assert.match(text, /Note: Diamond sponsor, Tech City/);
+  // Booked once: not again, and it can't then be turned down or cancelled.
+  assert.equal((await step(p.id, "complimentary")).json.error, "not_complimentary");
+  assert.equal((await step(p.id, "cancel")).json.error, "not_cancellable");
+
+  // An approved one, its payment link out, can be made complimentary too; the link stops working.
+  const q = (await propose({ quantity: 1, title: "Ade's Gold Sponsorship" })).json.proposal;
+  const link = (await step(q.id, "approve")).json.proposal.payUrl.split("link=").pop();
+  const made = (await step(q.id, "complimentary")).json.proposal;
+  assert.deepEqual([made.status, made.paymentStatus, made.payUrl], ["paid", "COMPLIMENTARY", null]);
+  assert.equal((await api("GET", `/expo/advertising/pay/${link}`)).status, 404);
+});
+
 test("admins page through the accounts: limit and offset, with how many match in all", async () => {
   const admin = { "x-admin-key": "admin-key" };
   const list = async (query) => (await api("GET", `/expo/admin/users?${query}`, { headers: admin })).json;

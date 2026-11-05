@@ -150,6 +150,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `POST /expo/admin/advertising/:id/cancel { reason? }` | Cancelled (before it's paid; an approved one gives its spots back), the owner told on KingsChat |
 | `POST /expo/admin/advertising/:id/settle` | A payment Espees has taken, checked with it again |
 | `POST /expo/admin/advertising/:id/paid { note? }` | An `approved` proposal marked paid by hand (`paymentStatus: MARKED_PAID`), once the team has seen the payment in Espees; the owner is told as for any payment |
+| `POST /expo/admin/advertising/:id/complimentary { note? }` | Booked free, for a sponsor whose category comes with ad space: a `pending` proposal (if its space still has room) or an `approved` one (not while a payment is with Espees) becomes `paid` with `paymentStatus: COMPLIMENTARY` and no payment link. It takes its spots as any booking does; the owner is told on KingsChat that there's nothing to pay. `not_complimentary` (409), `not_enough_spaces` (409) |
 | `POST /expo/admin/advertising/:id/reopen` | An approved proposal whose payment had no clear answer (`UNKNOWN`, or stuck `PROCESSING`) opened for payment again, once the team has seen in Espees it was never taken |
 
 `availability` on an exhibitor (all optional): `{ "dayStart": 10, "dayEnd": 17, "slotMinutes": 20, "closedDates": ["2026-11-09"], "blocked": ["2026-11-10T11:00:00"] }`.
