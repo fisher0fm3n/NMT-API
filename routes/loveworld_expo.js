@@ -134,7 +134,7 @@ const AD_SPACES = {
       "2x2.5": { size: "2 m wide × 2.5 m high", price: 1200 },
     },
   },
-  amphitheatre: { name: "Amphitheatre Exterior", size: "8.53 m wide × 11.28 m high", price: 3000, spots: 36, reserved: 11, perProduct: 4, ppi: 50 },
+  amphitheatre: { name: "Amphitheatre Exterior", size: "6.95 m wide × 11.28 m high", price: 3000, spots: 36, reserved: 11, perProduct: 4, ppi: 50 },
   "light-boxes": { name: "Light Boxes", size: "3 m wide × 1.5 m high", price: 1500, spots: 171, reserved: 101, perProduct: 4, ppi: 100 },
   video: { name: "Video Advert", size: "30 seconds, 1080 × 1920 HD MP4", price: 2000, spots: null, perProduct: null, kind: "video" },
   // For trying a real proposal, approval and payment end to end: admins only, like the test passes.
