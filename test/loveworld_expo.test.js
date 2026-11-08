@@ -1325,10 +1325,11 @@ test("admins page through the accounts: limit and offset, with how many match in
   assert.deepEqual((await list(`limit=2&offset=${all.total}`)).users, []);
 });
 
-test("officials: the whole video watched, then the quiz passed at 80% after a go that wasn't; the certificate in their name, set once", async () => {
+test("officials: the video watched in full or not at all, the quiz passed at 80% after a go that wasn't; the certificate in their name, set once", async () => {
   const admin = { "x-admin-key": "admin-key" };
   const me = (await api("POST", "/expo/auth/kingschat", { body: { code: "extra-90" } })).json.accessToken;
   const other = (await api("POST", "/expo/auth/kingschat", { body: { code: "extra-91" } })).json.accessToken;
+  const idle = (await api("POST", "/expo/auth/kingschat", { body: { code: "extra-92" } })).json.accessToken;
   const training = async (token = me) => (await api("GET", "/expo/officials", { token })).json.training;
   const progress = (seconds, token = me) => api("POST", "/expo/officials/progress", { token, body: { seconds } });
   const quiz = routes.officialsQuiz;
@@ -1349,8 +1350,9 @@ test("officials: the whole video watched, then the quiz passed at 80% after a go
   t = await training();
   assert.deepEqual([t.video.available, t.video.seconds, t.video.url], [true, 120, videoAt("video.mp4")]);
 
-  // No quiz before the whole video. The furthest point moves on only as fast as the video plays.
-  assert.equal((await api("GET", "/expo/officials/quiz", { token: me })).json.error, "watch_first");
+  // The quiz is open from the start; watching the video isn't required.
+  assert.equal((await api("GET", "/expo/officials/quiz", { token: idle })).json.questions.length, 25);
+  // The furthest point watched moves on only as fast as the video plays.
   const p0 = await progress(120);
   assert.equal(p0.status, 200, JSON.stringify(p0.json));
   t = p0.json.training;
@@ -1405,15 +1407,23 @@ test("officials: the whole video watched, then the quiz passed at 80% after a go
   assert.deepEqual([renamed.status, renamed.json.error], [409, "name_set"]);
   assert.equal((await training()).certificate.name, "Ada N. Obi");
 
+  // Someone who takes the quiz without watching the video: their training starts with it, and they can pass.
+  const straight = await api("POST", "/expo/officials/quiz", { token: other, body: { answers: answers([]) } });
+  assert.equal(straight.status, 201, JSON.stringify(straight.json));
+  assert.deepEqual([straight.json.attempt.score, straight.json.attempt.passed, straight.json.training.started, straight.json.training.watchedSeconds, straight.json.training.watchedAt], [25, true, true, 0, null]);
+  assert.ok(straight.json.training.passedAt);
+
   // The admin's view: everyone who started, each go, and how often each question is got right.
   assert.equal((await api("GET", "/expo/admin/officials")).status, 401);
   const view = (await api("GET", "/expo/admin/officials", { headers: admin })).json;
   const ada = view.officials.find((o) => o.user.username === "extra_90");
   assert.deepEqual(ada.attempts.map((a) => [a.score, a.passed]), [[19, false], [20, true]]);
   assert.deepEqual([ada.certificate.name, ada.watchedSeconds, !!ada.passedAt], ["Ada N. Obi", 115, true]);
-  assert.ok(!view.officials.some((o) => o.user.username === "extra_91"), "only people who started the training");
+  const quizOnly = view.officials.find((o) => o.user.username === "extra_91");
+  assert.deepEqual([quizOnly.watchedSeconds, quizOnly.watchedAt, quizOnly.attempts.length, !!quizOnly.passedAt], [0, null, 1, true]);
+  assert.ok(!view.officials.some((o) => o.user.username === "extra_92"), "only people who started the training (looking at the quiz isn't starting)");
   assert.deepEqual([view.questions.length, view.quiz.passMark, view.video.seconds], [25, 20, 120]);
-  assert.deepEqual([view.questions[0].attempts, view.questions[0].right, view.questions[1].right], [2, 1, 1]);
-  assert.equal(view.questions[24].right, 2);
+  assert.deepEqual([view.questions[0].attempts, view.questions[0].right, view.questions[1].right], [3, 2, 2]);
+  assert.equal(view.questions[24].right, 3);
   assert.equal(view.questions[0].answer, quiz[0].options[1]);
 });

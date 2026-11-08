@@ -452,7 +452,7 @@ const SCHEMA = `
   ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS client_key TEXT;
   CREATE UNIQUE INDEX IF NOT EXISTS ad_artwork_client_key ON ad_artwork (proposal_id, client_key) WHERE client_key IS NOT NULL;
 
-  -- Officials' training, one row a person from their first moment of the video: the furthest point
+  -- Officials' training, one row a person from their first moment of the video or first go at the quiz: the furthest point
   -- watched (seconds, moved on no faster than the video plays) and when it was last moved, when the
   -- whole video was watched, when they first passed the quiz, and the name they put on their certificate.
   CREATE TABLE IF NOT EXISTS official_training (
@@ -1569,8 +1569,9 @@ async function settleAd(id) {
  * Officials' training
  * ------------------------------------------------------------------------- */
 
-// Every Expo official watches the training video, then passes the quiz with OFFICIALS_PASS_PERCENT of
-// its answers right (as many goes as it takes), then puts their name on their certificate.
+// Every Expo official has the training video to watch and the quiz to pass, with OFFICIALS_PASS_PERCENT
+// of its answers right (as many goes as it takes, open from the start: the video isn't required first),
+// then puts their name on their certificate.
 // The video plays from its link (CloudFront); its length is read from the file there, in ranges.
 const OFFICIALS_VIDEO_DEFAULT = "https://d1zx0zj5kmre28.cloudfront.net/videos/InShot_20261108_133320385.mp4";
 const officialsVideoUrl = () => env("EXPO_OFFICIALS_VIDEO_URL") || OFFICIALS_VIDEO_DEFAULT;
@@ -2436,8 +2437,9 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { training: await officialsTraining(req.expoUserId) });
   }));
 
-  // { seconds }: how far into the video the person has watched. Their furthest point moves on no faster
-  // than the video plays since their last report; near the end, the video is watched and the quiz opens.
+  // { seconds }: how far into the video the person has watched, to pick up from there and for the team to
+  // see. Their furthest point moves on no faster than the video plays since their last report; near the
+  // end, the video is watched.
   router.post("/expo/officials/progress", ...user, asyncHandler(async (req, res) => {
     const video = await officialsVideo();
     if (!video.available) return fail(res, 503, "no_video", "The training video isn't available yet.");
@@ -2454,11 +2456,9 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { training: await officialsTraining(req.expoUserId) });
   }));
 
-  // The quiz, once the whole video is watched: every question, its choices in a new order each time,
-  // without the answers.
+  // The quiz, open to everyone signed in (watching the video first isn't required): every question, its
+  // choices in a new order each time, without the answers.
   router.get("/expo/officials/quiz", ...user, asyncHandler(async (req, res) => {
-    const t = await q1(`SELECT watched_at FROM official_training WHERE user_id = $1`, [req.expoUserId]);
-    if (!t?.watched_at) return fail(res, 409, "watch_first", "Watch the whole training video first.");
     ok(res, { questions: quizForPerson(), passMark: passScore(), passPercent: OFFICIALS_PASS_PERCENT });
   }));
 
@@ -2470,8 +2470,9 @@ module.exports = function loveworldExpoRoutes() {
     const byKey = async () => key && q1(`SELECT * FROM official_quiz_attempts WHERE user_id = $1 AND client_key = $2`, [req.expoUserId, key]);
     const before = await byKey();
     if (before) return ok(res, { attempt: shapeAttempt(before), training: await officialsTraining(req.expoUserId), repeated: true });
-    const t = await q1(`SELECT watched_at, passed_at FROM official_training WHERE user_id = $1`, [req.expoUserId]);
-    if (!t?.watched_at) return fail(res, 409, "watch_first", "Watch the whole training video first.");
+    // Their training starts here if they haven't watched any of the video.
+    const t = await q1(
+      `INSERT INTO official_training (user_id) VALUES ($1) ON CONFLICT (user_id) DO UPDATE SET updated_at = now() RETURNING passed_at`, [req.expoUserId]);
     if (t.passed_at) return fail(res, 409, "already_passed", "You've passed the quiz already.");
     const marked = markQuiz(req.body?.answers);
     if (!marked) return fail(res, 400, "unanswered", "Answer every question.");
