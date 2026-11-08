@@ -16,6 +16,9 @@
 //   ad_proposals        ad spaces asked for (the space, how many, what the ad is for): reviewed by the Expo
 //                       team, then paid in Espees through the payment link an approval makes
 //   ad_artwork          the images sent with an ad proposal, for the team to review
+//   official_training   an Expo official's training: how far into the training video they are, when
+//                       they watched it all and passed the quiz, and the name on their certificate
+//   official_quiz_attempts  each go at the officials' quiz: the answers, the score and the questions missed
 //
 // Auth: POST /expo/auth/kingschat exchanges a KingsChat accessToken (or authCode) for an
 // access token (HS256 JWT, 1 h) and a refresh token. Signed-in calls send
@@ -448,6 +451,35 @@ const SCHEMA = `
   CREATE UNIQUE INDEX IF NOT EXISTS ad_proposals_client_key ON ad_proposals (user_id, client_key) WHERE client_key IS NOT NULL;
   ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS client_key TEXT;
   CREATE UNIQUE INDEX IF NOT EXISTS ad_artwork_client_key ON ad_artwork (proposal_id, client_key) WHERE client_key IS NOT NULL;
+
+  -- Officials' training, one row a person from their first moment of the video: the furthest point
+  -- watched (seconds, moved on no faster than the video plays) and when it was last moved, when the
+  -- whole video was watched, when they first passed the quiz, and the name they put on their certificate.
+  CREATE TABLE IF NOT EXISTS official_training (
+    user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    watched_seconds INTEGER NOT NULL DEFAULT 0,
+    progress_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    watched_at TIMESTAMPTZ,
+    passed_at TIMESTAMPTZ,
+    certificate_name TEXT,
+    certificate_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  -- Every go at the quiz: the answers given ({ "1": "b", … }), the score out of the total, and the
+  -- questions missed. client_key: the page's one-time key, so a retry isn't counted twice.
+  CREATE TABLE IF NOT EXISTS official_quiz_attempts (
+    id UUID PRIMARY KEY,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    score INTEGER NOT NULL,
+    total INTEGER NOT NULL,
+    answers JSONB NOT NULL,
+    missed INTEGER[] NOT NULL DEFAULT '{}',
+    client_key TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS official_quiz_attempts_user ON official_quiz_attempts (user_id, created_at);
+  CREATE UNIQUE INDEX IF NOT EXISTS official_quiz_attempts_client_key ON official_quiz_attempts (user_id, client_key) WHERE client_key IS NOT NULL;
 `;
 
 let schemaReady = null;
@@ -1534,6 +1566,170 @@ async function settleAd(id) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Officials' training
+ * ------------------------------------------------------------------------- */
+
+// Every Expo official watches the training video, then passes the quiz with OFFICIALS_PASS_PERCENT of
+// its answers right (as many goes as it takes), then puts their name on their certificate.
+// The video plays from its link (CloudFront); its length is read from the file there, in ranges.
+const OFFICIALS_VIDEO_DEFAULT = "https://d1zx0zj5kmre28.cloudfront.net/videos/InShot_20261108_133320385.mp4";
+const officialsVideoUrl = () => env("EXPO_OFFICIALS_VIDEO_URL") || OFFICIALS_VIDEO_DEFAULT;
+const OFFICIALS_PASS_PERCENT = Math.min(100, Math.max(1, Number(env("EXPO_OFFICIALS_PASS_PERCENT")) || 80));
+// The furthest point watched moves on no faster than the video plays at up to 2×, since the last
+// report, plus a little for a report that comes late; within OFFICIALS_END_SECONDS of the end (a last
+// frame, the credits) the whole video is watched.
+const OFFICIALS_PLAY_RATE = 2;
+const OFFICIALS_SLACK_SECONDS = 30;
+const OFFICIALS_END_SECONDS = 10;
+const OFFICIALS_NAME_MAX = 80;
+
+// The quiz: the Expo team's post-video quiz, module by module. Each question's four choices are a to d
+// as written, and `answer` is the right one. The answers never leave this service.
+const OFFICIALS_MODULES = [
+  "Welcome and your role", "Courtesy and the Expo standard", "Hospitality", "Professional conduct and appearance",
+  "Communicating well", "Handling complaints and difficult moments", "Role skills", "Safety, teamwork and escalation",
+];
+const OFFICIALS_QUIZ = [
+  { module: 1, answer: "b", text: "Which statement best describes your role at the Expo?", options: ["I only need to know my own post.", "I am the face of the Expo and responsible for how visitors are treated.", "Visitor service is the job of the helpdesk only.", "I should describe the Expo in my own words."] },
+  { module: 1, answer: "a", text: "When a visitor asks what the Expo is, you should:", options: ["Give the approved description.", "Say whatever you remember.", "Tell them to read the brochure.", "Ask a colleague to answer."] },
+  { module: 1, answer: "a", text: "Which of these is part of your personal responsibility?", options: ["Arriving on time and knowing your post.", "Choosing which visitors deserve help.", "Ignoring problems that are not at your post.", "Giving different service to VIPs only."] },
+  { module: 2, answer: "a", text: "How long do you have to make a first impression?", options: ["About ten seconds.", "One minute.", "Five minutes.", "It does not matter."] },
+  { module: 2, answer: "b", text: "Which is the best welcome?", options: ["Nodding while you finish a phone call.", "Eye contact, a greeting and an offer of help.", "Waiting until the visitor speaks first.", "Pointing without speaking."] },
+  { module: 2, answer: "c", text: "Which of the following is prohibited conduct?", options: ["Saying \"Please\" and \"Thank you.\"", "Treating every visitor with equal dignity.", "Accepting a gift in exchange for special treatment.", "Offering to show a visitor the way."] },
+  { module: 3, answer: "a", text: "What are the five hospitality steps, in order?", options: ["Greet, Ask, Guide, Check, Thank.", "Ask, Greet, Point, Thank, Check.", "Greet, Guide, Ask, Thank, Check.", "Welcome, Direct, Leave, Thank, Check."] },
+  { module: 3, answer: "c", text: "A visitor in a wheelchair needs help. What should you do first?", options: ["Push the wheelchair immediately.", "Ask the companion what the visitor needs.", "Greet the visitor and ask how they would like to be helped.", "Call security."] },
+  { module: 3, answer: "c", text: "For an international guest who speaks little English, you should:", options: ["Speak louder.", "Use slang so it sounds friendly.", "Speak slowly with simple words, gestures and the map.", "Tell them to find someone who speaks their language."] },
+  { module: 4, answer: "b", text: "If you need to leave your post, you should:", options: ["Leave quietly and return soon.", "Tell your supervisor and wait to be relieved.", "Ask a visitor to watch the post.", "Close the post."] },
+  { module: 4, answer: "c", text: "Which action respects confidentiality?", options: ["Telling friends the VIP arrival time.", "Posting a photo of a security check online.", "Keeping VIP and security information within the team.", "Sharing exhibitor details with any visitor."] },
+  { module: 4, answer: "b", text: "When may you use your phone on duty?", options: ["Whenever it is quiet.", "During breaks, or for official Expo duties.", "Only when a supervisor is not watching.", "To film interesting incidents."] },
+  { module: 5, answer: "c", text: "A visitor asks a question you cannot answer. What do you say?", options: ["\"I don't know.\"", "A guess that sounds right.", "\"Let me find out for you,\" then ask your supervisor or the help desk.", "\"That is not my job.\""] },
+  { module: 5, answer: "b", text: "Which is good radio practice?", options: ["Long, chatty messages.", "Using call signs and short, clear messages.", "Shouting so you are heard.", "Using the radio to chat during quiet moments."] },
+  { module: 5, answer: "a", text: "Where may a visitor collect their badge?", options: ["The Access Point.", "Any entrance.", "The help desk only.", "Wherever the official says."] },
+  { module: 6, answer: "a", text: "What are the four complaint-handling steps?", options: ["Listen, Apologise, Act, Follow up.", "Ignore, Defend, Explain, Leave.", "Argue, Apologise, Act, Forget.", "Listen, Defend, Refer, Close."] },
+  { module: 6, answer: "b", text: "What should you avoid when a visitor is upset?", options: ["Listening without interrupting.", "Making promises you cannot keep.", "Lowering your voice.", "Offering what you can do."] },
+  { module: 6, answer: "c", text: "A visitor becomes abusive after you have stayed calm and polite. What do you do?", options: ["Shout back.", "Walk away without telling anyone.", "Say you need respectful conversation, then call your supervisor or security if it continues.", "Ignore the abuse indefinitely."] },
+  { module: 7, answer: "c", text: "At access control, a very important person arrives without a valid pass. You should:", options: ["Let them through to avoid embarrassment.", "Argue until they leave.", "Politely explain, and direct them to the help desk or call your supervisor.", "Check everyone's pass except theirs."] },
+  { module: 7, answer: "b", text: "When searching bags, you should:", options: ["Say nothing.", "Explain that it is for everyone's safety, and be respectful.", "Skip anyone who looks friendly.", "Search only certain nationalities."] },
+  { module: 7, answer: "b", text: "At the help desk, what should you do with a complaint you cannot resolve?", options: ["Tell the visitor to come back tomorrow.", "Record it and escalate it.", "Ignore it.", "Promise a solution."] },
+  { module: 8, answer: "c", text: "You see an unattended bag. What do you do?", options: ["Open it to check.", "Move it away from the crowd.", "Do not touch it, keep people away and report immediately.", "Wait to see whether the owner returns."] },
+  { module: 8, answer: "b", text: "A good escalation report includes:", options: ["Opinions about who is to blame.", "What, where, when and who, stated as facts.", "Only the location.", "A request to someone else to report it."] },
+  { module: 8, answer: "b", text: "At the end of your shift you should:", options: ["Leave immediately.", "Brief your relief on open issues, visitors being assisted, and anything unusual.", "Tell the visitors to find another official.", "Hand over only if asked."] },
+  { module: 8, answer: "b", text: "As a host or hostess in a pavilion, which of these should you know?", options: ["Only the location of your own booth.", "The location of every booth, the restrooms and the information desks.", "Only the exhibition times.", "Nothing. Visitors should ask the help desk."] },
+];
+const QUIZ_LETTERS = ["a", "b", "c", "d"];
+/** The score that passes a quiz of `total` questions. */
+const passScore = (total = OFFICIALS_QUIZ.length) => Math.ceil((total * OFFICIALS_PASS_PERCENT) / 100);
+const shuffled = (list) => {
+  const a = [...list];
+  for (let i = a.length - 1; i > 0; i--) { const j = crypto.randomInt(i + 1); [a[i], a[j]] = [a[j], a[i]]; }
+  return a;
+};
+/** The quiz as the person sees it: each question's choices in a new order every time, and no answers. */
+const quizForPerson = () => OFFICIALS_QUIZ.map((item, i) => ({
+  n: i + 1, module: item.module, moduleName: OFFICIALS_MODULES[item.module - 1], text: item.text,
+  options: shuffled(item.options.map((text, j) => ({ id: QUIZ_LETTERS[j], text }))),
+}));
+/** The answers given ({ "1": "b", … }) marked: { answers, missed, score, total }, or null when any question is unanswered. */
+function markQuiz(given) {
+  const answers = {};
+  const missed = [];
+  for (const [i, item] of OFFICIALS_QUIZ.entries()) {
+    const n = i + 1;
+    const a = typeof given?.[n] === "string" ? given[n].trim().toLowerCase() : "";
+    if (!QUIZ_LETTERS.slice(0, item.options.length).includes(a)) return null;
+    answers[n] = a;
+    if (a !== item.answer) missed.push(n);
+  }
+  return { answers, missed, total: OFFICIALS_QUIZ.length, score: OFFICIALS_QUIZ.length - missed.length };
+}
+const shapeAttempt = (a) => ({ score: a.score, total: a.total, passed: a.score >= passScore(a.total), missed: a.missed || [], at: a.created_at });
+
+/**
+ * An MP4's length in seconds, from its movie header (moov, then mvhd inside it), or null.
+ * `read(position, length)` gives `{ bytes, size }`: the bytes there (fewer at the end) and the file's size.
+ */
+async function mp4Seconds(read) {
+  const { size } = await read(0, 8);
+  if (!size) return null;
+  // The first box of `type` between `start` and `end`: where its contents start, and where it ends.
+  const box = async (start, end, type) => {
+    for (let at = start; at + 8 <= end;) {
+      const { bytes } = await read(at, 16);
+      if (bytes.length < 8) return null;
+      let len = bytes.readUInt32BE(0);
+      let head = 8;
+      if (len === 1) {
+        if (bytes.length < 16) return null;
+        len = Number(bytes.readBigUInt64BE(8));
+        head = 16;
+      } else if (len === 0) len = end - at;
+      if (len < head) return null;
+      if (bytes.toString("latin1", 4, 8) === type) return { body: at + head, end: Math.min(end, at + len) };
+      at += len;
+    }
+    return null;
+  };
+  const moov = await box(0, size, "moov");
+  const mvhd = moov && (await box(moov.body, moov.end, "mvhd"));
+  if (!mvhd) return null;
+  const { bytes: b } = await read(mvhd.body, 32);
+  if (b.length < 32) return null;
+  const v1 = b[0] === 1;
+  const scale = b.readUInt32BE(v1 ? 20 : 12);
+  const units = v1 ? Number(b.readBigUInt64BE(24)) : b.readUInt32BE(16);
+  return scale ? units / scale : null;
+}
+/** Reads a file at a web address a range at a time (never the whole of it), for mp4Seconds. */
+const rangesOf = (url) => async (position, length) => {
+  const res = await fetch(url, { headers: { range: `bytes=${position}-${position + length - 1}` }, signal: AbortSignal.timeout(10_000) });
+  if (res.status !== 206) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`it answered ${res.status} to a range request`);
+  }
+  return { bytes: Buffer.from(await res.arrayBuffer()), size: Number((res.headers.get("content-range") || "").split("/")[1]) || null };
+};
+let officialsVideoSeen = null;
+/**
+ * The training video: its link and its length in whole seconds, read from the file and kept for six
+ * hours (a minute when it couldn't be read: the last length read, else EXPO_OFFICIALS_VIDEO_SECONDS,
+ * stands in meanwhile). Not available while its length is unknown.
+ */
+async function officialsVideo() {
+  const url = officialsVideoUrl();
+  if (officialsVideoSeen?.url !== url || Date.now() > officialsVideoSeen.until) {
+    const read = await mp4Seconds(rangesOf(url)).catch((err) => {
+      console.error(`[expo] Officials' training video: its length couldn't be read from ${url} (${err.message})`);
+      return null;
+    });
+    const seconds = read ? Math.round(read) : (officialsVideoSeen?.url === url && officialsVideoSeen.seconds) || Number(env("EXPO_OFFICIALS_VIDEO_SECONDS")) || null;
+    officialsVideoSeen = { url, seconds, until: Date.now() + (read ? 6 * 3600_000 : 60_000) };
+  }
+  const { seconds } = officialsVideoSeen;
+  return { available: !!seconds, seconds, url: seconds ? url : null };
+}
+/**
+ * A person's training as they see it: the video (its link and length), the quiz's size and pass mark,
+ * how far they've watched, their goes (newest first) and their certificate.
+ */
+async function officialsTraining(userId) {
+  const [t, attempts, video] = await Promise.all([
+    q1(`SELECT * FROM official_training WHERE user_id = $1`, [userId]),
+    q(`SELECT score, total, missed, created_at FROM official_quiz_attempts WHERE user_id = $1 ORDER BY created_at DESC`, [userId]),
+    officialsVideo(),
+  ]);
+  return {
+    video,
+    quiz: { questions: OFFICIALS_QUIZ.length, passMark: passScore(), passPercent: OFFICIALS_PASS_PERCENT },
+    started: !!t,
+    watchedSeconds: t?.watched_seconds ?? 0,
+    watchedAt: t?.watched_at ?? null,
+    passedAt: t?.passed_at ?? null,
+    certificate: t?.certificate_name ? { name: t.certificate_name, issuedAt: t.certificate_at } : null,
+    attempts: attempts.map(shapeAttempt),
+  };
+}
+
+/* ---------------------------------------------------------------------------
  * Routes
  * ------------------------------------------------------------------------- */
 
@@ -2232,9 +2428,85 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { applications: rows.map((r) => ({ id: r.id, reference: r.reference, program: r.program, name: r.name, email: r.email, organisation: r.organisation, summary: r.summary, status: r.status, createdAt: r.created_at })) });
   }));
 
+  /* ---- officials' training --------------------------------------------- */
+
+  // The signed-in person's training: the video, the quiz's size and pass mark, how far they've
+  // watched, their goes at the quiz and their certificate (see officialsTraining).
+  router.get("/expo/officials", ...user, asyncHandler(async (req, res) => {
+    ok(res, { training: await officialsTraining(req.expoUserId) });
+  }));
+
+  // { seconds }: how far into the video the person has watched. Their furthest point moves on no faster
+  // than the video plays since their last report; near the end, the video is watched and the quiz opens.
+  router.post("/expo/officials/progress", ...user, asyncHandler(async (req, res) => {
+    const video = await officialsVideo();
+    if (!video.available) return fail(res, 503, "no_video", "The training video isn't available yet.");
+    const given = Math.max(0, Math.min(video.seconds, Math.floor(Number(req.body?.seconds) || 0)));
+    await q(
+      `INSERT INTO official_training (user_id, watched_seconds) VALUES ($1, LEAST($2::int, $3::int))
+       ON CONFLICT (user_id) DO UPDATE SET
+         watched_seconds = GREATEST(official_training.watched_seconds,
+           LEAST($2::int, official_training.watched_seconds + $3::int + floor(EXTRACT(EPOCH FROM now() - official_training.progress_at) * $4::numeric)::int)),
+         progress_at = now(), updated_at = now()`,
+      [req.expoUserId, given, OFFICIALS_SLACK_SECONDS, OFFICIALS_PLAY_RATE]);
+    await q(`UPDATE official_training SET watched_at = now() WHERE user_id = $1 AND watched_at IS NULL AND watched_seconds >= $2`,
+      [req.expoUserId, video.seconds - OFFICIALS_END_SECONDS]);
+    ok(res, { training: await officialsTraining(req.expoUserId) });
+  }));
+
+  // The quiz, once the whole video is watched: every question, its choices in a new order each time,
+  // without the answers.
+  router.get("/expo/officials/quiz", ...user, asyncHandler(async (req, res) => {
+    const t = await q1(`SELECT watched_at FROM official_training WHERE user_id = $1`, [req.expoUserId]);
+    if (!t?.watched_at) return fail(res, 409, "watch_first", "Watch the whole training video first.");
+    ok(res, { questions: quizForPerson(), passMark: passScore(), passPercent: OFFICIALS_PASS_PERCENT });
+  }));
+
+  // { answers: { "1": "b", … }, key? }: a go at the quiz, with every question answered. It's kept with its
+  // score and the questions missed (which are told, but not their right answers); the pass mark passes.
+  // As many goes as it takes, until one passes. The same `key` sent again gives back the go it made.
+  router.post("/expo/officials/quiz", ...user, asyncHandler(async (req, res) => {
+    const key = clientKey(req.body?.key);
+    const byKey = async () => key && q1(`SELECT * FROM official_quiz_attempts WHERE user_id = $1 AND client_key = $2`, [req.expoUserId, key]);
+    const before = await byKey();
+    if (before) return ok(res, { attempt: shapeAttempt(before), training: await officialsTraining(req.expoUserId), repeated: true });
+    const t = await q1(`SELECT watched_at, passed_at FROM official_training WHERE user_id = $1`, [req.expoUserId]);
+    if (!t?.watched_at) return fail(res, 409, "watch_first", "Watch the whole training video first.");
+    if (t.passed_at) return fail(res, 409, "already_passed", "You've passed the quiz already.");
+    const marked = markQuiz(req.body?.answers);
+    if (!marked) return fail(res, 400, "unanswered", "Answer every question.");
+    const row = await q1(
+      `INSERT INTO official_quiz_attempts (id, user_id, score, total, answers, missed, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (user_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING *`,
+      [crypto.randomUUID(), req.expoUserId, marked.score, marked.total, JSON.stringify(marked.answers), marked.missed, key]);
+    // Made by the same key a moment ago (two sends at once).
+    if (!row) return ok(res, { attempt: shapeAttempt(await byKey()), training: await officialsTraining(req.expoUserId), repeated: true });
+    if (marked.score >= passScore(marked.total)) {
+      await q(`UPDATE official_training SET passed_at = now(), updated_at = now() WHERE user_id = $1 AND passed_at IS NULL`, [req.expoUserId]);
+    }
+    res.status(201);
+    ok(res, { attempt: shapeAttempt(row), training: await officialsTraining(req.expoUserId) });
+  }));
+
+  // { name }: the name on the person's certificate, once they've passed. Set once: it can't be changed
+  // after (the same name sent again, a retry, is fine).
+  router.post("/expo/officials/certificate", ...user, asyncHandler(async (req, res) => {
+    const name = clean(String(req.body?.name ?? "").replace(/\s+/g, " "), OFFICIALS_NAME_MAX);
+    if (name.length < 2) return fail(res, 400, "bad_name", "Enter your name as it should appear on your certificate.");
+    const row = await q1(
+      `UPDATE official_training SET certificate_name = $2, certificate_at = now(), updated_at = now()
+        WHERE user_id = $1 AND passed_at IS NOT NULL AND certificate_name IS NULL RETURNING user_id`, [req.expoUserId, name]);
+    if (!row) {
+      const t = await q1(`SELECT passed_at, certificate_name FROM official_training WHERE user_id = $1`, [req.expoUserId]);
+      if (!t?.passed_at) return fail(res, 409, "not_passed", "Pass the quiz first.");
+      if (t.certificate_name !== name) return fail(res, 409, "name_set", "The name on your certificate is set already, and can't be changed.");
+    }
+    ok(res, { training: await officialsTraining(req.expoUserId) });
+  }));
+
   /* ---- admin ----------------------------------------------------------- */
 
-  const limit = (req, max = 500) => Math.min(max, Math.max(1, Number(req.query.limit) || 200));
+  const limit =(req, max = 500) => Math.min(max, Math.max(1, Number(req.query.limit) || 200));
 
   const shapeAdminUser = (r) => ({ ...shapeUser(r), disabled: !!r.disabled_at, disabledReason: r.disabled_reason || "", exhibitor: r.exhibitor_id ? { id: r.exhibitor_id, name: r.exhibitor_name } : null });
   const ADMIN_USER_SELECT = `SELECT u.*, e.name AS exhibitor_name FROM users u LEFT JOIN exhibitors e ON e.id = u.exhibitor_id`;
@@ -2343,6 +2615,7 @@ module.exports = function loveworldExpoRoutes() {
         messages: await count(`DELETE FROM notifications WHERE user_id = $1`),
         // After the messages, which an ad's removal would otherwise take with it uncounted.
         ads: await count(`DELETE FROM ad_proposals WHERE user_id = $1`),
+        quizAttempts: await count(`DELETE FROM official_quiz_attempts WHERE user_id = $1`),
       };
       await client.query(`DELETE FROM users WHERE id = $1`, [id]);
       await client.query("COMMIT");
@@ -2593,7 +2866,37 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposal: await adminAd(row) });
   }));
 
-  const STATUSES = { enquiries: ["new", "contacted", "closed"], applications: ["submitted", "shortlisted", "accepted", "declined"], registrations: ["pending", "confirmed", "cancelled"] };
+  /* ---- admin: officials' training -------------------------------------- */
+
+  // Everyone who has started the training, newest first: how far into the video, every go at the quiz
+  // (its score), when they passed and the name on their certificate. And each question with its right
+  // answer and how many goes got it right; the quiz's size and pass mark; the video.
+  router.get("/expo/admin/officials", requireAdmin, asyncHandler(async (req, res) => {
+    const rows = await q(
+      `SELECT t.*, u.kc_username, u.kc_name, u.first_name, u.last_name, u.email, u.phone,
+              COALESCE((SELECT json_agg(json_build_object('score', a.score, 'total', a.total, 'at', a.created_at) ORDER BY a.created_at)
+                          FROM official_quiz_attempts a WHERE a.user_id = t.user_id), '[]') AS goes
+         FROM official_training t JOIN users u ON u.id = t.user_id ORDER BY t.created_at DESC LIMIT $1`, [limit(req, 5000)]);
+    const all = (await q1(`SELECT count(*)::int AS n FROM official_quiz_attempts`)).n;
+    const missedBy = Object.fromEntries((await q(`SELECT n, count(*)::int AS times FROM official_quiz_attempts, unnest(missed) AS n GROUP BY n`)).map((m) => [m.n, m.times]));
+    ok(res, {
+      officials: rows.map((r) => ({
+        user: { id: r.user_id, username: r.kc_username, name: [r.first_name, r.last_name].filter(Boolean).join(" ") || r.kc_name || null, email: r.email, phone: r.phone },
+        startedAt: r.created_at, lastSeenAt: r.updated_at,
+        watchedSeconds: r.watched_seconds, watchedAt: r.watched_at, passedAt: r.passed_at,
+        certificate: r.certificate_name ? { name: r.certificate_name, issuedAt: r.certificate_at } : null,
+        attempts: r.goes.map((a) => ({ score: a.score, total: a.total, passed: a.score >= passScore(a.total), at: a.at })),
+      })),
+      questions: OFFICIALS_QUIZ.map((item, i) => ({
+        n: i + 1, module: item.module, moduleName: OFFICIALS_MODULES[item.module - 1], text: item.text,
+        answer: item.options[QUIZ_LETTERS.indexOf(item.answer)], attempts: all, right: all - (missedBy[i + 1] || 0),
+      })),
+      quiz: { questions: OFFICIALS_QUIZ.length, passMark: passScore(), passPercent: OFFICIALS_PASS_PERCENT },
+      video: await officialsVideo(),
+    });
+  }));
+
+  const STATUSES = { enquiries:["new", "contacted", "closed"], applications: ["submitted", "shortlisted", "accepted", "declined"], registrations: ["pending", "confirmed", "cancelled"] };
   const STATUS_TABLES = { enquiries: "sponsor_enquiries", applications: "program_applications", registrations: "registrations" };
   router.post("/expo/admin/:kind/:id", requireAdmin, asyncHandler(async (req, res, next) => {
     if (!STATUSES[req.params.kind]) return next();
@@ -2610,6 +2913,8 @@ module.exports = function loveworldExpoRoutes() {
 };
 
 module.exports.ensureSchema = ensureSchema;
+/** The officials' quiz with its answers, for the tests. */
+module.exports.officialsQuiz = OFFICIALS_QUIZ;
 /** Which pass settings are there (names only, never values), for the dev server's start-up line. */
 module.exports.passesSetup = () => ({ onSale: passesOnSale(), missing: [["EXPO_ESPEES_API_TOKEN", ESPEES_API_TOKEN], ["EXPO_KINGSPASS_URL", KINGSPASS_URL], ["EXPO_KINGSPASS_EVENT_TOKEN", KINGSPASS_EVENT_TOKEN]].filter(([, v]) => !v).map(([k]) => k), kingspass: KINGSPASS_URL, debug: payDebug() });
 module.exports.notifyBooking = notifyBooking;

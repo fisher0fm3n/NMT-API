@@ -102,6 +102,29 @@ const kingspassServer = http.createServer((req, res) => {
   });
 });
 
+/** A stand-in MP4 `seconds` long: just the boxes its length is read from (ftyp, then moov with its mvhd after the media). */
+function fakeMp4(seconds) {
+  const box = (type, body) => { const head = Buffer.alloc(8); head.writeUInt32BE(8 + body.length); head.write(type, 4, "latin1"); return Buffer.concat([head, body]); };
+  const mvhd = Buffer.alloc(100);
+  mvhd.writeUInt32BE(1000, 12);
+  mvhd.writeUInt32BE(seconds * 1000, 16);
+  return Buffer.concat([box("ftyp", Buffer.from("isom\0\0\0\0isom")), box("mdat", Buffer.alloc(64, 7)), box("moov", box("mvhd", mvhd))]);
+}
+// Where the officials' training video plays from (CloudFront, for real): /video.mp4 in ranges, as a CDN
+// sends it; /no-ranges.mp4 always whole (videoWholeSends counts those); anything else 404.
+const trainingVideo = fakeMp4(120);
+let videoWholeSends = 0;
+const videos = http.createServer((req, res) => {
+  if (req.url === "/no-ranges.mp4") { videoWholeSends++; res.setHeader("content-type", "video/mp4"); return res.end(trainingVideo); }
+  if (req.url !== "/video.mp4") { res.statusCode = 404; return res.end(); }
+  const m = (req.headers.range || "").match(/^bytes=(\d+)-(\d+)$/);
+  if (!m) { res.setHeader("content-type", "video/mp4"); return res.end(trainingVideo); }
+  const from = Number(m[1]);
+  const to = Math.min(Number(m[2]), trainingVideo.length - 1);
+  res.writeHead(206, { "content-type": "video/mp4", "content-range": `bytes ${from}-${to}/${trainingVideo.length}` });
+  res.end(trainingVideo.subarray(from, to + 1));
+});
+
 /** Waits until the stand-in KingsChat has been sent `n` messages in all (they go in the background). */
 async function messagesSoFar(n) {
   for (let i = 0; i < 100 && kcMessages.length < n; i++) await new Promise((r) => setTimeout(r, 30));
@@ -121,6 +144,7 @@ test.before(async () => {
   await new Promise((r) => kingschat.listen(0, "127.0.0.1", r));
   await new Promise((r) => espees.listen(0, "127.0.0.1", r));
   await new Promise((r) => kingspassServer.listen(0, "127.0.0.1", r));
+  await new Promise((r) => videos.listen(0, "127.0.0.1", r));
   const kc = `http://127.0.0.1:${kingschat.address().port}`;
   const pay = `http://127.0.0.1:${espees.address().port}`;
   Object.assign(process.env, {
@@ -152,6 +176,7 @@ test.after(async () => {
   const name = new URL(DB_URL).pathname.slice(1);
   await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
   await admin.end();
+  videos.close();
 });
 
 let token, refreshToken, user;
@@ -1298,4 +1323,97 @@ test("admins page through the accounts: limit and offset, with how many match in
   const extras = await list("q=extra&limit=1");
   assert.deepEqual([extras.users.length, extras.total], [1, 3]);
   assert.deepEqual((await list(`limit=2&offset=${all.total}`)).users, []);
+});
+
+test("officials: the whole video watched, then the quiz passed at 80% after a go that wasn't; the certificate in their name, set once", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const me = (await api("POST", "/expo/auth/kingschat", { body: { code: "extra-90" } })).json.accessToken;
+  const other = (await api("POST", "/expo/auth/kingschat", { body: { code: "extra-91" } })).json.accessToken;
+  const training = async (token = me) => (await api("GET", "/expo/officials", { token })).json.training;
+  const progress = (seconds, token = me) => api("POST", "/expo/officials/progress", { token, body: { seconds } });
+  const quiz = routes.officialsQuiz;
+
+  // Signed in only. A video whose length can't be read (not there, or not sent in ranges) isn't available.
+  const videoAt = (name) => `http://127.0.0.1:${videos.address().port}/${name}`;
+  process.env.EXPO_OFFICIALS_VIDEO_URL = videoAt("missing.mp4");
+  assert.equal((await api("GET", "/expo/officials")).status, 401);
+  let t = await training();
+  assert.deepEqual([t.video.available, t.video.url, t.started, t.quiz.questions, t.quiz.passMark, t.quiz.passPercent], [false, null, false, 25, 20, 80]);
+  assert.equal((await progress(10)).json.error, "no_video");
+  process.env.EXPO_OFFICIALS_VIDEO_URL = videoAt("no-ranges.mp4");
+  assert.equal((await training()).video.available, false);
+  assert.equal(videoWholeSends, 1, "asked once, and not read through");
+
+  // The video at its link, 120 seconds long, read from the file there in ranges.
+  process.env.EXPO_OFFICIALS_VIDEO_URL = videoAt("video.mp4");
+  t = await training();
+  assert.deepEqual([t.video.available, t.video.seconds, t.video.url], [true, 120, videoAt("video.mp4")]);
+
+  // No quiz before the whole video. The furthest point moves on only as fast as the video plays.
+  assert.equal((await api("GET", "/expo/officials/quiz", { token: me })).json.error, "watch_first");
+  const p0 = await progress(120);
+  assert.equal(p0.status, 200, JSON.stringify(p0.json));
+  t = p0.json.training;
+  assert.deepEqual([t.started, t.watchedSeconds, t.watchedAt], [true, 30, null]);
+  assert.equal((await progress(120)).json.training.watchedSeconds, 60);
+  assert.equal((await progress(5)).json.training.watchedSeconds, 60);
+  const db = new Client({ connectionString: DB_URL });
+  await db.connect();
+  await db.query(`UPDATE official_training SET progress_at = now() - interval '40 seconds' WHERE user_id = (SELECT id FROM users WHERE kc_username = 'extra_90')`);
+  await db.end();
+  t = (await progress(115)).json.training;
+  assert.equal(t.watchedSeconds, 115);
+  assert.ok(t.watchedAt, "within 10 seconds of the end is the whole video");
+
+  // The quiz: 25 questions, four choices each, no answers given away.
+  const qz = (await api("GET", "/expo/officials/quiz", { token: me })).json;
+  assert.equal(qz.questions.length, 25);
+  assert.deepEqual([qz.passMark, qz.passPercent], [20, 80]);
+  assert.ok(qz.questions.every((x) => x.options.length === 4 && !("answer" in x)));
+  assert.ok(!JSON.stringify(qz).includes('"answer"'));
+
+  const answers = (wrong) => Object.fromEntries(quiz.map((x, i) => [i + 1, wrong.includes(i + 1) ? ["a", "b", "c", "d"].find((l) => l !== x.answer) : x.answer]));
+  const go = (body) => api("POST", "/expo/officials/quiz", { token: me, body });
+  const some = answers([]);
+  delete some[25];
+  assert.equal((await go({ answers: some })).json.error, "unanswered");
+
+  // 19 of 25 (76%): not a pass. The questions missed are told, not their answers.
+  const first = await go({ answers: answers([2, 4, 6, 8, 10, 12]), key: "quiz-go-0001" });
+  assert.equal(first.status, 201, JSON.stringify(first.json));
+  assert.deepEqual([first.json.attempt.score, first.json.attempt.total, first.json.attempt.passed, first.json.attempt.missed], [19, 25, false, [2, 4, 6, 8, 10, 12]]);
+  assert.equal(first.json.training.passedAt, null);
+  // The same go sent again isn't counted twice.
+  const again = await go({ answers: answers([2, 4, 6, 8, 10, 12]), key: "quiz-go-0001" });
+  assert.deepEqual([again.status, again.json.repeated, again.json.training.attempts.length], [200, true, 1]);
+
+  // 20 of 25 (80%) passes; no more goes after that.
+  const second = await go({ answers: answers([1, 3, 5, 7, 9]), key: "quiz-go-0002" });
+  assert.deepEqual([second.json.attempt.score, second.json.attempt.passed], [20, true]);
+  assert.ok(second.json.training.passedAt);
+  assert.deepEqual(second.json.training.attempts.map((a) => a.score), [20, 19]);
+  assert.equal((await go({ answers: answers([]) })).json.error, "already_passed");
+
+  // The certificate: only after passing; the name tidied, and set once (the same name again is fine, another isn't).
+  assert.equal((await api("POST", "/expo/officials/certificate", { token: other, body: { name: "Someone Else" } })).json.error, "not_passed");
+  assert.equal((await api("POST", "/expo/officials/certificate", { token: me, body: { name: " " } })).json.error, "bad_name");
+  const cert = (await api("POST", "/expo/officials/certificate", { token: me, body: { name: "  Ada   N. Obi  " } })).json.training.certificate;
+  assert.equal(cert.name, "Ada N. Obi");
+  const again2 = await api("POST", "/expo/officials/certificate", { token: me, body: { name: "Ada N. Obi" } });
+  assert.deepEqual([again2.status, again2.json.training.certificate.issuedAt], [200, cert.issuedAt]);
+  const renamed = await api("POST", "/expo/officials/certificate", { token: me, body: { name: "Someone Else" } });
+  assert.deepEqual([renamed.status, renamed.json.error], [409, "name_set"]);
+  assert.equal((await training()).certificate.name, "Ada N. Obi");
+
+  // The admin's view: everyone who started, each go, and how often each question is got right.
+  assert.equal((await api("GET", "/expo/admin/officials")).status, 401);
+  const view = (await api("GET", "/expo/admin/officials", { headers: admin })).json;
+  const ada = view.officials.find((o) => o.user.username === "extra_90");
+  assert.deepEqual(ada.attempts.map((a) => [a.score, a.passed]), [[19, false], [20, true]]);
+  assert.deepEqual([ada.certificate.name, ada.watchedSeconds, !!ada.passedAt], ["Ada N. Obi", 115, true]);
+  assert.ok(!view.officials.some((o) => o.user.username === "extra_91"), "only people who started the training");
+  assert.deepEqual([view.questions.length, view.quiz.passMark, view.video.seconds], [25, 20, 120]);
+  assert.deepEqual([view.questions[0].attempts, view.questions[0].right, view.questions[1].right], [2, 1, 1]);
+  assert.equal(view.questions[24].right, 2);
+  assert.equal(view.questions[0].answer, quiz[0].options[1]);
 });
