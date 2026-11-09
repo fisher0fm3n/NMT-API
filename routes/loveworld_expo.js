@@ -15,7 +15,9 @@
 //   notifications       KingsChat messages sent about bookings (to the visitor and the exhibitor's team), and how each went
 //   ad_proposals        ad spaces asked for (the space, how many, what the ad is for): reviewed by the Expo
 //                       team, then paid in Espees through the payment link an approval makes
-//   ad_artwork          the images sent with an ad proposal, for the team to review
+//   ad_artwork          the artwork sent with an ad proposal, for the team: each file itself (up to
+//                       200 MB, sent in pieces and kept on disk in EXPO_AD_FILES_DIR) and, for an
+//                       image, a small review copy kept here
 //   official_training   an Expo official's training: how far into the training video they are, when
 //                       they watched it all and passed the quiz, and the name on their certificate
 //   official_quiz_attempts  each go at the officials' quiz: the answers, the score and the questions missed
@@ -29,11 +31,12 @@
 //
 // Same shape as routes/kingspresenter.js, so the two read alike.
 
-const { Router } = require("express");
+const { Router, raw } = require("express");
 const { Pool, Client } = require("pg");
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 
 const ENV_FILE = path.join(__dirname, "..", ".env");
 if (!process.env.EXPO_SKIP_ENV_FILE) {
@@ -451,6 +454,16 @@ const SCHEMA = `
   CREATE UNIQUE INDEX IF NOT EXISTS ad_proposals_client_key ON ad_proposals (user_id, client_key) WHERE client_key IS NOT NULL;
   ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS client_key TEXT;
   CREATE UNIQUE INDEX IF NOT EXISTS ad_artwork_client_key ON ad_artwork (proposal_id, client_key) WHERE client_key IS NOT NULL;
+  -- Artwork sent as the file itself: its size as announced, its type (by its first bytes), how much
+  -- has arrived (kept on disk, in AD_FILES_DIR, named by the row's id) and when the last of it did.
+  -- \`bytes\` is then the review copy of an image, or nothing for a file a browser can't show (a PDF).
+  ALTER TABLE ad_artwork ALTER COLUMN bytes DROP NOT NULL;
+  ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS file_size BIGINT;
+  ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS file_type TEXT;
+  ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS received BIGINT NOT NULL DEFAULT 0;
+  ALTER TABLE ad_artwork ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+  -- A printed space's artwork as a link (KingsCloud, Google Drive…), given with the proposal.
+  ALTER TABLE ad_proposals ADD COLUMN IF NOT EXISTS artwork_url TEXT;
 
   -- Officials' training, one row a person from their first moment of the video or first go at the quiz: the furthest point
   -- watched (seconds, moved on no faster than the video plays) and when it was last moved, when the
@@ -1396,6 +1409,13 @@ const AD_PAYING = ["PROCESSING", "CHARGED", "UNKNOWN", "MISMATCH"];
 // JSON body limit once in base64, and so many to a proposal.
 const AD_ARTWORK_MAX_BYTES = Math.floor(1.4 * 1024 * 1024);
 const AD_ARTWORK_MAX = 6;
+// Artwork as the file itself: up to AD_FILE_MAX_BYTES, sent in pieces of up to AD_CHUNK_MAX_BYTES
+// (each its own request, so no one request is large), kept on disk in AD_FILES_DIR, named by the
+// artwork's id. Outside the app's folder, which the process manager watches and /uploads serves.
+const AD_FILE_MAX_BYTES = 200 * 1024 * 1024;
+const AD_CHUNK_MAX_BYTES = 8 * 1024 * 1024;
+const AD_FILES_DIR = path.resolve(env("EXPO_AD_FILES_DIR") || path.join(os.homedir(), "loveworld-expo-files", "ad-artwork"));
+const adFilePath = (id) => path.join(AD_FILES_DIR, id);
 
 const adSpace = (id) => (Object.hasOwn(AD_SPACES, id) ? AD_SPACES[id] : null);
 /** One of a space's sizes by its id ({ size, price }), or null (no such size, or a space without sizes). */
@@ -1418,6 +1438,21 @@ function videoLink(v) {
 const clientKey = (v) => (typeof v === "string" && /^[\w-]{8,80}$/.test(v) ? v : null);
 /** The payment link an approval makes (on the website), while there is something to pay or see. */
 const adPayUrl = (r) => (r.pay_token && (r.status === "approved" || r.status === "paid") ? site(`/advertise/pay?link=${r.pay_token}`) || null : null);
+
+/**
+ * What an artwork file is, by its first bytes: an image (JPG, PNG, WebP, TIFF), a PDF (Illustrator
+ * files saved PDF-compatible are PDFs), a Photoshop file or PostScript (EPS, older Illustrator), or null.
+ */
+function artworkFileType(buf) {
+  const image = imageType(buf);
+  if (image) return image;
+  const head = buf.toString("latin1", 0, 5);
+  if (buf.length > 4 && ((buf[0] === 0x49 && buf[1] === 0x49 && (buf[2] === 0x2a || buf[2] === 0x2b) && buf[3] === 0) || (buf[0] === 0x4d && buf[1] === 0x4d && buf[2] === 0 && (buf[3] === 0x2a || buf[3] === 0x2b)))) return "image/tiff";
+  if (head === "%PDF-") return "application/pdf";
+  if (head.startsWith("8BPS")) return "image/vnd.adobe.photoshop";
+  if (head.startsWith("%!PS") || (buf.length > 4 && buf[0] === 0xc5 && buf[1] === 0xd0 && buf[2] === 0xd3 && buf[3] === 0xc6)) return "application/postscript";
+  return null;
+}
 
 function imageType(buf) {
   if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
@@ -1457,12 +1492,26 @@ async function adSpaces(userId = null, db = pool, { test = false } = {}) {
 /** Whether the account may see and use the admin-only test space. */
 const isAdminUser = async (userId) => !!userId && !!(await q1(`SELECT 1 FROM users WHERE id = $1 AND is_admin`, [userId]));
 
-/** The artwork of each proposal given, without the images themselves: { proposalId: [{ id, name, type, size }] }. */
+/** An artwork row's columns, as shapeArtwork reads them; `t`: the table's alias, when there's a join. */
+const adArtColumns = (t = "") => `${t}id AS id, ${t}name AS name, ${t}type AS type, ${t}bytes IS NOT NULL AS preview, octet_length(${t}bytes) AS preview_size, ${t}file_size AS file_size, ${t}file_type AS file_type, ${t}received AS received, ${t}completed_at AS completed_at`;
+const AD_ART_COLUMNS = adArtColumns();
+/**
+ * One piece of artwork as the owner and the team see it (never its bytes): its name, type and size
+ * (the file's, or for one sent before files, the image's), whether it has a review copy to show
+ * (`preview`), and how much of the file has arrived (`complete` once all of it has).
+ */
+function shapeArtwork(a) {
+  const file = a.file_size != null;
+  const size = Number(file ? a.file_size : a.preview_size);
+  return { id: a.id, name: a.name, type: (file ? a.file_type : a.type) || null, size, preview: !!a.preview, complete: !file || !!a.completed_at, received: file ? Number(a.received) : size };
+}
+
+/** The artwork of each proposal given, without the files themselves: { proposalId: [shapeArtwork] }. */
 async function adArtworkOf(ids) {
   const out = {};
   if (!ids.length) return out;
-  for (const a of await q(`SELECT id, proposal_id, name, type, octet_length(bytes) AS size FROM ad_artwork WHERE proposal_id = ANY($1::uuid[]) ORDER BY created_at`, [ids])) {
-    (out[a.proposal_id] ||= []).push({ id: a.id, name: a.name, type: a.type, size: Number(a.size) });
+  for (const a of await q(`SELECT proposal_id, ${AD_ART_COLUMNS} FROM ad_artwork WHERE proposal_id = ANY($1::uuid[]) ORDER BY created_at`, [ids])) {
+    (out[a.proposal_id] ||= []).push(shapeArtwork(a));
   }
   return out;
 }
@@ -1472,7 +1521,7 @@ function shapeAd(r, { artwork = [], admin = false } = {}) {
   const s = adSpace(r.space);
   return {
     id: r.id, reference: r.reference, space: r.space, spaceName: s?.name || r.space, size: adSizeLabel(r), sizeId: r.size || null,
-    quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total), title: r.title, description: r.description, videoUrl: r.video_url || null,
+    quantity: r.quantity, unitPrice: Number(r.unit_price), total: Number(r.total), title: r.title, description: r.description, videoUrl: r.video_url || null, artworkUrl: r.artwork_url || null,
     status: r.status, reviewNote: r.review_note || null, payUrl: adPayUrl(r),
     paymentStatus: r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null, paymentError: r.payment_error || null,
     createdAt: r.created_at, reviewedAt: r.reviewed_at || null, paidAt: r.paid_at || null, cancelledAt: r.cancelled_at || null, cancelledBy: r.cancelled_by || null,
@@ -1522,6 +1571,7 @@ function adMessage(kind, r) {
     `Space: ${r.quantity} × ${s?.name || r.space}${adSizeOf(s, r.size) ? `, ${adSizeOf(s, r.size).size}` : ""}`,
     `Ad: ${short(r.title, 120)}`,
     r.video_url ? `Video: ${r.video_url}` : "",
+    r.artwork_url ? `Artwork: ${r.artwork_url}` : "",
     kind === "complimentary" ? "To pay: nothing (complimentary)" : `${kind === "paid" ? "Paid" : "Total"}: ${amountLabel(r.total)}`,
     GAP,
     ...next[kind],
@@ -2182,12 +2232,13 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [] })), spaces: await adSpaces(req.expoUserId, pool, { test: await isAdminUser(req.expoUserId) }) });
   }));
 
-  // { space, size?, quantity, title, description, videoUrl?, expectedPrice?, key? }. Nothing is charged:
+  // { space, size?, quantity, title, description, videoUrl?, artworkUrl?, expectedPrice?, key? }. Nothing is charged:
   // the proposal waits for the Expo team (pending), and the person hears on KingsChat that it's in. A
   // space that comes in sizes needs one of them (`size`, its id), at that size's price. Each
   // product or service (one account's proposals with that title) holds at most a space's perProduct
   // (what it has waiting, approved or paid counts), and no more than are left. A video advert is one
-  // video, given as a link (videoUrl), with no limit. `key` (8 to 80 letters, digits, - and _): the
+  // video, given as a link (videoUrl), with no limit. A printed space's artwork may come as a link too
+  // (artworkUrl: KingsCloud, Google Drive…), besides or instead of files. `key` (8 to 80 letters, digits, - and _): the
   // same key sent again by the same person gives back the proposal it made (200, repeated: true), not
   // a second one, and no message.
   router.post("/expo/advertising/proposals", ...user, asyncHandler(async (req, res) => {
@@ -2206,6 +2257,8 @@ module.exports = function loveworldExpoRoutes() {
     if (!description) return fail(res, 400, "missing_fields", "Say what your ad is about.");
     const videoUrl = video ? videoLink(b.videoUrl) : null;
     if (video && !videoUrl) return fail(res, 400, "bad_video_link", "Give the link to your video: a web address where the Expo team can download it.");
+    const artworkUrl = video || !clean(b.artworkUrl) ? null : videoLink(b.artworkUrl);
+    if (!video && clean(b.artworkUrl) && !artworkUrl) return fail(res, 400, "bad_artwork_link", "The artwork link should be a web address, starting https://");
     const size = adSizeOf(s, b.size);
     if (s.sizes && !size) return fail(res, 400, "bad_size", `Choose a size for ${s.name}: ${Object.values(s.sizes).map((z) => z.size).join(", ")}.`);
     const price = size ? size.price : s.price;
@@ -2240,8 +2293,8 @@ module.exports = function loveworldExpoRoutes() {
         return fail(res, 409, "not_enough_spaces", now.remaining ? `Only ${now.remaining} ${s.name} space${now.remaining === 1 ? " is" : "s are"} left.` : `${s.name} are fully booked.`);
       }
       row = (await client.query(
-        `INSERT INTO ad_proposals (id, reference, user_id, space, size, quantity, unit_price, total, title, description, video_url, client_key) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *`,
-        [id, reference("AD"), req.expoUserId, spaceId, size ? b.size : null, quantity, price, Math.round(price * quantity * 10000) / 10000, title, description, videoUrl, key])).rows[0];
+        `INSERT INTO ad_proposals (id, reference, user_id, space, size, quantity, unit_price, total, title, description, video_url, client_key, artwork_url) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) RETURNING *`,
+        [id, reference("AD"), req.expoUserId, spaceId, size ? b.size : null, quantity, price, Math.round(price * quantity * 10000) / 10000, title, description, videoUrl, key, artworkUrl])).rows[0];
       await client.query("COMMIT");
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
@@ -2261,10 +2314,9 @@ module.exports = function loveworldExpoRoutes() {
     const mine = isUuid(req.params.id) && (await q1(`SELECT id, status FROM ad_proposals WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]));
     if (!mine) return fail(res, 404, "not_found", "No such proposal.");
     const key = clientKey(req.body?.key);
-    const stored = async () => key && q1(`SELECT id, name, type, octet_length(bytes) AS size FROM ad_artwork WHERE proposal_id = $1 AND client_key = $2`, [mine.id, key]);
-    const shapeArt = (a) => ({ id: a.id, name: a.name, type: a.type, size: Number(a.size) });
+    const stored = async () => key && q1(`SELECT ${AD_ART_COLUMNS} FROM ad_artwork WHERE proposal_id = $1 AND client_key = $2`, [mine.id, key]);
     const before = await stored();
-    if (before) return ok(res, { artwork: shapeArt(before), repeated: true });
+    if (before) return ok(res, { artwork: shapeArtwork(before), repeated: true });
     if (mine.status !== "pending") return fail(res, 409, "not_pending", "Artwork can be added while the proposal is being reviewed.");
     const bytes = Buffer.from(String(req.body?.data || ""), "base64");
     if (bytes.length > AD_ARTWORK_MAX_BYTES) return fail(res, 413, "too_large", `Each image must be ${(AD_ARTWORK_MAX_BYTES / 1024 / 1024).toFixed(1)} MB or smaller.`);
@@ -2273,17 +2325,116 @@ module.exports = function loveworldExpoRoutes() {
     const row = await q1(
       `INSERT INTO ad_artwork (id, proposal_id, name, type, bytes, client_key) SELECT $1, $2, $3, $4, $5, $7
         WHERE (SELECT count(*) FROM ad_artwork WHERE proposal_id = $2) < $6
-        ON CONFLICT (proposal_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING id, name, type, octet_length(bytes) AS size`,
+        ON CONFLICT (proposal_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING ${AD_ART_COLUMNS}`,
       [crypto.randomUUID(), mine.id, clean(req.body?.name, 120), type, bytes, AD_ARTWORK_MAX, key]);
     if (!row) {
       // Stored by the same key a moment ago (two sends at once), or the proposal is full.
       const meanwhile = await stored();
-      if (meanwhile) return ok(res, { artwork: shapeArt(meanwhile), repeated: true });
+      if (meanwhile) return ok(res, { artwork: shapeArtwork(meanwhile), repeated: true });
       return fail(res, 409, "too_many", `A proposal can have up to ${AD_ARTWORK_MAX} images.`);
     }
     res.status(201);
-    ok(res, { artwork: shapeArt(row) });
+    ok(res, { artwork: shapeArtwork(row) });
   }));
+
+  // { name, size, key?, preview? }: starts one artwork file (up to AD_FILE_MAX_BYTES) for the person's own
+  // proposal while it's being reviewed; its pieces follow (PUT …/files/:fileId). `preview`: for an image,
+  // a small review copy (base64 JPG, PNG or WebP, up to AD_ARTWORK_MAX_BYTES) for the team to look at.
+  // AD_ARTWORK_MAX files and images to a proposal. The same `key` again gives back the file it started
+  // (200, repeated), with how much of it has arrived, so a send can carry on where it stopped.
+  // Answers { artwork, received, chunkMax }.
+  router.post("/expo/advertising/proposals/:id/files", ...user, asyncHandler(async (req, res) => {
+    const mine = isUuid(req.params.id) && (await q1(`SELECT id, status FROM ad_proposals WHERE id = $1 AND user_id = $2`, [req.params.id, req.expoUserId]));
+    if (!mine) return fail(res, 404, "not_found", "No such proposal.");
+    const key = clientKey(req.body?.key);
+    const stored = async () => key && q1(`SELECT ${AD_ART_COLUMNS} FROM ad_artwork WHERE proposal_id = $1 AND client_key = $2 AND file_size IS NOT NULL`, [mine.id, key]);
+    const answer = (a) => ({ artwork: shapeArtwork(a), received: Number(a.received), chunkMax: AD_CHUNK_MAX_BYTES });
+    const before = await stored();
+    if (before) return ok(res, { ...answer(before), repeated: true });
+    if (mine.status !== "pending") return fail(res, 409, "not_pending", "Artwork can be added while the proposal is being reviewed.");
+    const size = Number(req.body?.size);
+    if (!Number.isSafeInteger(size) || size < 1) return fail(res, 400, "bad_size", "Say how big the file is.");
+    if (size > AD_FILE_MAX_BYTES) return fail(res, 413, "too_large", `Each file must be ${AD_FILE_MAX_BYTES / 1024 / 1024} MB or smaller. For a bigger one, give a link to it (KingsCloud, Google Drive…).`);
+    let preview = null, previewType = "";
+    if (req.body?.preview) {
+      preview = Buffer.from(String(req.body.preview), "base64");
+      previewType = imageType(preview);
+      if (preview.length > AD_ARTWORK_MAX_BYTES || !previewType) return fail(res, 400, "bad_preview", "The review copy must be a JPG, PNG or WebP image.");
+    }
+    const row = await q1(
+      `INSERT INTO ad_artwork (id, proposal_id, name, type, bytes, client_key, file_size) SELECT $1, $2, $3, $4, $5, $7, $8
+        WHERE (SELECT count(*) FROM ad_artwork WHERE proposal_id = $2) < $6
+        ON CONFLICT (proposal_id, client_key) WHERE client_key IS NOT NULL DO NOTHING RETURNING ${AD_ART_COLUMNS}`,
+      [crypto.randomUUID(), mine.id, clean(req.body?.name, 120), previewType, preview, AD_ARTWORK_MAX, key, size]);
+    if (!row) {
+      const meanwhile = await stored();
+      if (meanwhile) return ok(res, { ...answer(meanwhile), repeated: true });
+      return fail(res, 409, "too_many", `A proposal can have up to ${AD_ARTWORK_MAX} files.`);
+    }
+    res.status(201);
+    ok(res, answer(row));
+  }));
+
+  // The next piece of an artwork file, as the request's raw body (up to AD_CHUNK_MAX_BYTES), at
+  // ?offset= (the bytes already there). A piece already stored (its answer lost on the way back) is
+  // taken again without being written twice; one that would leave a gap is refused (409 bad_offset)
+  // with `received`, where to carry on from. The first piece must show the file is artwork (a JPG,
+  // PNG, WebP or TIFF image, a PDF, a Photoshop or PostScript file). Answers { artwork, received, complete }.
+  router.put("/expo/advertising/proposals/:id/files/:fileId", ...user,
+    raw({ type: () => true, limit: AD_CHUNK_MAX_BYTES }),
+    asyncHandler(async (req, res) => {
+      if (!isUuid(req.params.id) || !isUuid(req.params.fileId)) return fail(res, 404, "not_found", "No such file.");
+      const piece = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+      const offset = Number(req.query.offset);
+      if (!Number.isSafeInteger(offset) || offset < 0) return fail(res, 400, "bad_offset", "Say where this piece goes (offset).");
+      const client = await pool.connect();
+      let out;
+      try {
+        await client.query("BEGIN");
+        // One piece at a time for each file: two sent at once take turns.
+        const a = (await client.query(
+          `SELECT ${adArtColumns("w.")}
+             FROM ad_artwork w JOIN ad_proposals p ON p.id = w.proposal_id
+            WHERE w.id = $1 AND w.proposal_id = $2 AND p.user_id = $3 AND w.file_size IS NOT NULL FOR UPDATE OF w`,
+          [req.params.fileId, req.params.id, req.expoUserId])).rows[0];
+        const have = a ? Number(a.received) : 0;
+        if (!a) out = [404, "not_found", "No such file."];
+        else if (a.completed_at || offset + piece.length <= have) out = { a };
+        else if (offset !== have) out = { gap: have };
+        else if (!piece.length) out = [400, "empty", "This piece has nothing in it."];
+        else if (offset + piece.length > Number(a.file_size)) out = [400, "too_long", "This file is longer than its size said."];
+        else {
+          const fileType = offset === 0 ? artworkFileType(piece) : a.file_type;
+          if (!fileType) out = [400, "bad_type", "Artwork must be a JPG, PNG, WebP or TIFF image, a PDF, or a Photoshop (PSD), Illustrator or EPS file."];
+          else {
+            await fs.promises.mkdir(AD_FILES_DIR, { recursive: true });
+            const fh = await fs.promises.open(adFilePath(a.id), offset === 0 ? "w" : "r+");
+            try {
+              // Anything past what's recorded is from a piece whose answer never got here: written over.
+              await fh.truncate(offset);
+              await fh.write(piece, 0, piece.length, offset);
+              if (offset + piece.length === Number(a.file_size)) await fh.sync();
+            } finally {
+              await fh.close();
+            }
+            const moved = (await client.query(
+              `UPDATE ad_artwork SET received = $2, file_type = $3, completed_at = CASE WHEN $2 = file_size THEN now() END WHERE id = $1 RETURNING ${AD_ART_COLUMNS}`,
+              [a.id, offset + piece.length, fileType])).rows[0];
+            out = { a: moved };
+          }
+        }
+        await client.query(Array.isArray(out) ? "ROLLBACK" : "COMMIT");
+      } catch (err) {
+        await client.query("ROLLBACK").catch(() => {});
+        throw err;
+      } finally {
+        client.release();
+      }
+      if (Array.isArray(out)) return fail(res, ...out);
+      if (out.gap != null) return res.status(409).json({ status: false, error: "bad_offset", message: `This file has ${out.gap} bytes so far: carry on from there.`, received: out.gap });
+      const art = shapeArtwork(out.a);
+      ok(res, { artwork: art, received: art.received, complete: art.complete });
+    }));
 
   // The person withdraws their own proposal, before it's paid (and not while a payment is with Espees).
   router.post("/expo/advertising/proposals/:id/cancel", ...user, asyncHandler(async (req, res) => {
@@ -2604,6 +2755,8 @@ module.exports = function loveworldExpoRoutes() {
     if (user.is_admin && !(await q1(`SELECT 1 FROM users WHERE is_admin AND disabled_at IS NULL AND id <> $1 LIMIT 1`, [id]))) {
       return fail(res, 409, "last_admin", "This is the only admin account. Make another account an admin first.");
     }
+    // Its artwork files, kept on disk, go once the account has.
+    const files = (await q(`SELECT w.id FROM ad_artwork w JOIN ad_proposals p ON p.id = w.proposal_id WHERE p.user_id = $1 AND w.file_size IS NOT NULL`, [id])).map((r) => r.id);
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
@@ -2620,7 +2773,8 @@ module.exports = function loveworldExpoRoutes() {
       };
       await client.query(`DELETE FROM users WHERE id = $1`, [id]);
       await client.query("COMMIT");
-      ok(res, { deleted: id, removed });
+      for (const f of files) await fs.promises.rm(adFilePath(f), { force: true }).catch((err) => console.error(`[expo] artwork file ${f} not removed:`, err.message));
+      ok(res, { deleted: id, removed: { ...removed, artworkFiles: files.length } });
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       throw err;
@@ -2732,12 +2886,35 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { proposals: rows.map((r) => shapeAd(r, { artwork: art[r.id] || [], admin: true })), spaces: await adSpaces(null, pool, { test: true }) });
   }));
 
+  // A piece of artwork's image to look at: its review copy (or the image, for one sent before files).
   router.get("/expo/admin/advertising/artwork/:id", requireAdmin, asyncHandler(async (req, res) => {
-    const a = isUuid(req.params.id) && (await q1(`SELECT name, type, bytes FROM ad_artwork WHERE id = $1`, [req.params.id]));
+    const a = isUuid(req.params.id) && (await q1(`SELECT name, type, bytes FROM ad_artwork WHERE id = $1 AND bytes IS NOT NULL`, [req.params.id]));
     if (!a) return fail(res, 404, "not_found", "No such image.");
     res.setHeader("Content-Type", a.type);
     res.setHeader("Content-Disposition", `inline; filename="${(a.name || "artwork").replace(/[^\w.-]+/g, "_").slice(0, 80)}"`);
     res.end(a.bytes);
+  }));
+
+  // The artwork file itself, to download, once all of it has arrived (409 not_complete before). For
+  // artwork sent before files, its image.
+  router.get("/expo/admin/advertising/artwork/:id/file", requireAdmin, asyncHandler(async (req, res) => {
+    const a = isUuid(req.params.id) && (await q1(`SELECT id, name, type, bytes, file_size, file_type, received, completed_at FROM ad_artwork WHERE id = $1`, [req.params.id]));
+    if (!a) return fail(res, 404, "not_found", "No such file.");
+    const filename = (a.name || "artwork").replace(/[^\w.-]+/g, "_").slice(0, 120);
+    res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+    if (a.file_size == null) {
+      res.setHeader("Content-Type", a.type);
+      return res.end(a.bytes);
+    }
+    if (!a.completed_at) return fail(res, 409, "not_complete", `This file didn't finish uploading: ${Number(a.received)} of ${Number(a.file_size)} bytes arrived.`);
+    const where = adFilePath(a.id);
+    const stat = await fs.promises.stat(where).catch(() => null);
+    if (!stat) return fail(res, 404, "file_missing", "This file isn't on the server.");
+    res.setHeader("Content-Type", a.file_type || "application/octet-stream");
+    res.setHeader("Content-Length", String(stat.size));
+    const stream = fs.createReadStream(where);
+    stream.on("error", (err) => { console.error(`[expo] artwork file ${a.id}:`, err.message); res.destroy(err); });
+    stream.pipe(res);
   }));
 
   /** An admin's step on a proposal, under a lock on its row: `change(row, client)` answers with the new row, or [http, code, message]. */

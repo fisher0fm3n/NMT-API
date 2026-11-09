@@ -4,6 +4,10 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const http = require("node:http");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 const { Client } = require("pg");
 
 const DB_URL = process.env.EXPO_TEST_DATABASE_URL || "postgres://localhost/loveworld_expo_test";
@@ -132,6 +136,8 @@ async function messagesSoFar(n) {
 }
 
 let base, server, routes;
+// Where the service keeps ad artwork files in these tests: made fresh, removed after.
+const filesDir = fs.mkdtempSync(path.join(os.tmpdir(), "expo-ad-files-"));
 const api = async (method, path, { body, token, headers = {} } = {}) => {
   const res = await fetch(`${base}${path}`, {
     method, headers: { "content-type": "application/json", "x-api-key": "app-key", ...(token ? { authorization: `Bearer ${token}` } : {}), ...headers },
@@ -153,6 +159,7 @@ test.before(async () => {
     EXPO_KC_API_KEY: "kc-project-key", EXPO_KC_MESSAGES_URL: `${kc}/messages`,
     EXPO_ESPEES_API_TOKEN: "esp-test-token", EXPO_ESPEES_URL: pay,
     EXPO_KINGSPASS_URL: `http://127.0.0.1:${kingspassServer.address().port}`, EXPO_KINGSPASS_EVENT_TOKEN: "event-token", EXPO_KINGSPASS_TEST2_TICKET: "2599",
+    EXPO_AD_FILES_DIR: filesDir,
   });
   delete process.env.EXPO_TOKEN_SECRET;
   routes = require("../routes/loveworld_expo");
@@ -177,6 +184,7 @@ test.after(async () => {
   await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
   await admin.end();
   videos.close();
+  fs.rmSync(filesDir, { recursive: true, force: true });
 });
 
 let token, refreshToken, user;
@@ -1230,6 +1238,108 @@ test("ad spaces: a proposal or an image sent again with the same key gives back 
   assert.equal((await art("image-key-0002")).status, 201);
   const mine = (await api("GET", "/expo/advertising/proposals", { token: tolu })).json.proposals.find((p) => p.id === first.json.proposal.id);
   assert.equal(mine.artwork.length, 2);
+});
+
+test("ad spaces: artwork files up to 200 MB, sent in pieces and kept on disk; a link to the artwork as well", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const MB = 1024 * 1024;
+  const me = (await api("POST", "/expo/auth/kingschat", { body: { code: "extra-81" } })).json.accessToken;
+  // Someone else: an account other tests make (this test adds only the one it deletes at the end).
+  const other = (await api("POST", "/expo/auth/kingschat", { body: { code: "third-code" } })).json.accessToken;
+  const propose = (body) => api("POST", "/expo/advertising/proposals", { token: me, body: { space: "lampposts", quantity: 1, title: "Big Files Ltd", description: "Print-ready artwork", ...body } });
+
+  // A link to the artwork (KingsCloud, Google Drive…) is a web address.
+  assert.equal((await propose({ artworkUrl: "my google drive" })).json.error, "bad_artwork_link");
+  const made = await propose({ artworkUrl: "https://drive.google.com/file/d/abc/view" });
+  assert.equal(made.status, 201, JSON.stringify(made.json));
+  const ad = made.json.proposal;
+  assert.equal(ad.artworkUrl, "https://drive.google.com/file/d/abc/view");
+
+  const files = (body, t = me) => api("POST", `/expo/advertising/proposals/${ad.id}/files`, { token: t, body });
+  const put = async (fileId, offset, bytes, t = me) => {
+    const res = await fetch(`${base}/expo/advertising/proposals/${ad.id}/files/${fileId}?offset=${offset}`, {
+      method: "PUT", headers: { "content-type": "application/octet-stream", "x-api-key": "app-key", authorization: `Bearer ${t}` }, body: bytes,
+    });
+    return { status: res.status, json: await res.json() };
+  };
+  const listed = async () => (await api("GET", "/expo/admin/advertising", { headers: admin })).json.proposals.find((x) => x.id === ad.id);
+
+  // Up to 200 MB, its size said first; only to the person's own proposal.
+  assert.deepEqual([(await files({ name: "huge.pdf", size: 200 * MB + 1 })).status, (await files({ name: "huge.pdf", size: 200 * MB + 1 })).json.error], [413, "too_large"]);
+  assert.equal((await files({ name: "none.pdf", size: 0 })).json.error, "bad_size");
+  assert.equal((await files({ name: "x.pdf", size: 10 }, other)).status, 404);
+
+  // A 3 MB PDF in three pieces.
+  const pdf = Buffer.concat([Buffer.from("%PDF-1.7\n"), crypto.randomBytes(3 * MB - 9)]);
+  const started = await files({ name: "Banner print.pdf", size: pdf.length, key: "file-key-0001" });
+  assert.equal(started.status, 201, JSON.stringify(started.json));
+  assert.deepEqual([started.json.received, started.json.chunkMax, started.json.artwork.complete, started.json.artwork.preview], [0, 8 * MB, false, false]);
+  const id = started.json.artwork.id;
+  let r = await put(id, 0, pdf.subarray(0, MB));
+  assert.deepEqual([r.status, r.json.received, r.json.complete], [200, MB, false], JSON.stringify(r.json));
+  // The same piece again (its answer lost on the way back) is taken, not written twice; one past a gap
+  // is refused with where to carry on from; someone else can't add to it.
+  r = await put(id, 0, pdf.subarray(0, MB));
+  assert.deepEqual([r.status, r.json.received], [200, MB]);
+  r = await put(id, 2 * MB, pdf.subarray(2 * MB));
+  assert.deepEqual([r.status, r.json.error, r.json.received], [409, "bad_offset", MB]);
+  assert.equal((await put(id, MB, pdf.subarray(MB, 2 * MB), other)).status, 404);
+  // Started again with the same key (the page sending it again): the same file, and how far it got.
+  const resumed = await files({ name: "Banner print.pdf", size: pdf.length, key: "file-key-0001" });
+  assert.deepEqual([resumed.status, resumed.json.repeated, resumed.json.artwork.id, resumed.json.received], [200, true, id, MB]);
+  assert.equal((await put(id, MB, pdf.subarray(MB, 2 * MB))).json.received, 2 * MB);
+  // Longer than it said it was: refused. Then the rest.
+  assert.equal((await put(id, 2 * MB, Buffer.concat([pdf.subarray(2 * MB), Buffer.alloc(5)]))).json.error, "too_long");
+  r = await put(id, 2 * MB, pdf.subarray(2 * MB));
+  assert.deepEqual([r.json.received, r.json.complete, r.json.artwork.type, r.json.artwork.size], [pdf.length, true, "application/pdf", pdf.length]);
+
+  // Kept whole on disk; the admin sees it with the link and downloads it as it was sent. A PDF has no review copy.
+  assert.ok(fs.readFileSync(path.join(filesDir, id)).equals(pdf));
+  const seen = await listed();
+  assert.equal(seen.artworkUrl, "https://drive.google.com/file/d/abc/view");
+  assert.deepEqual(seen.artwork.map((a) => [a.name, a.type, a.size, a.complete, a.preview]), [["Banner print.pdf", "application/pdf", pdf.length, true, false]]);
+  const dl = await fetch(`${base}/expo/admin/advertising/artwork/${id}/file`, { headers: admin });
+  assert.deepEqual([dl.status, dl.headers.get("content-type"), dl.headers.get("content-disposition"), dl.headers.get("content-length")],
+    [200, "application/pdf", 'attachment; filename="Banner_print.pdf"', String(pdf.length)]);
+  assert.ok(Buffer.from(await dl.arrayBuffer()).equals(pdf));
+  assert.equal((await fetch(`${base}/expo/admin/advertising/artwork/${id}`, { headers: admin })).status, 404);
+  // A piece sent signed out is refused.
+  assert.equal((await fetch(`${base}/expo/advertising/proposals/${ad.id}/files/${id}?offset=0`, { method: "PUT", headers: { "content-type": "application/octet-stream", "x-api-key": "app-key" }, body: pdf.subarray(0, 10) })).status, 401);
+
+  // An image (TIFF) with its review copy for the team to look at.
+  const png = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(32, 7)]);
+  const tiff = Buffer.concat([Buffer.from([0x49, 0x49, 0x2a, 0x00]), crypto.randomBytes(5000)]);
+  const t1 = await files({ name: "poster.tif", size: tiff.length, preview: png.toString("base64") });
+  assert.equal(t1.json.artwork.preview, true);
+  r = await put(t1.json.artwork.id, 0, tiff);
+  assert.deepEqual([r.json.complete, r.json.artwork.type], [true, "image/tiff"]);
+  assert.equal((await fetch(`${base}/expo/admin/advertising/artwork/${t1.json.artwork.id}`, { headers: admin })).headers.get("content-type"), "image/png");
+  assert.equal((await files({ name: "bad.tif", size: 10, preview: Buffer.from("not an image").toString("base64") })).json.error, "bad_preview");
+  // A file that isn't artwork is refused at its first piece.
+  const exe = await files({ name: "setup.exe", size: 100 });
+  assert.equal((await put(exe.json.artwork.id, 0, Buffer.from("MZ" + "x".repeat(98)))).json.error, "bad_type");
+  // One left partway: the admin sees how far it got, and it can't be downloaded yet.
+  const half = await files({ name: "half.pdf", size: 2 * MB });
+  await put(half.json.artwork.id, 0, pdf.subarray(0, MB));
+  const partway = (await listed()).artwork.find((a) => a.id === half.json.artwork.id);
+  assert.deepEqual([partway.complete, partway.received, partway.size], [false, MB, 2 * MB]);
+  const early = await fetch(`${base}/expo/admin/advertising/artwork/${half.json.artwork.id}/file`, { headers: admin });
+  assert.deepEqual([early.status, (await early.json()).error], [409, "not_complete"]);
+
+  // Six to a proposal, files and images together.
+  assert.equal((await files({ name: "5.pdf", size: 10 })).status, 201);
+  assert.equal((await files({ name: "6.pdf", size: 10 })).status, 201);
+  assert.equal((await files({ name: "7.pdf", size: 10 })).json.error, "too_many");
+  // Not once the proposal has been looked at.
+  await api("POST", `/expo/admin/advertising/${ad.id}/reject`, { headers: admin, body: { reason: "Too big" } });
+  assert.equal((await files({ name: "late.pdf", size: 10 })).json.error, "not_pending");
+
+  // The account deleted: its artwork files go from disk.
+  const meId = (await api("GET", "/expo/me", { token: me })).json.user.id;
+  const gone = await api("DELETE", `/expo/admin/users/${meId}`, { headers: admin });
+  assert.equal(gone.status, 200, JSON.stringify(gone.json));
+  assert.equal(gone.json.removed.artworkFiles, 6);
+  assert.deepEqual([fs.existsSync(path.join(filesDir, id)), fs.existsSync(path.join(filesDir, t1.json.artwork.id))], [false, false]);
 });
 
 test("ad spaces: a video advert is one video, given as a link, with no limit", async () => {
