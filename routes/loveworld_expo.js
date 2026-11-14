@@ -21,7 +21,7 @@
 //   official_training   an Expo official's training: how far into the training video they are, when
 //                       they watched it all and passed the quiz, and the name on their certificate
 //   official_quiz_attempts  each go at the officials' quiz: the answers, the score and the questions missed
-//   team_votes          the team vote: 1 Espee for one team, once and for good (one row that isn't
+//   team_votes          the LoveWorld Launchpad's team vote: 1 Espee for one team, once and for good (one row that isn't
 //                       cancelled for each account; counted once Espees confirms the payment)
 //
 // Auth: POST /expo/auth/kingschat exchanges a KingsChat accessToken (or authCode) for an
@@ -496,8 +496,8 @@ const SCHEMA = `
   CREATE INDEX IF NOT EXISTS official_quiz_attempts_user ON official_quiz_attempts (user_id, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS official_quiz_attempts_client_key ON official_quiz_attempts (user_id, client_key) WHERE client_key IS NOT NULL;
 
-  -- Team votes: a signed-in person pays 1 Espee to vote for one team (a VOTE_TEAMS id), once, for
-  -- good. One row an attempt: pending (its payment is with Espees, taken but not yet confirmed, or
+  -- Team votes, for the LoveWorld Launchpad (the Expo Business Challenge): a signed-in person pays
+  -- 1 Espee to vote for one of its teams (a VOTE_TEAMS id), once, for good. One row an attempt: pending (its payment is with Espees, taken but not yet confirmed, or
   -- without a clear answer), counted (paid: the vote) or cancelled (nothing was taken, so they may
   -- try again). Paid as a pass is (payment_ref: Espees' reference; payment_status, payment_method,
   -- payer, payment_error). The two unique indexes are what make a vote final: an account, and the
@@ -1653,9 +1653,16 @@ async function settleAd(id) {
  * Team votes: 1 Espee for one team, once and for good
  * ------------------------------------------------------------------------- */
 
-// The teams (id: name). The website has the same ids, with its own pages for them (src/data/teams.ts
-// there): a rename is this line and that file's.
-const VOTE_TEAMS = { launchpad: "Launchpad", "wealth-liquefiers": "Wealth Liquefiers", dynamic: "Dynamic" };
+// The LoveWorld Launchpad (the Expo Business Challenge) is the competition; these are its teams
+// (id: name). The website has the same ids, with its own pages for them (src/data/teams.ts there):
+// a rename is this line and that file's.
+const VOTE_TEAMS = { "wealth-liquefiers": "Wealth Liquefiers", dynamic: "Dynamic" };
+// Ids votes were once taken for that aren't teams: on its first day the vote listed the Launchpad
+// itself as a third team. A vote for one of these is in no team's total, and the admin can release
+// it (reopen) so the person can vote for a team.
+const VOTE_FORMER_TEAMS = { launchpad: "Launchpad" };
+const isVoteTeam = (id) => Object.hasOwn(VOTE_TEAMS, id);
+const voteTeamName = (id) => (isVoteTeam(id) ? VOTE_TEAMS[id] : Object.hasOwn(VOTE_FORMER_TEAMS, id) ? VOTE_FORMER_TEAMS[id] : id);
 const VOTE_PRICE = 1;
 const voteCost = () => `${VOTE_PRICE} Espee${VOTE_PRICE === 1 ? "" : "s"}`;
 // Votes are taken while Espees is set up and EXPO_VOTING isn't "off" (the switch that closes voting).
@@ -1677,7 +1684,7 @@ const voteReference = () => `VOTE-${crypto.randomBytes(5).toString("hex").toUppe
 function shapeVote(r, { admin = false } = {}) {
   if (!r) return null;
   return {
-    id: r.id, reference: r.reference, team: r.team, teamName: VOTE_TEAMS[r.team] || r.team, amount: Number(r.amount) || 0, status: r.status,
+    id: r.id, reference: r.reference, team: r.team, teamName: voteTeamName(r.team), amount: Number(r.amount) || 0, status: r.status,
     paymentStatus: voteStuck(r) ? "UNKNOWN" : r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null,
     createdAt: r.created_at, paidAt: r.paid_at || null,
     ...(admin ? {
@@ -1693,26 +1700,32 @@ const voteOf = async (userId, db = pool) => (await db.query(
 
 /** Why someone with a vote (or one being paid for) can't vote now: [http, code, message]. */
 function voteRefusal(r) {
-  const name = VOTE_TEAMS[r.team] || r.team;
+  const name = voteTeamName(r.team);
   if (r.status === "counted") return [409, "already_voted", `You've already voted for ${name}. A vote can't be changed.`];
   if (r.payment_status === "PROCESSING" && !voteStuck(r)) return [409, "payment_in_progress", "Your payment is already going through. Give it a moment."];
   return [409, "vote_pending", `Your vote for ${name} is being confirmed with Espees. Please don't pay again: it will show here once it's confirmed.`];
 }
 
-/** Each team with its counted votes, and the total: for everyone (numbers left out when EXPO_VOTE_COUNTS is off) or, with `all`, for the admin. */
+/**
+ * Each team with its counted votes, and the total: for everyone (numbers left out when
+ * EXPO_VOTE_COUNTS is off) or, with `all`, for the admin, who also gets `other`: counted votes for
+ * something that isn't a team (VOTE_FORMER_TEAMS), which are in no total.
+ */
 async function voteTally({ all = false } = {}) {
   const rows = await q(`SELECT team, count(*)::int AS votes FROM team_votes WHERE status = 'counted' GROUP BY team`);
   const by = Object.fromEntries(rows.map((r) => [r.team, r.votes]));
   const shown = all || voteCountsPublic();
   const teams = Object.entries(VOTE_TEAMS).map(([id, name]) => ({ id, name, votes: shown ? by[id] || 0 : null }));
-  return { teams, total: shown ? teams.reduce((n, t) => n + t.votes, 0) : null };
+  const other = rows.filter((r) => !isVoteTeam(r.team)).reduce((n, r) => n + r.votes, 0);
+  return { teams, total: shown ? teams.reduce((n, t) => n + t.votes, 0) : null, ...(all ? { other } : {}) };
 }
 
 /** The voter's KingsChat message once their vote is counted. */
 function voteMessage(r) {
   return compose([
-    `🗳️ Your vote for ${VOTE_TEAMS[r.team] || r.team} is in!`,
+    `🗳️ Your vote for ${voteTeamName(r.team)} is in!`,
     GAP,
+    "LoveWorld Launchpad: The Expo Business Challenge",
     `Reference: ${r.reference}`,
     `Paid: ${voteCost()}`,
     GAP,
@@ -2801,7 +2814,7 @@ module.exports = function loveworldExpoRoutes() {
 
   /* ---- team votes: 1 Espee for one team, once and for good ------------- */
 
-  // The teams with their counted votes (`votes` and `total` null when EXPO_VOTE_COUNTS is off),
+  // The LoveWorld Launchpad's teams with their counted votes (`votes` and `total` null when EXPO_VOTE_COUNTS is off),
   // whether votes are being taken, what one costs and, signed in, the person's own vote. A payment
   // of theirs that Espees has taken but not yet confirmed is checked again as they look (at most
   // every 15 seconds), so a vote paid for on a page that then closed still gets counted.
@@ -2826,7 +2839,7 @@ module.exports = function loveworldExpoRoutes() {
     if (!votingOpen()) return fail(res, 503, "voting_closed", ESPEES_API_TOKEN ? "Voting is closed." : "Voting isn't open yet.");
     const b = req.body || {};
     const team = clean(b.team, 40);
-    if (!Object.hasOwn(VOTE_TEAMS, team)) return fail(res, 400, "bad_team", "Pick one of the teams.");
+    if (!isVoteTeam(team)) return fail(res, 400, "bad_team", "Pick one of the teams.");
     if (b.expectedPrice != null && !sameAmount(b.expectedPrice, VOTE_PRICE)) return fail(res, 409, "price_changed", `A vote costs ${voteCost()}.`);
     const u = await q1(`SELECT id, kc_id FROM users WHERE id = $1`, [req.expoUserId]);
     const had = await voteOf(u.id);
@@ -3315,8 +3328,9 @@ module.exports = function loveworldExpoRoutes() {
   const VOTE_ADMIN_SELECT = `SELECT v.*, u.kc_username, u.kc_name, u.first_name, u.last_name, u.email FROM team_votes v LEFT JOIN users u ON u.id = v.user_id`;
   const adminVote = async (id) => shapeVote(await q1(`${VOTE_ADMIN_SELECT} WHERE v.id = $1`, [id]), { admin: true });
 
-  // The totals (each team's counted votes; how many votes are counted, being checked and were never
-  // paid; the Espees taken) and the votes, newest first: who, the team, when, Espees' reference and
+  // The totals (each team's counted votes; how many votes are counted for the teams, how many for
+  // something that isn't a team, how many are being checked and how many attempts were never paid;
+  // the Espees taken) and the votes, newest first: who, the team, when, Espees' reference and
   // where the payment stands. ?status= (counted, pending, cancelled), ?team= and ?q= (name, username,
   // email or a reference) narrow the list; ?limit= and ?offset= page through it, and `total` is how
   // many match in all.
@@ -3336,7 +3350,7 @@ module.exports = function loveworldExpoRoutes() {
     const of = (s) => by.find((r) => r.status === s) || { n: 0, amount: 0 };
     ok(res, {
       open: votingOpen(), countsPublic: voteCountsPublic(), price: VOTE_PRICE, teams: tally.teams,
-      totals: { counted: of("counted").n, pending: of("pending").n, cancelled: of("cancelled").n, espees: of("counted").amount },
+      totals: { counted: tally.total, other: tally.other, pending: of("pending").n, cancelled: of("cancelled").n, espees: of("counted").amount },
       votes: rows.map((r) => shapeVote(r, { admin: true })), total: count?.n ?? rows.length, offset,
     });
   }));
@@ -3349,17 +3363,23 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { vote: await adminVote(r.id), ...(r.checkError ? { checkError: r.checkError } : {}) });
   }));
 
-  /** An admin's step on a vote still being paid for, under a lock on its row: `sql` (its $1 the id, $2 the note) makes the change. */
-  async function voteStep(req, res, allowed, sql) {
+  /**
+   * An admin's step on a vote, under a lock on its row: `sql` (its $1 the id, $2 the note) makes the
+   * change. For a vote still being paid for, once its charge has an answer; with `former`, also for a
+   * counted vote for something that isn't a team.
+   */
+  async function voteStep(req, res, sql, { former = false } = {}) {
     if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such vote.");
     const client = await pool.connect();
     let out;
     try {
       await client.query("BEGIN");
       const row = (await client.query(`SELECT * FROM team_votes WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+      const stray = former && row?.status === "counted" && !isVoteTeam(row.team);
       out = !row ? [404, "not_found", "No such vote."]
-        : row.status !== "pending" ? [409, "not_pending", row.status === "counted" ? "This vote is already counted." : "This attempt was never paid: there is nothing to change."]
-        : !allowed(row) ? [409, "payment_in_progress", "This payment is still going through. Give it a couple of minutes."]
+        : row.status !== "pending" && !stray ? [409, "not_pending", row.status === "counted" ? "This vote is counted: it's final." : "This attempt was never paid: there is nothing to change."]
+        // Not while the charge is still on its way to Espees (its answer isn't in yet).
+        : row.payment_status === "PROCESSING" && !voteStuck(row) ? [409, "payment_in_progress", "This payment is still going through. Give it a couple of minutes."]
         : (await client.query(sql, [row.id, clean(req.body?.note, 300) || null])).rows[0];
       await client.query(Array.isArray(out) ? "ROLLBACK" : "COMMIT");
     } catch (err) {
@@ -3371,13 +3391,10 @@ module.exports = function loveworldExpoRoutes() {
     if (Array.isArray(out)) return fail(res, ...out);
     return out;
   }
-  // Not while the charge is still on its way to Espees (its answer isn't in yet).
-  const voteSettled = (r) => r.payment_status !== "PROCESSING" || voteStuck(r);
-
   // { note? }: counts a vote by hand (paymentStatus MARKED_PAID), once the team has seen its payment
   // in Espees: one without a clear answer, say. The voter hears on KingsChat as for any vote.
   router.post("/expo/admin/votes/:id/paid", requireAdmin, asyncHandler(async (req, res) => {
-    const row = await voteStep(req, res, voteSettled,
+    const row = await voteStep(req, res,
       `UPDATE team_votes SET status = 'counted', paid_at = now(), payment_status = 'MARKED_PAID', payment_error = COALESCE($2, payment_error), updated_at = now() WHERE id = $1 RETURNING *`);
     if (!row || res.headersSent) return;
     voteMessageLater(row.id);
@@ -3385,10 +3402,12 @@ module.exports = function loveworldExpoRoutes() {
   }));
 
   // { note? }: lets the person vote again, once the team has seen in Espees that a payment without a
-  // clear answer was never taken: the attempt is kept, cancelled (paymentStatus REOPENED).
+  // clear answer was never taken: the attempt is kept, cancelled (paymentStatus REOPENED). Also for a
+  // counted vote for something that isn't a team (the Launchpad itself, listed as one at first): it
+  // was paid for, so what becomes of that Espee is the team's to settle with the person.
   router.post("/expo/admin/votes/:id/reopen", requireAdmin, asyncHandler(async (req, res) => {
-    const row = await voteStep(req, res, voteSettled,
-      `UPDATE team_votes SET status = 'cancelled', cancelled_at = now(), payment_status = 'REOPENED', payment_error = COALESCE($2, payment_error), updated_at = now() WHERE id = $1 RETURNING *`);
+    const row = await voteStep(req, res,
+      `UPDATE team_votes SET status = 'cancelled', cancelled_at = now(), payment_status = 'REOPENED', payment_error = COALESCE($2, payment_error), updated_at = now() WHERE id = $1 RETURNING *`, { former: true });
     if (!row || res.headersSent) return;
     ok(res, { vote: await adminVote(row.id) });
   }));
