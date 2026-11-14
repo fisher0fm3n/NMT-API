@@ -1537,3 +1537,176 @@ test("officials: the video watched in full or not at all, the quiz passed at 80%
   assert.equal(view.questions[24].right, 3);
   assert.equal(view.questions[0].answer, quiz[0].options[1]);
 });
+
+test("team votes: 1 Espee for one team, once and for good; a vote counts only once Espees confirms the payment", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const signIn = async (n) => (await api("POST", "/expo/auth/kingschat", { body: { code: `extra-${n}` } })).json;
+  const [ada, ben, cy, dee, eve, fay] = await Promise.all([60, 61, 62, 63, 64, 65].map(async (n) => (await signIn(n)).accessToken));
+  const wallet = { method: "wallet", username: "voter", pin: "4321" };
+  const cast = (t, team, body = {}) => api("POST", "/expo/votes", { token: t, body: { team, expectedPrice: 1, payment: wallet, ...body } });
+  const board = async (t) => (await api("GET", "/expo/votes", { token: t })).json;
+  const counts = async () => Object.fromEntries((await board()).teams.map((x) => [x.id, x.votes]));
+  const adminVotes = async (query = "") => (await api("GET", `/expo/admin/votes${query}`, { headers: admin })).json;
+  const sql = async (text, params = []) => {
+    const db = new Client({ connectionString: DB_URL });
+    await db.connect();
+    try { return await db.query(text, params); } finally { await db.end(); }
+  };
+  const n0 = kcMessages.length;
+  const told = () => kcMessages.slice(n0).filter((m) => /Your vote for/.test(m.message.body.text.body));
+
+  // The board, for anyone: the three teams, nothing counted yet, votes being taken at 1 Espee.
+  const start = await board();
+  assert.deepEqual([start.open, start.price, start.total, start.vote], [true, 1, 0, null]);
+  assert.deepEqual(start.teams, [{ id: "launchpad", name: "Launchpad", votes: 0 }, { id: "wealth-liquefiers", name: "Wealth Liquefiers", votes: 0 }, { id: "dynamic", name: "Dynamic", votes: 0 }]);
+
+  // Voting is for a signed-in person, for one of the teams, at the price shown, with a way to pay.
+  const charges = espeesCharges.length;
+  assert.equal((await api("POST", "/expo/votes", { body: { team: "dynamic", payment: wallet } })).status, 401);
+  assert.equal((await api("GET", "/expo/votes/me")).status, 401);
+  assert.equal((await cast(ada, "the-winners")).json.error, "bad_team");
+  assert.equal((await cast(ada, "toString")).json.error, "bad_team");
+  assert.deepEqual([(await cast(ada, "dynamic", { expectedPrice: 0.5 })).status, (await cast(ada, "dynamic", { expectedPrice: 0.5 })).json.error], [409, "price_changed"]);
+  assert.equal((await cast(ada, "dynamic", { payment: { method: "wallet", username: "voter" } })).json.error, "missing_payment");
+  assert.equal(espeesCharges.length, charges);
+  assert.equal((await sql(`SELECT 1 FROM team_votes`)).rowCount, 0);
+
+  // Espees refuses: nothing taken, so no vote. The attempt is kept, cancelled, and they can try again.
+  espeesRefuse = "Insufficient balance";
+  const declined = await cast(ada, "dynamic");
+  assert.deepEqual([declined.status, declined.json.error, declined.json.message], [402, "payment_declined", "Insufficient balance"]);
+  assert.equal((await board(ada)).vote, null);
+  assert.equal((await counts()).dynamic, 0);
+
+  // A vote: charged 1 Espee with the merchant token, confirmed with Espees, counted. The PIN isn't kept.
+  const v = await cast(ada, "launchpad");
+  assert.equal(v.status, 201, JSON.stringify(v.json));
+  assert.deepEqual([v.json.vote.team, v.json.vote.teamName, v.json.vote.status, v.json.vote.paymentStatus, v.json.vote.amount, v.json.vote.payer], ["launchpad", "Launchpad", "counted", "PAID", 1, "@voter"]);
+  assert.match(v.json.vote.reference, /^VOTE-[0-9A-F]{10}$/);
+  assert.deepEqual(espeesCharges.at(-1), { path: "/makepayment", token: "esp-test-token", body: { username: "voter", pin: "4321", espeesAmount: 1 }, reference: espeesCharges.at(-1).reference });
+  assert.ok(!JSON.stringify(v.json).includes("4321"));
+  assert.ok(!JSON.stringify((await sql(`SELECT * FROM team_votes`)).rows).includes("4321"));
+  assert.deepEqual(await counts(), { launchpad: 1, "wealth-liquefiers": 0, dynamic: 0 });
+  assert.equal((await board(ada)).vote.reference, v.json.vote.reference);
+  assert.equal((await api("GET", "/expo/votes/me", { token: ada })).json.vote.team, "launchpad");
+  // The voter hears on KingsChat, once.
+  for (let i = 0; i < 100 && !told().length; i++) await new Promise((r) => setTimeout(r, 30));
+  assert.match(told()[0]?.message.body.text.body || "", /Your vote for Launchpad is in!/);
+  assert.match(told()[0].message.body.text.body, new RegExp(`Reference: ${v.json.vote.reference}`));
+
+  // Once is for good: the same team again or another one is refused, and nothing more is charged.
+  const paidOnce = espeesCharges.length;
+  for (const team of ["launchpad", "dynamic"]) {
+    const again = await cast(ada, team);
+    assert.deepEqual([again.status, again.json.error], [409, "already_voted"]);
+    assert.match(again.json.message, /already voted for Launchpad/);
+  }
+  assert.equal(espeesCharges.length, paidOnce);
+  assert.deepEqual(await counts(), { launchpad: 1, "wealth-liquefiers": 0, dynamic: 0 });
+  // The database itself refuses a second vote for the account, and for its KingsChat identity.
+  const row = (await sql(`SELECT user_id, kc_id FROM team_votes WHERE status = 'counted'`)).rows[0];
+  await assert.rejects(sql(`INSERT INTO team_votes (id, reference, user_id, team, amount, status) VALUES ($1, 'VOTE-X1', $2, 'dynamic', 1, 'counted')`, [crypto.randomUUID(), row.user_id]), /team_votes_one_per_user/);
+  await assert.rejects(sql(`INSERT INTO team_votes (id, reference, kc_id, team, amount, status) VALUES ($1, 'VOTE-X2', $2, 'dynamic', 1, 'pending')`, [crypto.randomUUID(), row.kc_id]), /team_votes_one_per_kc/);
+
+  // Vote pressed twice at once: one vote, one charge.
+  espeesSlow = 300;
+  const both = await Promise.all([cast(ben, "dynamic"), cast(ben, "wealth-liquefiers")]);
+  espeesSlow = 0;
+  assert.deepEqual(both.map((x) => x.status).sort(), [201, 409]);
+  assert.equal(both.find((x) => x.status === 409).json.error, "payment_in_progress");
+  assert.equal(espeesCharges.length, paidOnce + 1);
+
+  // Charged, but Espees hasn't confirmed it: not a vote yet, and not to be paid for again. Counted
+  // once Espees confirms it, when the person looks again.
+  const slowRef = nextEspeesRef();
+  espeesStatus[slowRef] = { status: "0" };
+  const waiting = await cast(cy, "wealth-liquefiers");
+  assert.deepEqual([waiting.status, waiting.json.vote.status, waiting.json.vote.paymentStatus], [201, "pending", "CHARGED"]);
+  const before = await counts();
+  assert.equal(before["wealth-liquefiers"], both.find((x) => x.status === 201).json.vote.team === "wealth-liquefiers" ? 1 : 0);
+  const second = await cast(cy, "dynamic");
+  assert.deepEqual([second.status, second.json.error], [409, "vote_pending"]);
+  assert.equal((await api("POST", "/expo/votes/confirm", { token: cy })).json.vote.status, "pending");
+  espeesStatus[slowRef] = { status: "1" };
+  const confirmed = await api("POST", "/expo/votes/confirm", { token: cy });
+  assert.deepEqual([confirmed.json.vote.status, confirmed.json.vote.paymentStatus], ["counted", "PAID"]);
+  assert.equal((await counts())["wealth-liquefiers"], before["wealth-liquefiers"] + 1);
+  assert.equal((await api("POST", "/expo/votes/confirm", { token: dee })).status, 404);
+
+  // The same, with the page closed after paying: just looking at the board later brings it up to date.
+  const lateRef = nextEspeesRef();
+  espeesStatus[lateRef] = { status: "0" };
+  assert.equal((await cast(fay, "dynamic")).json.vote.status, "pending");
+  espeesStatus[lateRef] = { status: "1" };
+  await sql(`UPDATE team_votes SET payment_checked_at = now() - interval '1 minute' WHERE payment_ref = $1`, [lateRef]);
+  assert.equal((await board(fay)).vote.status, "counted");
+
+  // No clear answer from Espees: kept for the team, the person told not to pay again, nothing counted.
+  espeesBroken = true;
+  const unclear = await cast(dee, "dynamic");
+  espeesBroken = false;
+  assert.deepEqual([unclear.status, unclear.json.error], [502, "payment_unknown"]);
+  assert.deepEqual([(await board(dee)).vote.status, (await board(dee)).vote.paymentStatus], ["pending", "UNKNOWN"]);
+  assert.equal((await cast(dee, "dynamic")).json.error, "vote_pending");
+  // The team sees in Espees that nothing was taken, and reopens it: the attempt is kept, cancelled, and they vote.
+  const stuck = (await adminVotes("?status=pending")).votes.find((x) => x.user.username === "extra_63");
+  assert.deepEqual([stuck.paymentStatus, stuck.paymentRef], ["UNKNOWN", null]);
+  assert.match(stuck.paymentError, /500/);
+  assert.equal((await api("POST", `/expo/admin/votes/${stuck.id}/reopen`)).status, 401);
+  const reopened = await api("POST", `/expo/admin/votes/${stuck.id}/reopen`, { headers: admin, body: { note: "Not in Espees" } });
+  assert.deepEqual([reopened.json.vote.status, reopened.json.vote.paymentStatus, reopened.json.vote.paymentError], ["cancelled", "REOPENED", "Not in Espees"]);
+  assert.equal((await board(dee)).vote, null);
+  assert.equal((await cast(dee, "wealth-liquefiers")).json.vote.status, "counted");
+  // A counted vote can't be reopened or counted again.
+  const deeVote = (await board(dee)).vote;
+  assert.equal((await api("POST", `/expo/admin/votes/${deeVote.id}/reopen`, { headers: admin })).json.error, "not_pending");
+  assert.equal((await api("POST", `/expo/admin/votes/${deeVote.id}/paid`, { headers: admin })).json.error, "not_pending");
+
+  // Confirmed by Espees for another amount: not counted. The team, having seen the payment, counts it by hand.
+  espeesStatus[nextEspeesRef()] = { status: "1", amount: 0.01 };
+  const odd = await cast(eve, "launchpad");
+  assert.deepEqual([odd.json.vote.status, odd.json.vote.paymentStatus], ["pending", "MISMATCH"]);
+  assert.equal((await counts()).launchpad, 1);
+  const byHand = await api("POST", `/expo/admin/votes/${odd.json.vote.id}/paid`, { headers: admin, body: { note: "Seen in Espees" } });
+  assert.deepEqual([byHand.json.vote.status, byHand.json.vote.paymentStatus], ["counted", "MARKED_PAID"]);
+  assert.equal((await counts()).launchpad, 2);
+  assert.equal((await api("POST", `/expo/admin/votes/${odd.json.vote.id}/settle`, { headers: admin })).json.vote.status, "counted");
+
+  // The admin's view: the totals, and every vote with who, which team, when and Espees' reference.
+  assert.equal((await api("GET", "/expo/admin/votes")).status, 401);
+  const view = await adminVotes();
+  const tally = await counts();
+  assert.deepEqual(Object.fromEntries(view.teams.map((x) => [x.id, x.votes])), tally);
+  assert.deepEqual(view.totals, { counted: 6, pending: 0, cancelled: 2, espees: 6 });
+  assert.equal(tally.launchpad + tally["wealth-liquefiers"] + tally.dynamic, 6);
+  assert.deepEqual([view.total, view.votes.length], [8, 8]);
+  const adas = view.votes.find((x) => x.reference === v.json.vote.reference);
+  assert.deepEqual([adas.user.username, adas.user.name, adas.team, adas.status, adas.payer, adas.paymentRef, !!adas.paidAt, !!adas.createdAt], ["extra_60", "Extra 60", "launchpad", "counted", "@voter", espeesCharges[paidOnce - 1].reference, true, true]);
+  assert.deepEqual((await adminVotes("?status=cancelled")).votes.map((x) => x.paymentStatus).sort(), ["DECLINED", "REOPENED"]);
+  assert.deepEqual([(await adminVotes("?team=launchpad&status=counted")).total, (await adminVotes("?q=extra_60")).total, (await adminVotes(`?q=${v.json.vote.reference.toLowerCase()}`)).total], [2, 2, 1]);
+  assert.deepEqual([(await adminVotes("?limit=3")).votes.length, (await adminVotes("?limit=3&offset=6")).votes.length], [3, 2]);
+  assert.equal((await api("GET", "/expo/admin/stats", { headers: admin })).json.stats.votes, 6);
+  // A person never sees who else voted, Espees' reference or its errors.
+  assert.deepEqual([v.json.vote.user, v.json.vote.paymentRef, v.json.vote.paymentError], [undefined, undefined, undefined]);
+
+  // An account deleted and made again with the same KingsChat identity has still voted; the vote stays counted.
+  assert.equal((await api("DELETE", "/expo/account", { token: ada })).json.deleted, true);
+  const adaAgain = (await signIn(60)).accessToken;
+  assert.equal((await board(adaAgain)).vote.team, "launchpad");
+  assert.equal((await cast(adaAgain, "dynamic")).json.error, "already_voted");
+  assert.equal((await counts()).launchpad, 2);
+
+  // The running totals can be kept from the public, and voting closed.
+  process.env.EXPO_VOTE_COUNTS = "off";
+  const hidden = await board();
+  assert.deepEqual([hidden.total, hidden.teams.map((x) => x.votes)], [null, [null, null, null]]);
+  assert.equal((await adminVotes()).teams[0].votes, 2);
+  delete process.env.EXPO_VOTE_COUNTS;
+  process.env.EXPO_VOTING = "off";
+  const newcomer = (await signIn(66)).accessToken;
+  assert.equal((await board()).open, false);
+  assert.deepEqual([(await cast(newcomer, "dynamic")).status, (await cast(newcomer, "dynamic")).json.error], [503, "voting_closed"]);
+  delete process.env.EXPO_VOTING;
+  assert.equal(espeesCharges.length, paidOnce + 5);
+  assert.equal(told().length, 6);
+});

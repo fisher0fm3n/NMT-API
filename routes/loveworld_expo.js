@@ -21,6 +21,8 @@
 //   official_training   an Expo official's training: how far into the training video they are, when
 //                       they watched it all and passed the quiz, and the name on their certificate
 //   official_quiz_attempts  each go at the officials' quiz: the answers, the score and the questions missed
+//   team_votes          the team vote: 1 Espee for one team, once and for good (one row that isn't
+//                       cancelled for each account; counted once Espees confirms the payment)
 //
 // Auth: POST /expo/auth/kingschat exchanges a KingsChat accessToken (or authCode) for an
 // access token (HS256 JWT, 1 h) and a refresh token. Signed-in calls send
@@ -493,6 +495,38 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS official_quiz_attempts_user ON official_quiz_attempts (user_id, created_at);
   CREATE UNIQUE INDEX IF NOT EXISTS official_quiz_attempts_client_key ON official_quiz_attempts (user_id, client_key) WHERE client_key IS NOT NULL;
+
+  -- Team votes: a signed-in person pays 1 Espee to vote for one team (a VOTE_TEAMS id), once, for
+  -- good. One row an attempt: pending (its payment is with Espees, taken but not yet confirmed, or
+  -- without a clear answer), counted (paid: the vote) or cancelled (nothing was taken, so they may
+  -- try again). Paid as a pass is (payment_ref: Espees' reference; payment_status, payment_method,
+  -- payer, payment_error). The two unique indexes are what make a vote final: an account, and the
+  -- KingsChat identity behind it (kc_id, kept so that deleting the account and signing in again gives
+  -- no second vote), has at most one row that isn't cancelled, and nothing ever changes a row's team.
+  -- A deleted account's vote stays, counted, with no account on it.
+  CREATE TABLE IF NOT EXISTS team_votes (
+    id UUID PRIMARY KEY,
+    reference TEXT NOT NULL UNIQUE,
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    kc_id TEXT,
+    team TEXT NOT NULL,
+    amount NUMERIC(14,4) NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    payment_ref TEXT,
+    payment_status TEXT,
+    payment_method TEXT,
+    payer TEXT,
+    payment_error TEXT,
+    payment_checked_at TIMESTAMPTZ,
+    paid_at TIMESTAMPTZ,
+    cancelled_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE UNIQUE INDEX IF NOT EXISTS team_votes_one_per_user ON team_votes (user_id) WHERE status <> 'cancelled';
+  CREATE UNIQUE INDEX IF NOT EXISTS team_votes_one_per_kc ON team_votes (kc_id) WHERE status <> 'cancelled' AND kc_id IS NOT NULL;
+  CREATE INDEX IF NOT EXISTS team_votes_counted ON team_votes (team) WHERE status = 'counted';
+  CREATE INDEX IF NOT EXISTS team_votes_created ON team_votes (created_at DESC);
 `;
 
 let schemaReady = null;
@@ -1616,6 +1650,115 @@ async function settleAd(id) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Team votes: 1 Espee for one team, once and for good
+ * ------------------------------------------------------------------------- */
+
+// The teams (id: name). The website has the same ids, with its own pages for them (src/data/teams.ts
+// there): a rename is this line and that file's.
+const VOTE_TEAMS = { launchpad: "Launchpad", "wealth-liquefiers": "Wealth Liquefiers", dynamic: "Dynamic" };
+const VOTE_PRICE = 1;
+const voteCost = () => `${VOTE_PRICE} Espee${VOTE_PRICE === 1 ? "" : "s"}`;
+// Votes are taken while Espees is set up and EXPO_VOTING isn't "off" (the switch that closes voting).
+const votingOpen = () => !!ESPEES_API_TOKEN && (env("EXPO_VOTING") || "on").toLowerCase() !== "off";
+// EXPO_VOTE_COUNTS=off keeps the running totals to the admin: the public answers carry no numbers.
+const voteCountsPublic = () => (env("EXPO_VOTE_COUNTS") || "on").toLowerCase() !== "off";
+// A payment still marked as being sent after this long never got its answer recorded (the server
+// stopped mid-payment): nobody can tell whether it was taken, so it's for the team to check.
+const VOTE_SENDING_MS = 2 * 60 * 1000;
+const voteStuck = (r) => r.status === "pending" && r.payment_status === "PROCESSING" && Date.now() - new Date(r.created_at).getTime() > VOTE_SENDING_MS;
+// Ten hex characters: a reference never has to be made twice, however many vote.
+const voteReference = () => `VOTE-${crypto.randomBytes(5).toString("hex").toUpperCase()}`;
+
+/**
+ * A vote as the person sees it: pending or counted (or, for the admin, cancelled), with where its
+ * payment stands (a payment stuck being sent shows as UNKNOWN). The admin also sees who, Espees'
+ * reference and what went wrong.
+ */
+function shapeVote(r, { admin = false } = {}) {
+  if (!r) return null;
+  return {
+    id: r.id, reference: r.reference, team: r.team, teamName: VOTE_TEAMS[r.team] || r.team, amount: Number(r.amount) || 0, status: r.status,
+    paymentStatus: voteStuck(r) ? "UNKNOWN" : r.payment_status || null, paymentMethod: r.payment_method || null, payer: r.payer || null,
+    createdAt: r.created_at, paidAt: r.paid_at || null,
+    ...(admin ? {
+      user: r.user_id ? { id: r.user_id, username: r.kc_username || null, name: [r.first_name, r.last_name].filter(Boolean).join(" ") || r.kc_name || null, email: r.email || null } : null,
+      paymentRef: r.payment_ref || null, paymentError: r.payment_error || null, paymentCheckedAt: r.payment_checked_at || null, cancelledAt: r.cancelled_at || null,
+    } : {}),
+  };
+}
+
+/** The account's vote: its one row that isn't cancelled (its own, or its KingsChat identity's from an account since deleted), or null. */
+const voteOf = async (userId, db = pool) => (await db.query(
+  `SELECT v.* FROM team_votes v WHERE v.status <> 'cancelled' AND (v.user_id = $1 OR v.kc_id = (SELECT kc_id FROM users WHERE id = $1)) ORDER BY v.created_at DESC LIMIT 1`, [userId])).rows[0] || null;
+
+/** Why someone with a vote (or one being paid for) can't vote now: [http, code, message]. */
+function voteRefusal(r) {
+  const name = VOTE_TEAMS[r.team] || r.team;
+  if (r.status === "counted") return [409, "already_voted", `You've already voted for ${name}. A vote can't be changed.`];
+  if (r.payment_status === "PROCESSING" && !voteStuck(r)) return [409, "payment_in_progress", "Your payment is already going through. Give it a moment."];
+  return [409, "vote_pending", `Your vote for ${name} is being confirmed with Espees. Please don't pay again: it will show here once it's confirmed.`];
+}
+
+/** Each team with its counted votes, and the total: for everyone (numbers left out when EXPO_VOTE_COUNTS is off) or, with `all`, for the admin. */
+async function voteTally({ all = false } = {}) {
+  const rows = await q(`SELECT team, count(*)::int AS votes FROM team_votes WHERE status = 'counted' GROUP BY team`);
+  const by = Object.fromEntries(rows.map((r) => [r.team, r.votes]));
+  const shown = all || voteCountsPublic();
+  const teams = Object.entries(VOTE_TEAMS).map(([id, name]) => ({ id, name, votes: shown ? by[id] || 0 : null }));
+  return { teams, total: shown ? teams.reduce((n, t) => n + t.votes, 0) : null };
+}
+
+/** The voter's KingsChat message once their vote is counted. */
+function voteMessage(r) {
+  return compose([
+    `🗳️ Your vote for ${VOTE_TEAMS[r.team] || r.team} is in!`,
+    GAP,
+    `Reference: ${r.reference}`,
+    `Paid: ${voteCost()}`,
+    GAP,
+    "One vote each, and it can't be changed. Thank you for voting.",
+    site("/teams") && `The teams: ${site("/teams")}`,
+  ]);
+}
+
+/** Tell the voter on KingsChat, in the background (once: only the step to counted calls it). */
+function voteMessageLater(id) {
+  setImmediate(async () => {
+    try {
+      const r = await q1(`SELECT v.*, u.kc_user_id, u.kc_id AS user_kc_id FROM team_votes v JOIN users u ON u.id = v.user_id WHERE v.id = $1`, [id]);
+      if (r) await deliver({ userId: r.user_id, kc: r.kc_user_id || r.user_kc_id, text: voteMessage(r), kind: "vote:counted" }, { ref: r.reference });
+    } catch (err) {
+      console.error(`[expo] vote message (${id}) failed:`, err.message);
+    }
+  });
+}
+
+/**
+ * Brings a vote's payment up to date: one Espees has taken is checked with it (done, for this
+ * reference and the full price: the vote is counted, and the voter hears on KingsChat, once). Safe
+ * to call again and at the same time. Returns the row, with `checkError` when Espees couldn't be asked.
+ */
+async function settleVote(id) {
+  const r = await q1(`SELECT * FROM team_votes WHERE id = $1`, [id]);
+  if (!r || r.status !== "pending" || !r.payment_ref || !["CHARGED", "MISMATCH"].includes(r.payment_status)) return r;
+  const t = await espeesTransaction(r.payment_ref);
+  if (t.error) {
+    console.error(`[expo] Espees transaction (${r.reference}) not checked: ${t.error}`);
+    return { ...r, checkError: t.error };
+  }
+  const matches = (t.reference == null || String(t.reference) === r.payment_ref) && (t.amount == null || sameAmount(t.amount, r.amount));
+  if (t.done && !matches) console.error(`[expo] Espees transaction ${r.payment_ref} (${r.reference}) is for ${t.amount}, not ${Number(r.amount)}: not counted`);
+  const paid = t.done && matches;
+  // Only the step from pending to counted tells the voter, so a second check at the same time doesn't.
+  const moved = await q1(
+    `UPDATE team_votes SET payment_status = $2, payment_checked_at = now(), status = CASE WHEN $3 THEN 'counted' ELSE status END,
+       paid_at = CASE WHEN $3 THEN now() ELSE paid_at END, updated_at = now() WHERE id = $1 AND status = 'pending' RETURNING *`,
+    [id, paid ? "PAID" : t.done ? "MISMATCH" : "CHARGED", paid]);
+  if (paid && moved) voteMessageLater(id);
+  return moved || (await q1(`SELECT * FROM team_votes WHERE id = $1`, [id]));
+}
+
+/* ---------------------------------------------------------------------------
  * Officials' training
  * ------------------------------------------------------------------------- */
 
@@ -2656,6 +2799,98 @@ module.exports = function loveworldExpoRoutes() {
     ok(res, { training: await officialsTraining(req.expoUserId) });
   }));
 
+  /* ---- team votes: 1 Espee for one team, once and for good ------------- */
+
+  // The teams with their counted votes (`votes` and `total` null when EXPO_VOTE_COUNTS is off),
+  // whether votes are being taken, what one costs and, signed in, the person's own vote. A payment
+  // of theirs that Espees has taken but not yet confirmed is checked again as they look (at most
+  // every 15 seconds), so a vote paid for on a page that then closed still gets counted.
+  router.get("/expo/votes", ...maybeUser, asyncHandler(async (req, res) => {
+    let mine = req.expoUserId ? await voteOf(req.expoUserId) : null;
+    const due = mine && mine.status === "pending" && mine.payment_status === "CHARGED" && (!mine.payment_checked_at || Date.now() - new Date(mine.payment_checked_at).getTime() > 15000);
+    if (due) mine = await settleVote(mine.id);
+    ok(res, { open: votingOpen(), price: VOTE_PRICE, currency: "ESPEES", ...(await voteTally()), vote: shapeVote(mine) });
+  }));
+
+  // The signed-in person's vote: { vote } (pending or counted), or null when they haven't voted.
+  router.get("/expo/votes/me", ...user, asyncHandler(async (req, res) => {
+    ok(res, { vote: shapeVote(await voteOf(req.expoUserId)) });
+  }));
+
+  // { team, expectedPrice?, payment: { method: "wallet", username, pin } | { method: "card", cardNum, pin } }:
+  // the signed-in person's one vote. Espees is charged there and then, as for a pass (the PIN goes
+  // to Espees and is never kept), then asked to confirm the charge: 201 { vote }, counted once it
+  // has (pending, CHARGED, until then: /expo/votes/confirm asks again). Someone who has voted, or
+  // whose payment may have been taken, is refused (409) before anything is charged.
+  router.post("/expo/votes", ...user, asyncHandler(async (req, res) => {
+    if (!votingOpen()) return fail(res, 503, "voting_closed", ESPEES_API_TOKEN ? "Voting is closed." : "Voting isn't open yet.");
+    const b = req.body || {};
+    const team = clean(b.team, 40);
+    if (!Object.hasOwn(VOTE_TEAMS, team)) return fail(res, 400, "bad_team", "Pick one of the teams.");
+    if (b.expectedPrice != null && !sameAmount(b.expectedPrice, VOTE_PRICE)) return fail(res, 409, "price_changed", `A vote costs ${voteCost()}.`);
+    const u = await q1(`SELECT id, kc_id FROM users WHERE id = $1`, [req.expoUserId]);
+    const had = await voteOf(u.id);
+    if (had) return fail(res, ...voteRefusal(had));
+    const pay = paymentDetails(b.payment);
+    if (pay.missing) return fail(res, 400, "missing_payment", pay.missing);
+
+    // The vote is made, marked as with Espees, before anything is charged, under the person's
+    // payment lock: a second Vote, at the same moment or ever after, finds it and is refused. The
+    // unique indexes refuse it too, whatever this code does.
+    const id = crypto.randomUUID();
+    const ref = voteReference();
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [`expo-pay:${u.id}`]);
+      const live = await voteOf(u.id, client);
+      if (live) {
+        await client.query("ROLLBACK");
+        return fail(res, ...voteRefusal(live));
+      }
+      await client.query(
+        `INSERT INTO team_votes (id, reference, user_id, kc_id, team, amount, status, payment_status, payment_method, payer)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', 'PROCESSING', $7, $8)`,
+        [id, ref, u.id, u.kc_id || null, team, VOTE_PRICE, pay.method, pay.payer]);
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      if (err.code !== "23505" || !/^team_votes_one_per_/.test(err.constraint || "")) throw err;
+      const live = await voteOf(u.id);
+      return fail(res, ...(live ? voteRefusal(live) : [409, "already_voted", "You've already voted. A vote can't be changed."]));
+    } finally {
+      client.release();
+    }
+
+    const charge = await chargeEspees({ reference: ref, pass_price: VOTE_PRICE }, pay);
+    if (charge.declined || charge.unavailable) {
+      // Nothing was taken: the attempt is kept, cancelled, and they can vote again (for any team).
+      await q(`UPDATE team_votes SET status = 'cancelled', cancelled_at = now(), payment_status = 'DECLINED', payment_error = $2, updated_at = now() WHERE id = $1 AND status = 'pending'`,
+        [id, charge.declined || `unreachable: ${charge.unavailable}`]);
+      return charge.declined
+        ? fail(res, 402, "payment_declined", charge.declined)
+        : fail(res, 502, "payment_unavailable", "Espees couldn't be reached, so nothing was taken. Please try again in a moment.");
+    }
+    if (charge.unknown) {
+      console.error(`[expo] vote ${ref}: can't tell whether Espees took the payment (${charge.unknown})`);
+      await q(`UPDATE team_votes SET payment_status = 'UNKNOWN', payment_error = $2, updated_at = now() WHERE id = $1`, [id, charge.unknown]);
+      return fail(res, 502, "payment_unknown", "We couldn't tell whether Espees took the payment. Please don't pay again: the Expo team will check it, and your vote will show here once it's confirmed.");
+    }
+    await q(`UPDATE team_votes SET payment_ref = $2, payment_status = 'CHARGED', updated_at = now() WHERE id = $1`, [id, charge.reference]);
+    const v = await settleVote(id);
+    res.status(201);
+    ok(res, { vote: shapeVote(v) });
+  }));
+
+  // The person's own vote brought up to date: a payment Espees has taken is checked with it, and
+  // counted once confirmed. checkError: Espees couldn't be asked this time.
+  router.post("/expo/votes/confirm", ...user, asyncHandler(async (req, res) => {
+    const mine = await voteOf(req.expoUserId);
+    if (!mine) return fail(res, 404, "no_vote", "You haven't voted yet.");
+    const r = await settleVote(mine.id);
+    ok(res, { vote: shapeVote(r), ...(r.checkError ? { checkError: "Espees couldn't be reached to check the payment. Try again in a moment." } : {}) });
+  }));
+
   /* ---- admin ----------------------------------------------------------- */
 
   const limit =(req, max = 500) => Math.min(max, Math.max(1, Number(req.query.limit) || 200));
@@ -2666,7 +2901,8 @@ module.exports = function loveworldExpoRoutes() {
   router.get("/expo/admin/stats", requireAdmin, asyncHandler(async (_req, res) => {
     const row = await q1(`SELECT (SELECT count(*)::int FROM users) AS users, (SELECT count(*)::int FROM exhibitors) AS exhibitors,
       (SELECT count(*)::int FROM bookings WHERE status = 'confirmed') AS bookings, (SELECT count(*)::int FROM registrations) AS registrations,
-      (SELECT count(*)::int FROM sponsor_enquiries) AS enquiries, (SELECT count(*)::int FROM program_applications) AS applications`);
+      (SELECT count(*)::int FROM sponsor_enquiries) AS enquiries, (SELECT count(*)::int FROM program_applications) AS applications,
+      (SELECT count(*)::int FROM team_votes WHERE status = 'counted') AS votes`);
     ok(res, { stats: row });
   }));
 
@@ -3072,6 +3308,89 @@ module.exports = function loveworldExpoRoutes() {
       quiz: { questions: OFFICIALS_QUIZ.length, passMark: passScore(), passPercent: OFFICIALS_PASS_PERCENT },
       video: await officialsVideo(),
     });
+  }));
+
+  /* ---- admin: team votes ------------------------------------------------ */
+
+  const VOTE_ADMIN_SELECT = `SELECT v.*, u.kc_username, u.kc_name, u.first_name, u.last_name, u.email FROM team_votes v LEFT JOIN users u ON u.id = v.user_id`;
+  const adminVote = async (id) => shapeVote(await q1(`${VOTE_ADMIN_SELECT} WHERE v.id = $1`, [id]), { admin: true });
+
+  // The totals (each team's counted votes; how many votes are counted, being checked and were never
+  // paid; the Espees taken) and the votes, newest first: who, the team, when, Espees' reference and
+  // where the payment stands. ?status= (counted, pending, cancelled), ?team= and ?q= (name, username,
+  // email or a reference) narrow the list; ?limit= and ?offset= page through it, and `total` is how
+  // many match in all.
+  router.get("/expo/admin/votes", requireAdmin, asyncHandler(async (req, res) => {
+    const status = clean(req.query.status, 20);
+    const team = clean(req.query.team, 40);
+    const needle = clean(req.query.q, 100).toLowerCase();
+    const offset = Math.max(0, Math.floor(Number(req.query.offset) || 0));
+    const where = `WHERE ($1 = '' OR v.status = $1) AND ($2 = '' OR v.team = $2)
+       AND ($3 = '' OR lower(coalesce(u.kc_username,'') || ' ' || coalesce(u.kc_name,'') || ' ' || coalesce(u.first_name,'') || ' ' || coalesce(u.last_name,'') || ' ' || coalesce(u.email,'') || ' ' || v.reference || ' ' || coalesce(v.payment_ref,'')) LIKE '%' || $3 || '%')`;
+    const [rows, count, by, tally] = await Promise.all([
+      q(`${VOTE_ADMIN_SELECT} ${where} ORDER BY v.created_at DESC, v.id LIMIT $4 OFFSET $5`, [status, team, needle, limit(req, 1000), offset]),
+      q1(`SELECT count(*)::int AS n FROM team_votes v LEFT JOIN users u ON u.id = v.user_id ${where}`, [status, team, needle]),
+      q(`SELECT status, count(*)::int AS n, coalesce(sum(amount), 0)::float AS amount FROM team_votes GROUP BY status`),
+      voteTally({ all: true }),
+    ]);
+    const of = (s) => by.find((r) => r.status === s) || { n: 0, amount: 0 };
+    ok(res, {
+      open: votingOpen(), countsPublic: voteCountsPublic(), price: VOTE_PRICE, teams: tally.teams,
+      totals: { counted: of("counted").n, pending: of("pending").n, cancelled: of("cancelled").n, espees: of("counted").amount },
+      votes: rows.map((r) => shapeVote(r, { admin: true })), total: count?.n ?? rows.length, offset,
+    });
+  }));
+
+  // A payment Espees has taken, checked with it again (as the person's own /expo/votes/confirm).
+  router.post("/expo/admin/votes/:id/settle", requireAdmin, asyncHandler(async (req, res) => {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such vote.");
+    const r = await settleVote(req.params.id);
+    if (!r) return fail(res, 404, "not_found", "No such vote.");
+    ok(res, { vote: await adminVote(r.id), ...(r.checkError ? { checkError: r.checkError } : {}) });
+  }));
+
+  /** An admin's step on a vote still being paid for, under a lock on its row: `sql` (its $1 the id, $2 the note) makes the change. */
+  async function voteStep(req, res, allowed, sql) {
+    if (!isUuid(req.params.id)) return fail(res, 404, "not_found", "No such vote.");
+    const client = await pool.connect();
+    let out;
+    try {
+      await client.query("BEGIN");
+      const row = (await client.query(`SELECT * FROM team_votes WHERE id = $1 FOR UPDATE`, [req.params.id])).rows[0];
+      out = !row ? [404, "not_found", "No such vote."]
+        : row.status !== "pending" ? [409, "not_pending", row.status === "counted" ? "This vote is already counted." : "This attempt was never paid: there is nothing to change."]
+        : !allowed(row) ? [409, "payment_in_progress", "This payment is still going through. Give it a couple of minutes."]
+        : (await client.query(sql, [row.id, clean(req.body?.note, 300) || null])).rows[0];
+      await client.query(Array.isArray(out) ? "ROLLBACK" : "COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw err;
+    } finally {
+      client.release();
+    }
+    if (Array.isArray(out)) return fail(res, ...out);
+    return out;
+  }
+  // Not while the charge is still on its way to Espees (its answer isn't in yet).
+  const voteSettled = (r) => r.payment_status !== "PROCESSING" || voteStuck(r);
+
+  // { note? }: counts a vote by hand (paymentStatus MARKED_PAID), once the team has seen its payment
+  // in Espees: one without a clear answer, say. The voter hears on KingsChat as for any vote.
+  router.post("/expo/admin/votes/:id/paid", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await voteStep(req, res, voteSettled,
+      `UPDATE team_votes SET status = 'counted', paid_at = now(), payment_status = 'MARKED_PAID', payment_error = COALESCE($2, payment_error), updated_at = now() WHERE id = $1 RETURNING *`);
+    if (!row || res.headersSent) return;
+    voteMessageLater(row.id);
+    ok(res, { vote: await adminVote(row.id) });
+  }));
+
+  // { note? }: lets the person vote again, once the team has seen in Espees that a payment without a
+  // clear answer was never taken: the attempt is kept, cancelled (paymentStatus REOPENED).
+  router.post("/expo/admin/votes/:id/reopen", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await voteStep(req, res, voteSettled,
+      `UPDATE team_votes SET status = 'cancelled', cancelled_at = now(), payment_status = 'REOPENED', payment_error = COALESCE($2, payment_error), updated_at = now() WHERE id = $1 RETURNING *`);
+    if (!row || res.headersSent) return;
+    ok(res, { vote: await adminVote(row.id) });
   }));
 
   const STATUSES = { enquiries:["new", "contacted", "closed"], applications: ["submitted", "shortlisted", "accepted", "declined"], registrations: ["pending", "confirmed", "cancelled"] };
