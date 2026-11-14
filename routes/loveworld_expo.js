@@ -1717,7 +1717,7 @@ function voteMessage(r) {
     `Paid: ${voteCost()}`,
     GAP,
     "One vote each, and it can't be changed. Thank you for voting.",
-    site("/teams") && `The teams: ${site("/teams")}`,
+    site("/vote") && `The teams: ${site("/vote")}`,
   ]);
 }
 
