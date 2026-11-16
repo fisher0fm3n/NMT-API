@@ -110,6 +110,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `PUT /kp/updates/upload` | For the build (`x-upload-key: KP_UPDATE_UPLOAD_KEY`): an installer (below) |
 | `GET /kp/songs?since=<ISO time>` | The song catalogue, no words: `{ songs: [{ id, title, tags, rev, updatedAt, deletedAt? }], updatedAt }`. No sign-in: the app key only (below) |
 | `POST /kp/songs/fetch { ids }` | Up to 200 catalogue songs, whole: `{ songs: [<KingsPresenter song>, catalogueRev] }` |
+| `GET /kp/devotionals?month=YYYY-MM` | The daily devotionals (Rhapsody of Realities) of a month, whole: `{ days: [...] }`. No sign-in: the app key only (below) |
+| `GET /kp/devotionals/:date` | One day: `{ day }`; 404 before it is published |
 
 Library kinds: `services`, `songs`, `presentations`, `media`, `templates`, `settings`.
 
@@ -199,6 +201,31 @@ DELETE /kp/admin/songs/:id                               → { deleted: true, id
 A song published again with the same words is left as it is. KingsPresenter publishes its own songs
 with `KP_ADMIN_KEY=… node scripts/songs-upload.js` (its built-in library, `data/defaults/library.json`).
 
+## Daily devotionals
+
+Rhapsody of Realities, a day at a time, for KingsPresenter's Slides → Devotional (each day as slides).
+Every copy reads them with the app key; a copy fetches the month it needs and keeps it, so a church
+offline on the day still has it.
+
+```
+GET /kp/devotionals?month=2026-11      { days: [ day … ] } in date order
+GET /kp/devotionals/2026-11-16         { day }   (404 not_found before it is published)
+```
+
+A day: `{ date, publication: "rhapsody", title, scripture: { text, reference }, body: [paragraphs],
+prayer: { heading, text }, furtherStudy, readingPlan: { oneYear, twoYear }, updatedAt }`.
+
+The administrator publishes a month from its PDF with KingsPresenter's script (it reads the PDF with
+pdftotext, finds each day, checks its weekday against its date, and sends the days):
+
+```
+KP_ADMIN_KEY=… node scripts/devotional-pdf.js "RHAPSODY OF REALITIES NOVEMBER 2026.pdf" --month 2026-11 --upload
+PUT    /kp/admin/devotionals { "days": [ … up to 400 … ] }   → { added, updated, unchanged }
+DELETE /kp/admin/devotionals/:date                           → { deleted: true, date }
+```
+
+A day published again with the same words is left as it is.
+
 ## May this copy run?
 
 The desktop app asks at start and every few hours, signed in or not:
@@ -248,6 +275,7 @@ streams an hour (`too_many`, 429).
 | `POST /kp/admin/users/:id` | `{ "disabled": true, "reason" }` — `:id` is the account id or its KingsChat username |
 | `POST /kp/admin/users/:id/cloud` | `{ "minutes": 600 }` — the account's own monthly cloud listening (`0` stops it; `null`: the default again). What is used this month stays |
 | `PUT /kp/admin/songs`, `DELETE /kp/admin/songs/:id` | The song catalogue (above) |
+| `PUT /kp/admin/devotionals`, `DELETE /kp/admin/devotionals/:date` | The daily devotionals (above) |
 | `DELETE /kp/admin/users/:id` | The account deleted for good, with its library, media, recording summaries, cloud listening, devices and sign-ins (its copies stay, not signed in). Says what went: `{ "deleted": true, "user", "removed": { "documents", "media", "summaries", "devices" } }`. Its copies are signed out at once. Signing in with KingsChat again makes a new, empty account; to keep someone out, disable the account instead |
 | `GET /kp/admin/policy` | `{ minVersion, message, cloudMinutes }` (`cloudMinutes` is read only: `KP_CLOUD_MINUTES`) |
 | `PUT /kp/admin/policy` | `{ "minVersion": "0.2.0", "message": "Please update before Sunday." }` — `""` lets every version run |

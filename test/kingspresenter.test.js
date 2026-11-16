@@ -106,7 +106,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_songs", "cloud_usage", "devices", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_songs", "cloud_usage", "devices", "devotionals", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -625,6 +625,30 @@ test("the song catalogue: the administrator publishes songs, every copy lists an
     assert.deepEqual((await call("GET", "/kp/songs")).json.songs.map((s) => s.id), ["lw-test-two"]);
     assert.ok((await call("GET", `/kp/songs?since=${encodeURIComponent(since)}`)).json.songs.find((s) => s.id === "lw-test-one").deletedAt);
     assert.deepEqual((await call("POST", "/kp/songs/fetch", { body: { ids: ["lw-test-one"] } })).json.songs, []);
+  } finally {
+    delete process.env.KP_ADMIN_KEY;
+  }
+});
+
+test("devotionals: the administrator publishes a month; every copy gets a month or a day with the app key", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const day = (date, words = "First made-up paragraph.") => ({ date, title: "A Made-Up Title", scripture: { text: "Made-up words", reference: "John 1:1" }, body: [words, "Second made-up paragraph."], prayer: { heading: "Prayer", text: "Made-up prayer." }, furtherStudy: "John 1:2", readingPlan: { oneYear: "John 1", twoYear: "John 2" } });
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    assert.equal((await call("PUT", "/kp/admin/devotionals", { headers: { "x-admin-key": "wrong" }, body: { days: [day("2026-11-01")] } })).status, 401);
+    assert.equal((await call("PUT", "/kp/admin/devotionals", { headers: admin, body: { days: [{ date: "1 Nov", title: "x", body: ["y"] }] } })).json.error, "bad_day");
+    assert.deepEqual(pick((await call("PUT", "/kp/admin/devotionals", { headers: admin, body: { days: [day("2026-11-01"), day("2026-11-02"), day("2026-12-01")] } })).json, ["added", "updated", "unchanged"]), { added: 3, updated: 0, unchanged: 0 });
+    assert.deepEqual(pick((await call("PUT", "/kp/admin/devotionals", { headers: admin, body: { days: [day("2026-11-01"), day("2026-11-02", "Changed made-up paragraph.")] } })).json, ["added", "updated", "unchanged"]), { added: 0, updated: 1, unchanged: 1 });
+
+    assert.equal((await call("GET", "/kp/devotionals?month=2026-11", { key: "wrong" })).status, 401);
+    const month = (await call("GET", "/kp/devotionals?month=2026-11")).json.days;
+    assert.deepEqual(month.map((d) => [d.date, d.title, d.body[0]]), [["2026-11-01", "A Made-Up Title", "First made-up paragraph."], ["2026-11-02", "A Made-Up Title", "Changed made-up paragraph."]]);
+    assert.equal((await call("GET", "/kp/devotionals?month=November")).status, 400);
+    assert.equal((await call("GET", "/kp/devotionals/2026-12-01")).json.day.scripture.reference, "John 1:1");
+    assert.equal((await call("GET", "/kp/devotionals/2027-01-01")).status, 404);
+
+    assert.equal((await call("DELETE", "/kp/admin/devotionals/2026-12-01", { headers: admin })).json.deleted, true);
+    assert.equal((await call("GET", "/kp/devotionals/2026-12-01")).status, 404);
   } finally {
     delete process.env.KP_ADMIN_KEY;
   }

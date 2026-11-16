@@ -328,6 +328,17 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS catalogue_songs_updated ON catalogue_songs (updated_at);
 
+  -- Daily devotionals (Rhapsody of Realities): one row a day, its article as doc
+  -- (title, opening scripture, paragraphs, prayer, further study, reading plans).
+  CREATE TABLE IF NOT EXISTS devotionals (
+    publication TEXT NOT NULL DEFAULT 'rhapsody',
+    day DATE NOT NULL,
+    title TEXT NOT NULL,
+    doc JSONB NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (publication, day)
+  );
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -381,6 +392,20 @@ const ok = (res, payload = {}) => res.json({ status: true, ...payload });
 const fail = (res, http, error, message) => res.status(http).json({ status: false, error, message });
 const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
 const clean = (v, max = 4000) => String(v ?? "").trim().slice(0, max);
+const PUBLICATIONS = new Set(["rhapsody"]);
+const isDay = (v) => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "")) && !Number.isNaN(Date.parse(`${v}T00:00:00Z`));
+/** What is wrong with a devotional day ({ date, title, scripture?, body: [paragraphs], prayer?, … }), or "". */
+function dayProblem(d) {
+  if (!d || typeof d !== "object") return "not a day";
+  if (!isDay(d.date)) return "date: YYYY-MM-DD";
+  if (!clean(d.title, 300)) return "no title";
+  if (!Array.isArray(d.body) || !d.body.length || !d.body.every((p) => typeof p === "string")) return "body: its paragraphs";
+  if (JSON.stringify(d).length > 60000) return "too long";
+  return "";
+}
+// The day as Postgres writes it (a JS Date would be the server's local midnight: a day early in UTC).
+const shapeDay = (r) => ({ ...r.doc, date: r.day_text, publication: r.publication, updatedAt: r.updated_at });
+
 /** What is wrong with a catalogue song (a KingsPresenter song: id, title, sections of lines), or "". */
 function songProblem(s) {
   if (!s || typeof s !== "object") return "not a song";
@@ -1451,6 +1476,48 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     res.setHeader("Content-Disposition", `attachment; filename="${r.filename.replace(/"/g, "")}"`);
     res.setHeader("X-Sha256", r.sha256);
     fs.createReadStream(file).on("error", () => res.destroy()).pipe(res);
+  }));
+
+  // Daily devotionals (Rhapsody of Realities), every copy with the app key: a month at once (so a
+  // copy keeps it for the days it is offline) or one day. The administrator publishes a month.
+  const publicationOf = (req) => (PUBLICATIONS.has(clean(req.query.publication, 40)) ? clean(req.query.publication, 40) : "rhapsody");
+  router.get("/kp/devotionals", ...app, asyncHandler(async (req, res) => {
+    const month = clean(req.query.month, 7);
+    if (!/^\d{4}-\d{2}$/.test(month)) return fail(res, 400, "bad_request", "month: YYYY-MM.");
+    const rows = await q(`SELECT *, to_char(day, 'YYYY-MM-DD') AS day_text FROM devotionals WHERE publication = $1 AND to_char(day, 'YYYY-MM') = $2 ORDER BY day`, [publicationOf(req), month]);
+    ok(res, { days: rows.map(shapeDay) });
+  }));
+  router.get("/kp/devotionals/:date", ...app, asyncHandler(async (req, res) => {
+    if (!isDay(req.params.date)) return fail(res, 400, "bad_request", "date: YYYY-MM-DD.");
+    const row = await q1(`SELECT *, to_char(day, 'YYYY-MM-DD') AS day_text FROM devotionals WHERE publication = $1 AND day = $2`, [publicationOf(req), req.params.date]);
+    if (!row) return fail(res, 404, "not_found", "No devotional for that day yet.");
+    ok(res, { day: shapeDay(row) });
+  }));
+  router.put("/kp/admin/devotionals", requireAdmin, asyncHandler(async (req, res) => {
+    const days = Array.isArray(req.body?.days) ? req.body.days : [];
+    if (!days.length || days.length > 400) return fail(res, 400, "bad_request", "days: 1 to 400 days.");
+    const bad = days.findIndex((d) => dayProblem(d));
+    if (bad >= 0) return fail(res, 400, "bad_day", `Day ${bad + 1}: ${dayProblem(days[bad])}`);
+    const counts = { added: 0, updated: 0, unchanged: 0 };
+    for (const d of days) {
+      const publication = PUBLICATIONS.has(d.publication) ? d.publication : "rhapsody";
+      const { date, publication: _p, updatedAt: _u, ...doc } = d;
+      const next = { ...doc, title: clean(doc.title, 300) };
+      // Compared as JSON by Postgres (its own key order): a month published again changes nothing.
+      const before = await q1(`SELECT doc = $3::jsonb AS same FROM devotionals WHERE publication = $1 AND day = $2`, [publication, date, JSON.stringify(next)]);
+      if (before?.same) { counts.unchanged += 1; continue; }
+      await q(`INSERT INTO devotionals (publication, day, title, doc) VALUES ($1, $2, $3, $4)
+               ON CONFLICT (publication, day) DO UPDATE SET title = EXCLUDED.title, doc = EXCLUDED.doc, updated_at = now()`,
+        [publication, date, next.title, next]);
+      counts[before ? "updated" : "added"] += 1;
+    }
+    ok(res, counts);
+  }));
+  router.delete("/kp/admin/devotionals/:date", requireAdmin, asyncHandler(async (req, res) => {
+    if (!isDay(req.params.date)) return fail(res, 400, "bad_request", "date: YYYY-MM-DD.");
+    const row = await q1(`DELETE FROM devotionals WHERE publication = $1 AND day = $2 RETURNING day`, [publicationOf(req), req.params.date]);
+    if (!row) return fail(res, 404, "not_found", "No devotional for that day.");
+    ok(res, { deleted: true, date: req.params.date });
   }));
 
   // The song catalogue: songs every copy may download into its library, signed in or not (the
