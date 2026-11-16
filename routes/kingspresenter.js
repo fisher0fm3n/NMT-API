@@ -316,6 +316,18 @@ const SCHEMA = `
     UNIQUE (version, platform, arch)
   );
 
+  -- The song catalogue every copy may download (LoveWorld songs): one row a song, its
+  -- KingsPresenter song as doc; rev goes up when its words change, deleted_at takes it down.
+  CREATE TABLE IF NOT EXISTS catalogue_songs (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    doc JSONB NOT NULL,
+    rev INTEGER NOT NULL DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    deleted_at TIMESTAMPTZ
+  );
+  CREATE INDEX IF NOT EXISTS catalogue_songs_updated ON catalogue_songs (updated_at);
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -369,6 +381,17 @@ const ok = (res, payload = {}) => res.json({ status: true, ...payload });
 const fail = (res, http, error, message) => res.status(http).json({ status: false, error, message });
 const sha256 = (v) => crypto.createHash("sha256").update(v).digest("hex");
 const clean = (v, max = 4000) => String(v ?? "").trim().slice(0, max);
+/** What is wrong with a catalogue song (a KingsPresenter song: id, title, sections of lines), or "". */
+function songProblem(s) {
+  if (!s || typeof s !== "object") return "not a song";
+  if (!/^[a-z0-9][a-z0-9-]{0,99}$/.test(String(s.id || ""))) return "id: lowercase letters, digits and dashes";
+  if (!clean(s.title, 200)) return "no title";
+  if (!Array.isArray(s.sections) || !s.sections.length) return "no sections";
+  if (!s.sections.every((x) => x && typeof x.label === "string" && Array.isArray(x.lines) && x.lines.every((l) => typeof l === "string"))) return "sections need a label and lines";
+  if (s.order && !(Array.isArray(s.order) && s.order.every((l) => typeof l === "string"))) return "order: section labels";
+  if (JSON.stringify(s).length > 100000) return "too long";
+  return "";
+}
 const isUuid = (v) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(v || ""));
 const b64url = (buf) => Buffer.from(buf).toString("base64url");
 const safeEqual = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
@@ -1428,6 +1451,55 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     res.setHeader("Content-Disposition", `attachment; filename="${r.filename.replace(/"/g, "")}"`);
     res.setHeader("X-Sha256", r.sha256);
     fs.createReadStream(file).on("error", () => res.destroy()).pipe(res);
+  }));
+
+  // The song catalogue: songs every copy may download into its library, signed in or not (the
+  // app key only). The list is small (no words): a copy asks what is new since it last looked,
+  // then fetches the songs it wants, up to 200 at a time.
+  router.get("/kp/songs", ...app, asyncHandler(async (req, res) => {
+    const since = clean(req.query.since, 40);
+    const at = since && !Number.isNaN(Date.parse(since)) ? new Date(since) : null;
+    const rows = await q(
+      `SELECT id, title, doc->'tags' AS tags, rev, updated_at, deleted_at FROM catalogue_songs
+       ${at ? "WHERE updated_at > $1" : "WHERE deleted_at IS NULL"} ORDER BY title`, at ? [at] : []);
+    const last = await q1(`SELECT max(updated_at) AS at FROM catalogue_songs`);
+    ok(res, {
+      songs: rows.map((r) => ({ id: r.id, title: r.title, tags: r.tags || [], rev: r.rev, updatedAt: r.updated_at, ...(r.deleted_at ? { deletedAt: r.deleted_at } : {}) })),
+      updatedAt: last?.at || null,
+    });
+  }));
+
+  router.post("/kp/songs/fetch", ...app, asyncHandler(async (req, res) => {
+    const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map((id) => clean(id, 100)).filter(Boolean))];
+    if (!ids.length || ids.length > 200) return fail(res, 400, "bad_request", "ids: 1 to 200 song ids.");
+    const rows = await q(`SELECT id, doc, rev, updated_at FROM catalogue_songs WHERE id = ANY($1) AND deleted_at IS NULL`, [ids]);
+    ok(res, { songs: rows.map((r) => ({ ...r.doc, id: r.id, catalogueRev: r.rev, updatedAt: r.updated_at })) });
+  }));
+
+  // The administrator publishes songs (a song that is already there, with the same words, is left
+  // as it is; with other words its rev goes up, so copies can tell) and takes them down.
+  router.put("/kp/admin/songs", requireAdmin, asyncHandler(async (req, res) => {
+    const songs = Array.isArray(req.body?.songs) ? req.body.songs : [];
+    if (!songs.length || songs.length > 500) return fail(res, 400, "bad_request", "songs: 1 to 500 songs.");
+    const bad = songs.findIndex((s) => songProblem(s));
+    if (bad >= 0) return fail(res, 400, "bad_song", `Song ${bad + 1}: ${songProblem(songs[bad])}`);
+    const counts = { added: 0, updated: 0, unchanged: 0 };
+    for (const s of songs) {
+      const { id, rev: _rev, updatedAt: _u, createdAt: _c, catalogueRev: _cr, ...doc } = s;
+      const row = await q1(
+        `INSERT INTO catalogue_songs (id, title, doc) VALUES ($1, $2, $3)
+         ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, doc = EXCLUDED.doc, rev = catalogue_songs.rev + 1, updated_at = now(), deleted_at = NULL
+           WHERE catalogue_songs.doc IS DISTINCT FROM EXCLUDED.doc OR catalogue_songs.deleted_at IS NOT NULL
+         RETURNING rev`, [id, clean(doc.title, 200), doc]);
+      if (!row) counts.unchanged += 1; else if (row.rev === 1) counts.added += 1; else counts.updated += 1;
+    }
+    ok(res, counts);
+  }));
+
+  router.delete("/kp/admin/songs/:id", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await q1(`UPDATE catalogue_songs SET deleted_at = now(), updated_at = now() WHERE id = $1 AND deleted_at IS NULL RETURNING id`, [clean(req.params.id, 100)]);
+    if (!row) return fail(res, 404, "not_found", "No such song.");
+    ok(res, { deleted: true, id: row.id });
   }));
 
   router.get("/kp/remote/sessions", ...user, asyncHandler(async (req, res) => {

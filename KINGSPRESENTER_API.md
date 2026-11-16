@@ -108,6 +108,8 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /kp/updates/files/:version/:platform/:arch` | The installer. No sign-in: the app key only |
 | `GET /kp/updates/releases` | Every release, newest first |
 | `PUT /kp/updates/upload` | For the build (`x-upload-key: KP_UPDATE_UPLOAD_KEY`): an installer (below) |
+| `GET /kp/songs?since=<ISO time>` | The song catalogue, no words: `{ songs: [{ id, title, tags, rev, updatedAt, deletedAt? }], updatedAt }`. No sign-in: the app key only (below) |
+| `POST /kp/songs/fetch { ids }` | Up to 200 catalogue songs, whole: `{ songs: [<KingsPresenter song>, catalogueRev] }` |
 
 Library kinds: `services`, `songs`, `presentations`, `media`, `templates`, `settings`.
 
@@ -174,6 +176,29 @@ x-filename: KingsPresenter-0.1.2-arm64.dmg   x-sha256: <the file's>   x-notes: <
 Errors: `unauthorized_upload_key` (401), `bad_request` / `hash_mismatch` / `empty_upload`
 (400), `too_large` (413, over `KP_MAX_RELEASE_MB`), `uploads_off` (503, no key set).
 
+## Song catalogue
+
+Songs every copy may download into its library, signed in or not (the app key only). KingsPresenter
+asks what is new since it last looked, shows the songs it does not have, and fetches the ones chosen:
+
+```
+GET  /kp/songs                         every song: { songs: [{ id, title, tags, rev, updatedAt }], updatedAt }
+GET  /kp/songs?since=2026-11-16T10:00Z  only what changed after that time, songs taken down too (deletedAt)
+POST /kp/songs/fetch { "ids": ["lw-king-of-heaven"] }   the songs, whole (1 to 200 ids)
+```
+
+A song is a KingsPresenter song (`id`, `title`, `tags`, `sections: [{ label, name, lines }]`, `order`);
+ids are fixed (`lw-<slug>`), so a song from the catalogue and the same song from the installer are one
+song. `rev` goes up each time its words change. The administrator publishes and takes down:
+
+```
+PUT    /kp/admin/songs { "songs": [ … up to 500 … ] }   → { added, updated, unchanged }
+DELETE /kp/admin/songs/:id                               → { deleted: true, id }
+```
+
+A song published again with the same words is left as it is. KingsPresenter publishes its own songs
+with `KP_ADMIN_KEY=… node scripts/songs-upload.js` (its built-in library, `data/defaults/library.json`).
+
 ## May this copy run?
 
 The desktop app asks at start and every few hours, signed in or not:
@@ -222,6 +247,7 @@ streams an hour (`too_many`, 429).
 | `GET /kp/admin/users?q=` | Accounts, with their copies, signed-in devices and this month's `cloud` listening; `cloudMinutes`: the default |
 | `POST /kp/admin/users/:id` | `{ "disabled": true, "reason" }` — `:id` is the account id or its KingsChat username |
 | `POST /kp/admin/users/:id/cloud` | `{ "minutes": 600 }` — the account's own monthly cloud listening (`0` stops it; `null`: the default again). What is used this month stays |
+| `PUT /kp/admin/songs`, `DELETE /kp/admin/songs/:id` | The song catalogue (above) |
 | `DELETE /kp/admin/users/:id` | The account deleted for good, with its library, media, recording summaries, cloud listening, devices and sign-ins (its copies stay, not signed in). Says what went: `{ "deleted": true, "user", "removed": { "documents", "media", "summaries", "devices" } }`. Its copies are signed out at once. Signing in with KingsChat again makes a new, empty account; to keep someone out, disable the account instead |
 | `GET /kp/admin/policy` | `{ minVersion, message, cloudMinutes }` (`cloudMinutes` is read only: `KP_CLOUD_MINUTES`) |
 | `PUT /kp/admin/policy` | `{ "minVersion": "0.2.0", "message": "Please update before Sunday." }` — `""` lets every version run |

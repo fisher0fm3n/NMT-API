@@ -106,7 +106,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["cloud_usage", "devices", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_songs", "cloud_usage", "devices", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -589,4 +589,43 @@ test("the database is found from KINGSPRESENTER_DATABASE_URL, else NMM reporting
   assert.deepEqual([fields.user, fields.host, fields.database, fields.password, fields.port], ["nmm", "db.example", "kingspresenter", "secret", 5432]);
   assert.equal(dbConfigFrom({ PCO_FN_DB_PASSWORD: "pco" }).password, "pco");
   assert.equal(dbConfigFrom({}).password, undefined);
+});
+
+const pick = (o, keys) => Object.fromEntries(keys.map((k) => [k, o[k]]));
+
+test("the song catalogue: the administrator publishes songs, every copy lists and fetches them with the app key", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  const song = (id, words) => ({ id, title: id === "lw-test-one" ? "Test One" : "Test Two", tags: ["LoveWorld"], sections: [{ label: "v1", name: "Verse 1", lines: [words, "Second line"] }], order: ["v1"] });
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    assert.equal((await call("PUT", "/kp/admin/songs", { headers: { "x-admin-key": "wrong" }, body: { songs: [song("lw-test-one", "a")] } })).status, 401);
+    assert.equal((await call("PUT", "/kp/admin/songs", { headers: admin, body: { songs: [{ id: "Bad Id", title: "x", sections: [] }] } })).json.error, "bad_song");
+    assert.deepEqual(pick((await call("PUT", "/kp/admin/songs", { headers: admin, body: { songs: [song("lw-test-one", "First words"), song("lw-test-two", "Other words")] } })).json, ["added", "updated", "unchanged"]), { added: 2, updated: 0, unchanged: 0 });
+
+    // The list has no words; the app key is needed, a sign-in is not.
+    assert.equal((await call("GET", "/kp/songs", { key: "wrong" })).status, 401);
+    const list = (await call("GET", "/kp/songs")).json;
+    assert.deepEqual(list.songs.map((s) => [s.id, s.title, s.rev]), [["lw-test-one", "Test One", 1], ["lw-test-two", "Test Two", 1]]);
+    assert.equal(list.songs[0].sections, undefined, "no words in the list");
+    const since = list.updatedAt;
+
+    // The same words again change nothing; other words raise the rev, and only that song is new since.
+    assert.deepEqual(pick((await call("PUT", "/kp/admin/songs", { headers: admin, body: { songs: [song("lw-test-one", "First words")] } })).json, ["added", "updated", "unchanged"]), { added: 0, updated: 0, unchanged: 1 });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal((await call("PUT", "/kp/admin/songs", { headers: admin, body: { songs: [song("lw-test-two", "Changed words")] } })).json.updated, 1);
+    assert.deepEqual((await call("GET", `/kp/songs?since=${encodeURIComponent(since)}`)).json.songs.map((s) => [s.id, s.rev]), [["lw-test-two", 2]]);
+
+    // Fetched whole, with the catalogue's rev.
+    const got = (await call("POST", "/kp/songs/fetch", { body: { ids: ["lw-test-two", "lw-missing"] } })).json.songs;
+    assert.deepEqual(got.map((s) => [s.id, s.catalogueRev, s.sections[0].lines[0]]), [["lw-test-two", 2, "Changed words"]]);
+    assert.equal((await call("POST", "/kp/songs/fetch", { body: { ids: [] } })).status, 400);
+
+    // Taken down: gone from the list and from fetch, and listed as deleted to a copy that looked before.
+    assert.equal((await call("DELETE", "/kp/admin/songs/lw-test-one", { headers: admin })).json.deleted, true);
+    assert.deepEqual((await call("GET", "/kp/songs")).json.songs.map((s) => s.id), ["lw-test-two"]);
+    assert.ok((await call("GET", `/kp/songs?since=${encodeURIComponent(since)}`)).json.songs.find((s) => s.id === "lw-test-one").deletedAt);
+    assert.deepEqual((await call("POST", "/kp/songs/fetch", { body: { ids: ["lw-test-one"] } })).json.songs, []);
+  } finally {
+    delete process.env.KP_ADMIN_KEY;
+  }
 });
