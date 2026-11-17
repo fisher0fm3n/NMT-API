@@ -647,6 +647,19 @@ test("devotionals: the administrator publishes a month; every copy gets a month 
     assert.equal((await call("GET", "/kp/devotionals/2026-12-01")).json.day.scripture.reference, "John 1:1");
     assert.equal((await call("GET", "/kp/devotionals/2027-01-01")).status, 404);
 
+    // The day's photo: a JPEG, after the day; kept when the day's words are published again.
+    const jpeg = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.from("made-up picture")]);
+    assert.equal((await call("PUT", "/kp/admin/devotionals/2027-02-01/image", { headers: admin, body: jpeg })).status, 404, "no such day yet");
+    assert.equal((await call("PUT", "/kp/admin/devotionals/2026-11-01/image", { headers: admin, body: Buffer.from("not a jpeg") })).json.error, "bad_image");
+    const put = (await call("PUT", "/kp/admin/devotionals/2026-11-01/image", { headers: admin, body: jpeg })).json;
+    assert.equal(put.image.bytes, jpeg.length);
+    await call("PUT", "/kp/admin/devotionals", { headers: admin, body: { days: [day("2026-11-01", "Words again.")] } });
+    assert.equal((await call("GET", "/kp/devotionals/2026-11-01")).json.day.image.sha256, put.image.sha256);
+    const got = await fetch(`${base}/kp/devotionals/2026-11-01/image`, { headers: { "x-api-key": "app-key" } });
+    assert.equal(got.headers.get("content-type"), "image/jpeg");
+    assert.deepEqual(Buffer.from(await got.arrayBuffer()), jpeg);
+    assert.equal((await call("GET", "/kp/devotionals/2026-11-02/image")).status, 404);
+
     assert.equal((await call("DELETE", "/kp/admin/devotionals/2026-12-01", { headers: admin })).json.deleted, true);
     assert.equal((await call("GET", "/kp/devotionals/2026-12-01")).status, 404);
   } finally {

@@ -338,6 +338,9 @@ const SCHEMA = `
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     PRIMARY KEY (publication, day)
   );
+  -- The day's photo (its file in KP_MEDIA_DIR/devotionals), kept when the day's words are published again.
+  ALTER TABLE devotionals ADD COLUMN IF NOT EXISTS image_sha TEXT;
+  ALTER TABLE devotionals ADD COLUMN IF NOT EXISTS image_bytes INTEGER;
 
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -404,7 +407,9 @@ function dayProblem(d) {
   return "";
 }
 // The day as Postgres writes it (a JS Date would be the server's local midnight: a day early in UTC).
-const shapeDay = (r) => ({ ...r.doc, date: r.day_text, publication: r.publication, updatedAt: r.updated_at });
+const shapeDay = (r) => ({ ...r.doc, date: r.day_text, publication: r.publication, updatedAt: r.updated_at, ...(r.image_sha ? { image: { sha256: r.image_sha, bytes: r.image_bytes } } : {}) });
+const MAX_DEVOTIONAL_IMAGE = 4 * 1024 * 1024;
+const devotionalImage = (publication, date) => path.join(MEDIA_DIR, "devotionals", `${publication}-${date}.jpg`);
 
 /** What is wrong with a catalogue song (a KingsPresenter song: id, title, sections of lines), or "". */
 function songProblem(s) {
@@ -1513,10 +1518,42 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     }
     ok(res, counts);
   }));
+  // A day's photo (a JPEG): the administrator sends it after the day; every copy fetches it.
+  router.put("/kp/admin/devotionals/:date/image", requireAdmin, asyncHandler(async (req, res) => {
+    const date = req.params.date;
+    if (!isDay(date)) { req.resume(); return fail(res, 400, "bad_request", "date: YYYY-MM-DD."); }
+    const publication = publicationOf(req);
+    if (!(await q1(`SELECT 1 FROM devotionals WHERE publication = $1 AND day = $2`, [publication, date]))) { req.resume(); return fail(res, 404, "not_found", "Publish the day before its photo."); }
+    if (Number(req.header("content-length")) > MAX_DEVOTIONAL_IMAGE) { req.resume(); return fail(res, 413, "too_large", "A photo may be up to 4 MB."); }
+    const chunks = [];
+    let bytes = 0;
+    for await (const c of req) { bytes += c.length; if (bytes > MAX_DEVOTIONAL_IMAGE) return fail(res, 413, "too_large", "A photo may be up to 4 MB."); chunks.push(c); }
+    const body = Buffer.concat(chunks);
+    if (!(body.length > 3 && body[0] === 0xff && body[1] === 0xd8 && body[2] === 0xff)) return fail(res, 400, "bad_image", "The photo must be a JPEG.");
+    const file = devotionalImage(publication, date);
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, body);
+    const sha = crypto.createHash("sha256").update(body).digest("hex");
+    await q(`UPDATE devotionals SET image_sha = $3, image_bytes = $4 WHERE publication = $1 AND day = $2`, [publication, date, sha, body.length]);
+    ok(res, { date, image: { sha256: sha, bytes: body.length } });
+  }));
+  router.get("/kp/devotionals/:date/image", ...app, asyncHandler(async (req, res) => {
+    if (!isDay(req.params.date)) return fail(res, 400, "bad_request", "date: YYYY-MM-DD.");
+    const row = await q1(`SELECT image_sha FROM devotionals WHERE publication = $1 AND day = $2`, [publicationOf(req), req.params.date]);
+    if (!row?.image_sha) return fail(res, 404, "not_found", "No photo for that day.");
+    let body;
+    try { body = await fsp.readFile(devotionalImage(publicationOf(req), req.params.date)); } catch { return fail(res, 404, "not_found", "The photo is not on this server any more."); }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("X-Sha256", row.image_sha);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.end(body);
+  }));
+
   router.delete("/kp/admin/devotionals/:date", requireAdmin, asyncHandler(async (req, res) => {
     if (!isDay(req.params.date)) return fail(res, 400, "bad_request", "date: YYYY-MM-DD.");
     const row = await q1(`DELETE FROM devotionals WHERE publication = $1 AND day = $2 RETURNING day`, [publicationOf(req), req.params.date]);
     if (!row) return fail(res, 404, "not_found", "No devotional for that day.");
+    await fsp.rm(devotionalImage(publicationOf(req), req.params.date), { force: true });
     ok(res, { deleted: true, date: req.params.date });
   }));
 

@@ -210,10 +210,11 @@ offline on the day still has it.
 ```
 GET /kp/devotionals?month=2026-11      { days: [ day … ] } in date order
 GET /kp/devotionals/2026-11-16         { day }   (404 not_found before it is published)
+GET /kp/devotionals/2026-11-16/image   the day's photo (image/jpeg, X-Sha256); 404 when it has none
 ```
 
 A day: `{ date, publication: "rhapsody", title, scripture: { text, reference }, body: [paragraphs],
-prayer: { heading, text }, furtherStudy, readingPlan: { oneYear, twoYear }, updatedAt }`.
+prayer: { heading, text }, furtherStudy, readingPlan: { oneYear, twoYear }, updatedAt, image?: { sha256, bytes } }`.
 
 The administrator publishes a month from its PDF with KingsPresenter's script (it reads the PDF with
 pdftotext, finds each day, checks its weekday against its date, and sends the days):
@@ -221,8 +222,12 @@ pdftotext, finds each day, checks its weekday against its date, and sends the da
 ```
 KP_ADMIN_KEY=… node scripts/devotional-pdf.js "RHAPSODY OF REALITIES NOVEMBER 2026.pdf" --month 2026-11 --upload
 PUT    /kp/admin/devotionals { "days": [ … up to 400 … ] }   → { added, updated, unchanged }
-DELETE /kp/admin/devotionals/:date                           → { deleted: true, date }
+PUT    /kp/admin/devotionals/:date/image   (a JPEG, up to 4 MB) → { date, image: { sha256, bytes } }
+DELETE /kp/admin/devotionals/:date                           → { deleted: true, date }   (its photo too)
 ```
+
+The script sends each day's photo after the days: the picture at the top of the day's first page,
+its grey side bands cropped off. A day published again keeps its photo.
 
 A day published again with the same words is left as it is.
 
