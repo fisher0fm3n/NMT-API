@@ -342,6 +342,25 @@ const SCHEMA = `
   ALTER TABLE devotionals ADD COLUMN IF NOT EXISTS image_sha TEXT;
   ALTER TABLE devotionals ADD COLUMN IF NOT EXISTS image_bytes INTEGER;
 
+  -- What people tell us from the apps (Help → Send feedback): an idea, a problem, or something
+  -- they like, with the copy's details when they chose to send them. Kept when the account goes.
+  CREATE TABLE IF NOT EXISTS feedback (
+    id SERIAL PRIMARY KEY,
+    kind TEXT NOT NULL,
+    message TEXT NOT NULL,
+    email TEXT NOT NULL DEFAULT '',
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    install_id UUID,
+    app TEXT NOT NULL DEFAULT 'desktop',
+    version TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    details JSONB NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'new',
+    note TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX IF NOT EXISTS feedback_created ON feedback (created_at DESC);
+
   CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,
@@ -1330,7 +1349,80 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     ok(res, { allowed: true, reason: "", message: "", minVersion: min });
   }));
 
+  /* ---- Feedback ------------------------------------------------------- */
+
+  // From the apps (Help → Send feedback), signed in or not: { kind: idea|problem|praise|other,
+  // message, email?, installId?, app?, version?, platform?, details? }. At most 10 an hour from
+  // one copy (or one address when it sends no id).
+  const FEEDBACK_KINDS = ["idea", "problem", "praise", "other"];
+  const FEEDBACK_STATUS = ["new", "seen", "done"];
+  const feedbackTimes = new Map();
+  const shapeFeedback = (r) => ({
+    id: r.id, kind: r.kind, message: r.message, email: r.email, app: r.app, version: r.version, platform: r.platform, details: r.details || {},
+    installId: r.install_id, user: r.user_id ? { id: r.user_id, username: r.kc_username || "", name: r.kc_name || "" } : null,
+    status: r.status, note: r.note, createdAt: r.created_at,
+  });
+  router.post("/kp/feedback", ...app, asyncHandler(async (req, res) => {
+    const b = req.body || {};
+    const message = clean(b.message, 5000);
+    if (message.length < 3) return fail(res, 400, "missing_message", "Write what you would like to tell us.");
+    const email = clean(b.email, 200);
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return fail(res, 400, "bad_email", "That email address does not look right.");
+    const installId = isUuid(b.installId) ? String(b.installId) : null;
+    const who = installId || req.ip || "?";
+    const now = Date.now();
+    const recent = (feedbackTimes.get(who) || []).filter((t) => now - t < 3600_000);
+    if (recent.length >= 10) return fail(res, 429, "too_many", "That is a lot of feedback in one hour: please try again a little later.");
+    recent.push(now);
+    feedbackTimes.set(who, recent);
+    if (feedbackTimes.size > 5000) feedbackTimes.clear();
+    // A few plain details about the copy (its system, language), when the person chose to send them.
+    const details = {};
+    if (b.details && typeof b.details === "object" && !Array.isArray(b.details)) {
+      for (const [k, v] of Object.entries(b.details).slice(0, 20)) {
+        if (typeof v === "string") details[clean(k, 40)] = clean(v, 300);
+        else if (typeof v === "number" || typeof v === "boolean") details[clean(k, 40)] = v;
+      }
+    }
+    const payload = await verifyAccess(bearerToken(req)); // optional: who sent it
+    const row = await q1(
+      `INSERT INTO feedback (kind, message, email, user_id, install_id, app, version, platform, details)
+       VALUES ($1, $2, $3, (SELECT id FROM users WHERE id = $4::uuid), $5, $6, $7, $8, $9) RETURNING id, created_at`,
+      [FEEDBACK_KINDS.includes(b.kind) ? b.kind : "other", message, email, isUuid(payload?.sub) ? payload.sub : null, installId,
+        clean(b.app, 20) || "desktop", clean(b.version, 40), clean(b.platform, 40), JSON.stringify(details)]);
+    ok(res, { feedback: { id: row.id, createdAt: row.created_at } });
+  }));
+
   /* ---- The administrator ---------------------------------------------- */
+
+  // Feedback, newest first: ?status=new|seen|done, ?kind=, ?q= (words in it, an email, an account).
+  router.get("/kp/admin/feedback", requireAdmin, asyncHandler(async (req, res) => {
+    const where = [];
+    const args = [Math.min(500, Number(req.query.limit) || 100)];
+    if (FEEDBACK_STATUS.includes(req.query.status)) { args.push(req.query.status); where.push(`f.status = $${args.length}`); }
+    if (FEEDBACK_KINDS.includes(req.query.kind)) { args.push(req.query.kind); where.push(`f.kind = $${args.length}`); }
+    const term = clean(req.query.q, 80).replace(/^@/, "");
+    if (term) { args.push(`%${term}%`); where.push(`(f.message ILIKE $${args.length} OR f.email ILIKE $${args.length} OR u.kc_username ILIKE $${args.length} OR u.kc_name ILIKE $${args.length})`); }
+    const rows = await q(
+      `SELECT f.*, u.kc_username, u.kc_name FROM feedback f LEFT JOIN users u ON u.id = f.user_id
+       ${where.length ? `WHERE ${where.join(" AND ")}` : ""} ORDER BY f.created_at DESC LIMIT $1`, args);
+    const counts = await q(`SELECT status, count(*)::int AS n FROM feedback GROUP BY status`);
+    ok(res, { feedback: rows.map(shapeFeedback), counts: Object.fromEntries(FEEDBACK_STATUS.map((st) => [st, counts.find((c) => c.status === st)?.n || 0])) });
+  }));
+
+  // One piece of feedback marked { status: new|seen|done }, with a note of what was done.
+  router.post("/kp/admin/feedback/:id", requireAdmin, asyncHandler(async (req, res) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id < 1) return fail(res, 404, "not_found", "No such feedback.");
+    const status = FEEDBACK_STATUS.includes(req.body?.status) ? req.body.status : null;
+    const note = req.body && "note" in req.body ? clean(req.body.note, 2000) : null;
+    const row = await q1(
+      `UPDATE feedback f SET status = COALESCE($2, f.status), note = COALESCE($3, f.note) WHERE f.id = $1
+       RETURNING f.*, (SELECT kc_username FROM users WHERE id = f.user_id) AS kc_username, (SELECT kc_name FROM users WHERE id = f.user_id) AS kc_name`,
+      [id, status, note]);
+    if (!row) return fail(res, 404, "not_found", "No such feedback.");
+    ok(res, { feedback: shapeFeedback(row) });
+  }));
 
   const shapeInstall = (r) => ({
     id: r.id, name: r.name, platform: r.platform, arch: r.arch, version: r.version, firstSeen: r.first_seen, lastSeen: r.last_seen,

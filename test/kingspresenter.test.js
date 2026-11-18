@@ -106,7 +106,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_songs", "cloud_usage", "devices", "devotionals", "documents", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_songs", "cloud_usage", "devices", "devotionals", "documents", "feedback", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -662,6 +662,50 @@ test("devotionals: the administrator publishes a month; every copy gets a month 
 
     assert.equal((await call("DELETE", "/kp/admin/devotionals/2026-12-01", { headers: admin })).json.deleted, true);
     assert.equal((await call("GET", "/kp/devotionals/2026-12-01")).status, 404);
+  } finally {
+    delete process.env.KP_ADMIN_KEY;
+  }
+});
+
+test("feedback from the apps: kept with who sent it (when signed in), at most 10 an hour from one copy, and read and marked by the administrator", async () => {
+  const installId = crypto.randomUUID();
+  const send = (body, token) => call("POST", "/kp/feedback", { body: { installId, version: "0.1.17", platform: "darwin", ...body }, token });
+  assert.equal((await call("POST", "/kp/feedback", { key: "", body: { message: "Hello there" } })).status, 401, "the app key is asked for");
+  assert.equal((await send({ kind: "idea", message: "" })).json.error, "missing_message");
+  assert.equal((await send({ kind: "idea", message: "Nice work", email: "not-an-email" })).json.error, "bad_email");
+
+  const anon = await send({ kind: "problem", message: "The countdown froze at 0:03.", details: { os: "macOS 15.2", language: "fr", nested: { no: 1 } } });
+  assert.equal(anon.status, 200);
+  const auth = (await call("POST", "/kp/auth/kingschat", { body: { code: "good-code" } })).json;
+  const signed = await send({ kind: "praise", message: "Listen found every verse on Sunday!", email: "media@church.org" }, auth.accessToken);
+  assert.equal(signed.status, 200);
+  assert.equal((await send({ kind: "nonsense", message: "Something else" })).status, 200, "an unknown kind is kept as other");
+
+  // A copy that sends too much in an hour waits.
+  for (let i = 0; i < 7; i++) await send({ kind: "idea", message: `Idea ${i}` });
+  assert.equal((await send({ kind: "idea", message: "One too many" })).json.error, "too_many");
+
+  const admin = { "x-admin-key": "admin-key" };
+  assert.equal((await call("GET", "/kp/admin/feedback", { headers: admin })).json.error, "admin_off");
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    const all = (await call("GET", "/kp/admin/feedback", { headers: admin })).json;
+    assert.equal(all.feedback.length, 10);
+    assert.deepEqual(all.counts, { new: 10, seen: 0, done: 0 });
+    const problem = all.feedback.find((f) => f.id === anon.json.feedback.id);
+    assert.deepEqual([problem.kind, problem.user, problem.installId, problem.version, problem.details], ["problem", null, installId, "0.1.17", { os: "macOS 15.2", language: "fr" }]);
+    const praise = all.feedback.find((f) => f.id === signed.json.feedback.id);
+    assert.deepEqual([praise.email, praise.user.username], ["media@church.org", "pastor_ade"]);
+    assert.equal(all.feedback.find((f) => f.message === "Something else").kind, "other");
+
+    assert.deepEqual((await call("GET", "/kp/admin/feedback?kind=praise", { headers: admin })).json.feedback.map((f) => f.id), [praise.id]);
+    assert.deepEqual((await call("GET", "/kp/admin/feedback?q=countdown", { headers: admin })).json.feedback.map((f) => f.id), [problem.id]);
+    assert.deepEqual((await call("GET", "/kp/admin/feedback?q=@pastor_ade", { headers: admin })).json.feedback.map((f) => f.id), [praise.id]);
+
+    const marked = (await call("POST", `/kp/admin/feedback/${problem.id}`, { headers: admin, body: { status: "done", note: "Fixed in 0.1.18" } })).json.feedback;
+    assert.deepEqual([marked.status, marked.note], ["done", "Fixed in 0.1.18"]);
+    assert.deepEqual((await call("GET", "/kp/admin/feedback?status=done", { headers: admin })).json.feedback.map((f) => f.id), [problem.id]);
+    assert.equal((await call("POST", "/kp/admin/feedback/999999", { headers: admin, body: { status: "seen" } })).status, 404);
   } finally {
     delete process.env.KP_ADMIN_KEY;
   }

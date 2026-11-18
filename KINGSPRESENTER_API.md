@@ -112,6 +112,7 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `POST /kp/songs/fetch { ids }` | Up to 200 catalogue songs, whole: `{ songs: [<KingsPresenter song>, catalogueRev] }` |
 | `GET /kp/devotionals?month=YYYY-MM` | The daily devotionals (Rhapsody of Realities) of a month, whole: `{ days: [...] }`. No sign-in: the app key only (below) |
 | `GET /kp/devotionals/:date` | One day: `{ day }`; 404 before it is published |
+| `POST /kp/feedback` | From the apps (Help → Send feedback): `{ kind: idea\|problem\|praise\|other, message, email?, installId?, app?, version?, platform?, details? }` → `{ feedback: { id, createdAt } }`. The app key; signed in or not (kept with the account when signed in). `missing_message` / `bad_email` (400); `too_many` (429) after 10 in an hour from one copy |
 
 Library kinds: `services`, `songs`, `presentations`, `media`, `templates`, `settings`.
 
@@ -282,6 +283,8 @@ streams an hour (`too_many`, 429).
 | `PUT /kp/admin/songs`, `DELETE /kp/admin/songs/:id` | The song catalogue (above) |
 | `PUT /kp/admin/devotionals`, `DELETE /kp/admin/devotionals/:date` | The daily devotionals (above) |
 | `DELETE /kp/admin/users/:id` | The account deleted for good, with its library, media, recording summaries, cloud listening, devices and sign-ins (its copies stay, not signed in). Says what went: `{ "deleted": true, "user", "removed": { "documents", "media", "summaries", "devices" } }`. Its copies are signed out at once. Signing in with KingsChat again makes a new, empty account; to keep someone out, disable the account instead |
+| `GET /kp/admin/feedback?status=&kind=&q=` | Feedback, newest first: `{ feedback: [{ id, kind, message, email, app, version, platform, details, installId, user, status, note, createdAt }], counts: { new, seen, done } }`; `q` searches the words, the email and the account |
+| `POST /kp/admin/feedback/:id` | `{ "status": "done", "note": "Fixed in 0.1.18" }` — status `new`, `seen` or `done` |
 | `GET /kp/admin/policy` | `{ minVersion, message, cloudMinutes }` (`cloudMinutes` is read only: `KP_CLOUD_MINUTES`) |
 | `PUT /kp/admin/policy` | `{ "minVersion": "0.2.0", "message": "Please update before Sunday." }` — `""` lets every version run |
 
