@@ -1,6 +1,7 @@
 // routes/pcdl.routes.js
 const { Router } = require("express");
 const { Client } = require("pg");
+const { pgConfig, fetchUserTokenKey } = require("../lib/config");
 const axios = require("axios");
 const path = require("path");
 const fs = require("fs");
@@ -85,16 +86,10 @@ function validateAdminListPayload(b) {
 }
 
 // ---------------------------------------------------------------------
-// DB (fixed credentials, same pattern you use elsewhere)
+// DB (connection settings come from lib/config.js / .env)
 // ---------------------------------------------------------------------
 function newClient() {
-  return new Client({
-    user: "postgres",
-    host: "102.219.189.166",
-    database: "pcdl",
-    password: "B8Mgs81D58eTub9GhnO2FOp2",
-    port: 5432,
-  });
+  return new Client(pgConfig("pcdl"));
 }
 
 async function withClient(fn) {
@@ -164,7 +159,7 @@ async function verifyUserToken(email, token) {
   try {
     const resp = await axios.post(
       "https://sjvv8a3ys1.execute-api.us-east-1.amazonaws.com/Dev/fetchUserToken",
-      { email, token: "SFG89VKUG98DPGWJRW4" },
+      { email, token: fetchUserTokenKey() },
       { timeout: 8000, headers: { "Content-Type": "application/json" } },
     );
     const apiToken = resp?.data?.token;
@@ -7044,7 +7039,7 @@ module.exports = function pcdlRoutes(deps) {
               },
               body: JSON.stringify({
                 email: existing.email,
-                token: "SFG89VKUG98DPGWJRW4",
+                token: fetchUserTokenKey(),
               }),
             },
           );
@@ -7208,7 +7203,7 @@ module.exports = function pcdlRoutes(deps) {
               },
               body: JSON.stringify({
                 email: providerEmail,
-                token: "SFG89VKUG98DPGWJRW4",
+                token: fetchUserTokenKey(),
               }),
             },
           );

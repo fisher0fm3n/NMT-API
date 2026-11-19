@@ -23,6 +23,7 @@
 
 const { Router } = require("express");
 const { Client } = require("pg");
+const { pgConfig, fetchUserTokenKey } = require("../lib/config");
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
@@ -83,13 +84,7 @@ function passportUpload(field = "passport_photo") {
 
 // -------------------- DB --------------------
 function newClient() {
-  return new Client({
-    user: "postgres",
-    host: "102.219.189.166",
-    database: "pcdl_affiliate",
-    password: "B8Mgs81D58eTub9GhnO2FOp2",
-    port: 5432,
-  });
+  return new Client(pgConfig("pcdl_affiliate"));
 }
 async function withClient(fn) {
   const db = newClient();
@@ -159,7 +154,7 @@ async function verifyUserToken(email, token) {
   try {
     const resp = await axios.post(
       "https://sjvv8a3ys1.execute-api.us-east-1.amazonaws.com/Dev/fetchUserToken",
-      { email, token: "SFG89VKUG98DPGWJRW4" },
+      { email, token: fetchUserTokenKey() },
       { timeout: 8000, headers: { "Content-Type": "application/json" } }
     );
     const apiToken = resp?.data?.token;

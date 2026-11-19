@@ -64,10 +64,9 @@ const IMMTV_DB_PORT = Number(
 const IMMTV_DB_USER =
   process.env.IMMTV_DB_USER || process.env.DB_USERNAME || "usr_immtv_web";
 
+// No default: set IMMTV_DB_PASSWORD (or DB_PASSWORD) in .env.
 const IMMTV_DB_PASSWORD =
-  process.env.IMMTV_DB_PASSWORD ||
-  process.env.DB_PASSWORD ||
-  "094ru394utjg3jt3SJDJJD";
+  process.env.IMMTV_DB_PASSWORD || process.env.DB_PASSWORD;
 
 const IMMTV_DB_NAME =
   process.env.IMMTV_DB_NAME || process.env.DB_DATABASE || "db_immtv";

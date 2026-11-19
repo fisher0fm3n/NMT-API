@@ -175,7 +175,13 @@ io.on("connection", (socket) => {
 });
 
 // Boot
-const port = Number(process.env.PORT || 3001);
+{
+  const missing = require("./lib/config").missingSecrets();
+  if (missing.length) {
+    console.error(`[config] missing in .env: ${missing.join(", ")}. Requests that need them will fail.`);
+  }
+}
+const port =Number(process.env.PORT || 3001);
 // Bind to all interfaces so the load balancer can reach you
 const host = process.env.HOST || "0.0.0.0";
 

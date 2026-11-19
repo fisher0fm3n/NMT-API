@@ -7,6 +7,7 @@
 
 const { Router } = require("express");
 const { Client } = require("pg");
+const { pgConfig } = require("../lib/config");
 const path = require("path");
 const fs = require("fs");
 const multer = require("multer");
@@ -82,13 +83,7 @@ function translatorPictureUpload(field = "picture") {
  * ---------------------------------------------------------------------------
  */
 function newClient() {
-  return new Client({
-    user: process.env.PCO_FN_DB_USER || "postgres",
-    host: process.env.PCO_FN_DB_HOST || "102.219.189.166",
-    database: process.env.PCO_FN_DB_NAME || "pco_fn",
-    password: process.env.PCO_FN_DB_PASSWORD || "B8Mgs81D58eTub9GhnO2FOp2",
-    port: Number(process.env.PCO_FN_DB_PORT || 5432),
-  });
+  return new Client(pgConfig(process.env.PCO_FN_DB_NAME || "pco_fn"));
 }
 
 async function withClient(fn) {

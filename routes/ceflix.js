@@ -1,6 +1,7 @@
 // routes/pcdl.routes.js
 const { Router } = require("express");
 const { Client } = require("pg");
+const { pgConfig } = require("../lib/config");
 const axios = require("axios");
 const { trimDeep } = require("../lib/utils");
 const { getFirebaseAdmin } = require("../lib/firebaseAdmin");
@@ -11,13 +12,7 @@ const dailyInterestVideo = require("../jobs/dailyInterestVideo");
 // DB
 // ---------------------------------------------------------------------
 function newClient() {
-  return new Client({
-    user: "postgres",
-    host: "102.219.189.166",
-    database: "ceflix",
-    password: "B8Mgs81D58eTub9GhnO2FOp2",
-    port: 5432,
-  });
+  return new Client(pgConfig("ceflix"));
 }
 
 async function withClient(fn) {
