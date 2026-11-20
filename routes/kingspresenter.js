@@ -114,6 +114,13 @@ const PUBLIC_URL = (env("KP_PUBLIC_URL") || "").replace(/\/+$/, "");
 const PLATFORMS = new Set(["darwin", "win32"]);
 const ARCHES = new Set(["arm64", "x64"]);
 
+// The song catalogue's recordings (a song's full recording and its backing track), kept outside
+// the project as the installers are, and the largest one taken.
+const SONG_AUDIO_DIR = path.resolve(env("KP_SONG_AUDIO_DIR") || path.join(os.homedir(), "kingspresenter-song-audio"));
+const MAX_SONG_AUDIO = Number(env("KP_MAX_SONG_AUDIO_MB") || 80) * 1024 * 1024;
+const RECORDING_KINDS = new Set(["full", "backing"]);
+const AUDIO_TYPES = { ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".aac": "audio/aac", ".wav": "audio/wav", ".ogg": "audio/ogg", ".flac": "audio/flac" };
+
 const KINDS = new Set(["services", "songs", "presentations", "media", "templates", "settings"]);
 
 /* ---------------------------------------------------------------------------
@@ -328,6 +335,21 @@ const SCHEMA = `
   );
   CREATE INDEX IF NOT EXISTS catalogue_songs_updated ON catalogue_songs (updated_at);
 
+  -- A catalogue song's recordings: its full recording and its backing track, one file each in
+  -- KP_SONG_AUDIO_DIR. Adding or changing one moves its song's updated_at (not its rev).
+  CREATE TABLE IF NOT EXISTS catalogue_recordings (
+    song_id TEXT NOT NULL REFERENCES catalogue_songs (id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,
+    filename TEXT NOT NULL,
+    storage_key TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    bytes BIGINT NOT NULL,
+    sha256 TEXT NOT NULL,
+    duration REAL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (song_id, kind)
+  );
+
   -- Daily devotionals (Rhapsody of Realities): one row a day, its article as doc
   -- (title, opening scripture, paragraphs, prayer, further study, reading plans).
   CREATE TABLE IF NOT EXISTS devotionals (
@@ -431,6 +453,12 @@ const MAX_DEVOTIONAL_IMAGE = 4 * 1024 * 1024;
 const devotionalImage = (publication, date) => path.join(MEDIA_DIR, "devotionals", `${publication}-${date}.jpg`);
 
 /** What is wrong with a catalogue song (a KingsPresenter song: id, title, sections of lines), or "". */
+// A song's recordings as the catalogue lists them ({ full: { bytes, sha256, duration } }), in SQL
+// for a row of catalogue_songs called s; null with none.
+const RECORDINGS_OF = `(SELECT json_object_agg(r.kind, json_build_object('bytes', r.bytes, 'sha256', r.sha256, 'duration', r.duration))
+  FROM catalogue_recordings r WHERE r.song_id = s.id)`;
+const shapeRecording = (r) => ({ songId: r.song_id, kind: r.kind, filename: r.filename, mime: r.mime, bytes: Number(r.bytes), sha256: r.sha256, duration: r.duration, updatedAt: r.updated_at });
+
 function songProblem(s) {
   if (!s || typeof s !== "object") return "not a song";
   if (!/^[a-z0-9][a-z0-9-]{0,99}$/.test(String(s.id || ""))) return "id: lowercase letters, digits and dashes";
@@ -901,6 +929,7 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
   const router = Router();
   fs.mkdirSync(MEDIA_DIR, { recursive: true });
   fs.mkdirSync(RELEASES_DIR, { recursive: true });
+  fs.mkdirSync(SONG_AUDIO_DIR, { recursive: true });
 
   // Never cache an API response; the database is ready before any route runs.
   router.use("/kp", (_req, res, next) => {
@@ -1656,11 +1685,11 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
     const since = clean(req.query.since, 40);
     const at = since && !Number.isNaN(Date.parse(since)) ? new Date(since) : null;
     const rows = await q(
-      `SELECT id, title, doc->'tags' AS tags, rev, updated_at, deleted_at FROM catalogue_songs
+      `SELECT id, title, doc->'tags' AS tags, rev, updated_at, deleted_at, ${RECORDINGS_OF} AS recordings FROM catalogue_songs s
        ${at ? "WHERE updated_at > $1" : "WHERE deleted_at IS NULL"} ORDER BY title`, at ? [at] : []);
     const last = await q1(`SELECT max(updated_at) AS at FROM catalogue_songs`);
     ok(res, {
-      songs: rows.map((r) => ({ id: r.id, title: r.title, tags: r.tags || [], rev: r.rev, updatedAt: r.updated_at, ...(r.deleted_at ? { deletedAt: r.deleted_at } : {}) })),
+      songs: rows.map((r) => ({ id: r.id, title: r.title, tags: r.tags || [], rev: r.rev, updatedAt: r.updated_at, ...(r.recordings ? { recordings: r.recordings } : {}), ...(r.deleted_at ? { deletedAt: r.deleted_at } : {}) })),
       updatedAt: last?.at || null,
     });
   }));
@@ -1668,8 +1697,37 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
   router.post("/kp/songs/fetch", ...app, asyncHandler(async (req, res) => {
     const ids = [...new Set((Array.isArray(req.body?.ids) ? req.body.ids : []).map((id) => clean(id, 100)).filter(Boolean))];
     if (!ids.length || ids.length > 200) return fail(res, 400, "bad_request", "ids: 1 to 200 song ids.");
-    const rows = await q(`SELECT id, doc, rev, updated_at FROM catalogue_songs WHERE id = ANY($1) AND deleted_at IS NULL`, [ids]);
-    ok(res, { songs: rows.map((r) => ({ ...r.doc, id: r.id, catalogueRev: r.rev, updatedAt: r.updated_at })) });
+    const rows = await q(`SELECT id, doc, rev, updated_at, ${RECORDINGS_OF} AS recordings FROM catalogue_songs s WHERE id = ANY($1) AND deleted_at IS NULL`, [ids]);
+    ok(res, { songs: rows.map((r) => ({ ...r.doc, id: r.id, catalogueRev: r.rev, updatedAt: r.updated_at, ...(r.recordings ? { recordings: r.recordings } : {}) })) });
+  }));
+
+  // A catalogue song's recording (its full recording or backing track), with the app key: the
+  // file, a part of it when asked for one (Range: a player seeking), with its hash.
+  router.get("/kp/songs/:id/recordings/:kind", ...app, asyncHandler(async (req, res) => {
+    const r = await q1(
+      `SELECT r.* FROM catalogue_recordings r JOIN catalogue_songs s ON s.id = r.song_id
+       WHERE r.song_id = $1 AND r.kind = $2 AND s.deleted_at IS NULL`, [clean(req.params.id, 100), clean(req.params.kind, 20)]);
+    if (!r) return fail(res, 404, "not_found", "This song has no such recording.");
+    const file = path.join(SONG_AUDIO_DIR, r.storage_key);
+    let size;
+    try { size = (await fsp.stat(file)).size; } catch { return fail(res, 404, "not_found", "The recording is not on this server any more."); }
+    res.setHeader("Content-Type", r.mime);
+    res.setHeader("Accept-Ranges", "bytes");
+    res.setHeader("X-Sha256", r.sha256);
+    if (r.duration) res.setHeader("X-Duration", String(r.duration));
+    res.setHeader("Content-Disposition", `inline; filename="${r.filename.replace(/"/g, "")}"`);
+    const range = /^bytes=(\d*)-(\d*)$/.exec(req.header("range") || "");
+    let start = 0;
+    let end = size - 1;
+    if (range && (range[1] || range[2])) {
+      start = range[1] ? Number(range[1]) : Math.max(0, size - Number(range[2]));
+      end = range[1] && range[2] ? Math.min(Number(range[2]), size - 1) : size - 1;
+      if (start > end || start >= size) { res.setHeader("Content-Range", `bytes */${size}`); return res.status(416).end(); }
+      res.status(206);
+      res.setHeader("Content-Range", `bytes ${start}-${end}/${size}`);
+    }
+    res.setHeader("Content-Length", String(end - start + 1));
+    fs.createReadStream(file, { start, end }).on("error", () => res.destroy()).pipe(res);
   }));
 
   // The administrator publishes songs (a song that is already there, with the same words, is left
@@ -1690,6 +1748,75 @@ module.exports = function kingsPresenterRoutes({ openai = null } = {}) {
       if (!row) counts.unchanged += 1; else if (row.rev === 1) counts.added += 1; else counts.updated += 1;
     }
     ok(res, counts);
+  }));
+
+  // The administrator puts a catalogue song's recording here (KingsPresenter's
+  // scripts/recordings-upload.js): the file as the body, its hash, name and length in headers.
+  // Streamed to disk; the same file again is left as it is; another replaces the one before.
+  router.put("/kp/admin/songs/:id/recordings/:kind", requireAdmin, asyncHandler(async (req, res) => {
+    const id = clean(req.params.id, 100);
+    const kind = clean(req.params.kind, 20);
+    const sha = clean(req.header("x-sha256"), 64).toLowerCase();
+    const filename = (clean(req.header("x-filename"), 200).replace(/[^\w .()+'-]+/g, "") || `${id}.mp3`).slice(0, 200);
+    const ext = path.extname(filename).toLowerCase();
+    const duration = Number(req.header("x-duration")) || null;
+    const bad = !RECORDING_KINDS.has(kind) ? "kind: full or backing."
+      : !/^[a-f0-9]{64}$/.test(sha) ? "x-sha256 must be the file's SHA-256."
+      : !AUDIO_TYPES[ext] ? "x-filename must end in .mp3, .m4a, .aac, .wav, .ogg or .flac." : "";
+    if (bad) { req.resume(); return fail(res, 400, "bad_request", bad); }
+    if (Number(req.header("content-length")) > MAX_SONG_AUDIO) { req.resume(); return fail(res, 413, "too_large", `A recording may be up to ${MAX_SONG_AUDIO / 1024 / 1024} MB.`); }
+    const song = await q1(`SELECT id FROM catalogue_songs WHERE id = $1 AND deleted_at IS NULL`, [id]);
+    if (!song) { req.resume(); return fail(res, 404, "not_found", "No such song in the catalogue."); }
+    const before = await q1(`SELECT * FROM catalogue_recordings WHERE song_id = $1 AND kind = $2`, [id, kind]);
+    if (before && before.sha256 === sha && fs.existsSync(path.join(SONG_AUDIO_DIR, before.storage_key))) { req.resume(); return ok(res, { unchanged: true, recording: shapeRecording(before) }); }
+    const storageKey = `${id}/${kind}-${sha.slice(0, 16)}${ext}`;
+    const file = path.join(SONG_AUDIO_DIR, storageKey);
+    const part = `${file}.part`;
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    const hash = crypto.createHash("sha256");
+    let bytes = 0;
+    try {
+      await new Promise((resolve, reject) => {
+        const out = fs.createWriteStream(part);
+        req.on("data", (c) => { hash.update(c); bytes += c.length; if (bytes > MAX_SONG_AUDIO) req.destroy(Object.assign(new Error("too large"), { code: "too_large" })); });
+        req.on("error", reject);
+        req.on("aborted", () => reject(new Error("The upload stopped early.")));
+        out.on("error", reject);
+        out.on("finish", resolve);
+        req.pipe(out);
+      });
+      if (!bytes) throw Object.assign(new Error("The upload was empty."), { code: "empty_upload" });
+      if (hash.digest("hex") !== sha) throw Object.assign(new Error("The file does not match its hash."), { code: "hash_mismatch" });
+    } catch (err) {
+      await fsp.rm(part, { force: true });
+      const code = ["too_large", "hash_mismatch", "empty_upload"].includes(err.code) ? err.code : "upload_failed";
+      return fail(res, code === "too_large" ? 413 : 400, code, err.message);
+    }
+    await fsp.rename(part, file);
+    const row = await q1(
+      `INSERT INTO catalogue_recordings (song_id, kind, filename, storage_key, mime, bytes, sha256, duration)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (song_id, kind) DO UPDATE SET filename = EXCLUDED.filename, storage_key = EXCLUDED.storage_key, mime = EXCLUDED.mime,
+         bytes = EXCLUDED.bytes, sha256 = EXCLUDED.sha256, duration = EXCLUDED.duration, updated_at = now()
+       RETURNING *`, [id, kind, filename, storageKey, AUDIO_TYPES[ext], bytes, sha, duration]);
+    if (before && before.storage_key !== storageKey) await fsp.rm(path.join(SONG_AUDIO_DIR, before.storage_key), { force: true });
+    await q(`UPDATE catalogue_songs SET updated_at = now() WHERE id = $1`, [id]); // copies asking what is new hear of it
+    res.status(201);
+    ok(res, { recording: shapeRecording(row) });
+  }));
+
+  // Every recording the catalogue has (for the upload script: what is up already, by hash).
+  router.get("/kp/admin/recordings", requireAdmin, asyncHandler(async (_req, res) => {
+    const rows = await q(`SELECT * FROM catalogue_recordings ORDER BY song_id, kind`);
+    ok(res, { recordings: rows.map(shapeRecording) });
+  }));
+
+  router.delete("/kp/admin/songs/:id/recordings/:kind", requireAdmin, asyncHandler(async (req, res) => {
+    const row = await q1(`DELETE FROM catalogue_recordings WHERE song_id = $1 AND kind = $2 RETURNING *`, [clean(req.params.id, 100), clean(req.params.kind, 20)]);
+    if (!row) return fail(res, 404, "not_found", "This song has no such recording.");
+    await fsp.rm(path.join(SONG_AUDIO_DIR, row.storage_key), { force: true });
+    await q(`UPDATE catalogue_songs SET updated_at = now() WHERE id = $1`, [row.song_id]);
+    ok(res, { deleted: true });
   }));
 
   router.delete("/kp/admin/songs/:id", requireAdmin, asyncHandler(async (req, res) => {

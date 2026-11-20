@@ -15,6 +15,7 @@ const DB_URL = process.env.KP_TEST_DATABASE_URL || "postgres://localhost/kingspr
 if (!["localhost", "127.0.0.1", "::1", ""].includes(new URL(DB_URL).hostname)) throw new Error("KP_TEST_DATABASE_URL must be a database on this computer");
 const MEDIA = fs.mkdtempSync(path.join(os.tmpdir(), "kp-media-"));
 const RELEASES = fs.mkdtempSync(path.join(os.tmpdir(), "kp-releases-"));
+const SONG_AUDIO = fs.mkdtempSync(path.join(os.tmpdir(), "kp-song-audio-"));
 
 // OpenAI, as far as summaries go: answers with whatever the test puts in `aiAnswer`.
 const aiCalls = [];
@@ -60,7 +61,7 @@ test.before(async () => {
   Object.assign(process.env, {
     KP_SKIP_ENV_FILE: "1", KINGSPRESENTER_DATABASE_URL: DB_URL, KP_DATABASE_URL: DB_URL, KP_KC_CLIENT_ID: "test-client", KP_KC_CLIENT_SECRET: "shh", KP_KC_LEGACY_CLIENT_IDS: "old-client", KP_KC_API_KEY: "kc-project-key", KP_KC_TOKEN_URL: `${kc}/token`, KP_KC_PROFILE_URL: `${kc}/profile`,
     KP_API_KEY: "app-key", KP_RELAY_KEY: "relay-key", KP_MEDIA_DIR: MEDIA, KP_RELAY_URL: "wss://relay.test", KP_SITE_URL: "http://localhost:3000",
-    KP_RELEASES_DIR: RELEASES, KP_UPDATE_UPLOAD_KEY: "upload-key", KP_SUMMARY_MAX_CHARS: "5000",
+    KP_RELEASES_DIR: RELEASES, KP_SONG_AUDIO_DIR: SONG_AUDIO, KP_UPDATE_UPLOAD_KEY: "upload-key", KP_SUMMARY_MAX_CHARS: "5000",
   });
   delete process.env.KP_TOKEN_SECRET;
   routes = require("../routes/kingspresenter");
@@ -84,6 +85,7 @@ test.after(async () => {
   await admin.end();
   fs.rmSync(MEDIA, { recursive: true, force: true });
   fs.rmSync(RELEASES, { recursive: true, force: true });
+  fs.rmSync(SONG_AUDIO, { recursive: true, force: true });
 });
 
 const call = async (method, url, { body, token, key = "app-key", headers = {} } = {}) => {
@@ -106,7 +108,7 @@ test("the database and its tables are made on first use", async () => {
   await c.connect();
   const t = await c.query(`SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 1`);
   await c.end();
-  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_songs", "cloud_usage", "devices", "devotionals", "documents", "feedback", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
+  assert.deepEqual(t.rows.map((x) => x.table_name), ["catalogue_recordings", "catalogue_songs", "cloud_usage", "devices", "devotionals", "documents", "feedback", "installs", "media_objects", "recording_summaries", "refresh_tokens", "relays", "releases", "remote_joins", "remote_sessions", "settings", "signin_tickets", "users"]);
 });
 
 test("the app key is asked for, and the apps learn where to sign in and which relay to use", async () => {
@@ -625,6 +627,62 @@ test("the song catalogue: the administrator publishes songs, every copy lists an
     assert.deepEqual((await call("GET", "/kp/songs")).json.songs.map((s) => s.id), ["lw-test-two"]);
     assert.ok((await call("GET", `/kp/songs?since=${encodeURIComponent(since)}`)).json.songs.find((s) => s.id === "lw-test-one").deletedAt);
     assert.deepEqual((await call("POST", "/kp/songs/fetch", { body: { ids: ["lw-test-one"] } })).json.songs, []);
+  } finally {
+    delete process.env.KP_ADMIN_KEY;
+  }
+});
+
+test("the catalogue's recordings: the administrator puts a song's recording up, every copy sees it listed and plays it", async () => {
+  const admin = { "x-admin-key": "admin-key" };
+  process.env.KP_ADMIN_KEY = "admin-key";
+  try {
+    const song = { id: "lw-rec-song", title: "King of Eternity", tags: ["LoveWorld"], sections: [{ label: "v1", name: "Verse 1", lines: ["Gracious God"] }], order: ["v1"] };
+    assert.equal((await call("PUT", "/kp/admin/songs", { headers: admin, body: { songs: [song] } })).json.added, 1);
+    const since = (await call("GET", "/kp/songs")).json.updatedAt;
+    const audio = crypto.randomBytes(5000);
+    const sha = crypto.createHash("sha256").update(audio).digest("hex");
+    const put = (body, h = {}, url = "/kp/admin/songs/lw-rec-song/recordings/full") => call("PUT", url, { body, key: null, headers: { ...admin, "x-sha256": sha, "x-filename": "King of Eternity (with Pastor Chris).mp3", "x-duration": "243", "content-type": "audio/mpeg", ...h } });
+
+    assert.equal((await put(audio, { "x-admin-key": "wrong" })).status, 401);
+    assert.equal((await put(audio, {}, "/kp/admin/songs/lw-nothing/recordings/full")).status, 404, "a song the catalogue does not have");
+    assert.equal((await put(audio, {}, "/kp/admin/songs/lw-rec-song/recordings/vocals")).json.error, "bad_request");
+    assert.equal((await put(audio, { "x-filename": "song.exe" })).json.error, "bad_request");
+    assert.equal((await put(crypto.randomBytes(100))).json.error, "hash_mismatch");
+    await new Promise((r) => setTimeout(r, 20));
+    const first = await put(audio);
+    assert.equal(first.status, 201);
+    assert.deepEqual(pick(first.json.recording, ["kind", "bytes", "mime", "duration"]), { kind: "full", bytes: 5000, mime: "audio/mpeg", duration: 243 });
+    assert.equal((await put(audio)).json.unchanged, true, "the same file again is left as it is");
+    assert.deepEqual((await call("GET", "/kp/admin/recordings", { key: null, headers: admin })).json.recordings.map((x) => [x.songId, x.kind, x.sha256]), [["lw-rec-song", "full", sha]]);
+    assert.equal((await call("GET", "/kp/admin/recordings", { key: null })).status, 401);
+
+    // Listed (to copies that looked before too) and in the song fetched, with no new rev.
+    const listed = (await call("GET", `/kp/songs?since=${encodeURIComponent(since)}`)).json.songs.find((x) => x.id === "lw-rec-song");
+    assert.deepEqual(listed.recordings, { full: { bytes: 5000, sha256: sha, duration: 243 } });
+    assert.equal(listed.rev, 1);
+    assert.equal((await call("POST", "/kp/songs/fetch", { body: { ids: ["lw-rec-song"] } })).json.songs[0].recordings.full.sha256, sha);
+
+    // Played with the app key: whole, or a part (a player seeking).
+    assert.equal((await call("GET", "/kp/songs/lw-rec-song/recordings/full", { key: "wrong" })).status, 401);
+    const whole = await fetch(`${base}/kp/songs/lw-rec-song/recordings/full`, { headers: { "x-api-key": "app-key" } });
+    assert.equal(whole.headers.get("x-sha256"), sha);
+    assert.equal(whole.headers.get("content-type"), "audio/mpeg");
+    assert.equal(whole.headers.get("x-duration"), "243");
+    assert.ok(Buffer.from(await whole.arrayBuffer()).equals(audio));
+    const part = await fetch(`${base}/kp/songs/lw-rec-song/recordings/full`, { headers: { "x-api-key": "app-key", range: "bytes=100-199" } });
+    assert.equal(part.status, 206);
+    assert.equal(part.headers.get("content-range"), "bytes 100-199/5000");
+    assert.ok(Buffer.from(await part.arrayBuffer()).equals(audio.subarray(100, 200)));
+    assert.equal((await call("GET", "/kp/songs/lw-rec-song/recordings/backing")).status, 404);
+
+    // Another file replaces it (the one before goes from the disk); taken off, it is gone.
+    const other = crypto.randomBytes(3000);
+    const otherSha = crypto.createHash("sha256").update(other).digest("hex");
+    assert.equal((await put(other, { "x-sha256": otherSha })).status, 201);
+    assert.deepEqual(fs.readdirSync(path.join(SONG_AUDIO, "lw-rec-song")), [`full-${otherSha.slice(0, 16)}.mp3`]);
+    assert.equal((await call("DELETE", "/kp/admin/songs/lw-rec-song/recordings/full", { headers: admin })).json.deleted, true);
+    assert.deepEqual(fs.readdirSync(path.join(SONG_AUDIO, "lw-rec-song")), []);
+    assert.equal((await call("GET", "/kp/songs")).json.songs.find((x) => x.id === "lw-rec-song").recordings, undefined);
   } finally {
     delete process.env.KP_ADMIN_KEY;
   }

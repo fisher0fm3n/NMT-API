@@ -108,8 +108,9 @@ Success: `{ "status": true, … }`. Failure: `{ "status": false, "error": "<code
 | `GET /kp/updates/files/:version/:platform/:arch` | The installer. No sign-in: the app key only |
 | `GET /kp/updates/releases` | Every release, newest first |
 | `PUT /kp/updates/upload` | For the build (`x-upload-key: KP_UPDATE_UPLOAD_KEY`): an installer (below) |
-| `GET /kp/songs?since=<ISO time>` | The song catalogue, no words: `{ songs: [{ id, title, tags, rev, updatedAt, deletedAt? }], updatedAt }`. No sign-in: the app key only (below) |
+| `GET /kp/songs?since=<ISO time>` | The song catalogue, no words: `{ songs: [{ id, title, tags, rev, updatedAt, recordings?, deletedAt? }], updatedAt }`. No sign-in: the app key only (below) |
 | `POST /kp/songs/fetch { ids }` | Up to 200 catalogue songs, whole: `{ songs: [<KingsPresenter song>, catalogueRev] }` |
+| `GET /kp/songs/:id/recordings/:kind` | A catalogue song's full recording or backing track (Range for a part). No sign-in: the app key only (below) |
 | `GET /kp/devotionals?month=YYYY-MM` | The daily devotionals (Rhapsody of Realities) of a month, whole: `{ days: [...] }`. No sign-in: the app key only (below) |
 | `GET /kp/devotionals/:date` | One day: `{ day }`; 404 before it is published |
 | `POST /kp/feedback` | From the apps (Help → Send feedback): `{ kind: idea\|problem\|praise\|other, message, email?, installId?, app?, version?, platform?, details? }` → `{ feedback: { id, createdAt } }`. The app key; signed in or not (kept with the account when signed in). `missing_message` / `bad_email` (400); `too_many` (429) after 10 in an hour from one copy |
@@ -202,6 +203,27 @@ DELETE /kp/admin/songs/:id                               → { deleted: true, id
 A song published again with the same words is left as it is. KingsPresenter publishes its own songs
 with `KP_ADMIN_KEY=… node scripts/songs-upload.js` (its built-in library, `data/defaults/library.json`).
 
+### Recordings
+
+A catalogue song may have recordings: its full recording (`full`) and its backing track (`backing`).
+The list and fetch name them (`recordings: { full: { bytes, sha256, duration } }`); KingsPresenter
+fetches one the first time **Play song** (or **Play backing track**) is pressed on a song that has
+none of its own, and keeps it with the song:
+
+```
+GET    /kp/songs/:id/recordings/:kind        the file (app key); Range for a part (206)
+PUT    /kp/admin/songs/:id/recordings/:kind  the file as the body (streamed to KP_SONG_AUDIO_DIR)
+         x-admin-key, x-sha256, x-filename (.mp3 .m4a .aac .wav .ogg .flac), x-duration (seconds)
+         → 201 { recording }, or { unchanged: true } for the same file again
+DELETE /kp/admin/songs/:id/recordings/:kind  → { deleted: true }
+GET    /kp/admin/recordings                 → { recordings: [{ songId, kind, filename, bytes, sha256, duration }] }
+```
+
+A recording added, changed or taken off moves its song's `updatedAt` (not its `rev`), so copies
+asking what is new since hear of it. Errors: `not_found` (404, no such song), `bad_request`,
+`hash_mismatch`, `empty_upload` (400), `too_large` (413, over `KP_MAX_SONG_AUDIO_MB`). KingsPresenter
+puts the LoveWorld recordings up with `KP_ADMIN_KEY=… node scripts/recordings-upload.js`.
+
 ## Daily devotionals
 
 Rhapsody of Realities, a day at a time, for KingsPresenter's Slides → Devotional (each day as slides).
@@ -281,6 +303,7 @@ streams an hour (`too_many`, 429).
 | `POST /kp/admin/users/:id` | `{ "disabled": true, "reason" }` — `:id` is the account id or its KingsChat username |
 | `POST /kp/admin/users/:id/cloud` | `{ "minutes": 600 }` — the account's own monthly cloud listening (`0` stops it; `null`: the default again). What is used this month stays |
 | `PUT /kp/admin/songs`, `DELETE /kp/admin/songs/:id` | The song catalogue (above) |
+| `PUT`/`DELETE /kp/admin/songs/:id/recordings/:kind` | A catalogue song's recordings (above) |
 | `PUT /kp/admin/devotionals`, `DELETE /kp/admin/devotionals/:date` | The daily devotionals (above) |
 | `DELETE /kp/admin/users/:id` | The account deleted for good, with its library, media, recording summaries, cloud listening, devices and sign-ins (its copies stay, not signed in). Says what went: `{ "deleted": true, "user", "removed": { "documents", "media", "summaries", "devices" } }`. Its copies are signed out at once. Signing in with KingsChat again makes a new, empty account; to keep someone out, disable the account instead |
 | `GET /kp/admin/feedback?status=&kind=&q=` | Feedback, newest first: `{ feedback: [{ id, kind, message, email, app, version, platform, details, installId, user, status, note, createdAt }], counts: { new, seen, done } }`; `q` searches the words, the email and the account |
@@ -325,6 +348,8 @@ curl -X POST -H "x-admin-key: $KEY" -H "content-type: application/json" -d '{"mi
 | `KP_UPDATE_UPLOAD_KEY` | none | Lets the build upload installers (the GitHub secret of the same name) |
 | `KP_RELEASES_DIR` | `~/kingspresenter-releases` | The installers (outside the project, as the media) |
 | `KP_MAX_RELEASE_MB` | 1024 | Largest installer |
+| `KP_SONG_AUDIO_DIR` | `~/kingspresenter-song-audio` | The song catalogue's recordings (outside the project) |
+| `KP_MAX_SONG_AUDIO_MB` | 80 | Largest recording |
 | `KP_PUBLIC_URL` | this request's host | The API's public address up to its mount point, for the installer links (`https://nmt.loveworldapis.com/api`) |
 
 Tests: `node --test test/kingspresenter.test.js` (a local Postgres; a stand-in KingsChat).
